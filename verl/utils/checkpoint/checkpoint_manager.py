@@ -67,16 +67,19 @@ class BaseCheckpointManager:
         print(f'Checkpoint manager remove previous save local path: {abs_path}')
         if not os.path.exists(abs_path):
             return
-        # Remove everything except the 'checkpoints' folder
         for entry in os.scandir(abs_path):
-            if entry.name == 'checkpoints':
-                # Skip the 'checkpoints' folder
+            if entry.name == 'checkpoint':
                 continue
 
             if entry.is_dir():
+                # ignore_errors=True will skip errors like "directory not found"
                 shutil.rmtree(entry.path, ignore_errors=True)
             else:
-                os.remove(entry.path)
+                # Gracefully handle already-missing files
+                try:
+                    os.remove(entry.path)
+                except FileNotFoundError:
+                    pass
 
     @staticmethod
     def local_mkdir(path):
