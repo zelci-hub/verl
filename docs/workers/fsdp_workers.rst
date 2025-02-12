@@ -59,7 +59,7 @@ highlighted below:
 3. ``FSDPVLLMShardingManager`` a context manager to perform actual
    resharding between actor and rollout.
 
-See `source code <https://github.com/volcengine/verl/blob/main/verl/trainer/ppo/workers/fsdp_workers.py#L42>`_. for more information.
+See `source code <https://github.com/volcengine/verl/blob/main/verl/workers/fsdp_workers.py>`_. for more information.
 
 1. Generate sequence and recompute log prob
 
@@ -73,7 +73,7 @@ See `source code <https://github.com/volcengine/verl/blob/main/verl/trainer/ppo/
 
 - In this function, the rollout model will perform auto-regressive
   generation and the actor model will recompute the old log prob for the
-  generetad response.
+  generated response.
 
 3. Update actor model
 
