@@ -31,7 +31,7 @@ def _default_compute_score(data_source, solution_str, ground_truth):
         from . import prime_code
         res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
     else:
-        return rllm_reward_fn
+        return rllm_reward_fn(solution_str, ground_truth)
 
     if isinstance(res, (int, float, bool)):
         return float(res)
