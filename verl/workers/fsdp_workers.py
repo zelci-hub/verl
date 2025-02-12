@@ -22,11 +22,13 @@ import warnings
 import torch
 import torch.distributed
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
 import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
 from verl import DataProto
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import register, Dispatch
+import verl.utils.hdfs_io as hdfs_io
 from verl.utils import hf_tokenizer
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.fs import copy_local_path_from_hdfs
@@ -555,6 +557,26 @@ class ActorRolloutRefWorker(Worker):
                                      load_grad=self._is_offload_grad)
 
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step)
+        
+        torch.distributed.barrier()
+
+        # TODO: support DCP and save sharded checkpoints
+        import torch.distributed
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = self.actor.actor_module.state_dict()
+        if self.rank == 0:
+            full_checkpoint_local_path=f'{local_path}/checkpoint'
+            print(f'Saving actor checkpoint to {full_checkpoint_local_path}')
+            os.makedirs(full_checkpoint_local_path, exist_ok=True)
+            self.actor_module.save_pretrained(full_checkpoint_local_path, state_dict=state_dict)
+            self.tokenizer.save_pretrained(full_checkpoint_local_path)
+            if hdfs_path is not None:
+                print(f'Uploading actor checkpoint to {hdfs_path}')
+                hdfs_io.makedirs(hdfs_path, exist_ok=True)
+                hdfs_io.copy(src=full_checkpoint_local_path, dst=hdfs_path)
+
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -831,6 +853,7 @@ class CriticWorker(Worker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step)
 
         torch.distributed.barrier()
+
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
 
