@@ -136,7 +136,8 @@ def is_valid_checkpoint(ckpt_path):
     Returns True if the checkpoint directory has all required files/folders.
     Adjust the checks below to match your own project requirements.
     """
-    # Example required .pt files:
+
+    # 1) Check for required top-level files
     required_pt_files = [
         'actor.lock',
         'data.pt'
@@ -147,31 +148,39 @@ def is_valid_checkpoint(ckpt_path):
             print(f"Checkpoint {ckpt_path} is missing required file: {fname}")
             return False
 
+    # 2) Check for 'actor' folder
     actor_dir = os.path.join(ckpt_path, "actor")
     if not os.path.isdir(actor_dir):
         print(f"Checkpoint {ckpt_path} is missing the 'actor' folder.")
         return False
 
-
-    # Example required folder: "checkpoint"
+    # 3) Check for subfolders in 'actor'
     checkpoint_dir = os.path.join(actor_dir, "checkpoint")
     if not os.path.isdir(checkpoint_dir):
-        print(f"Checkpoint {ckpt_path} is missing the 'checkpoint' directory.")
-        return False
-    
-    # Example required folder: "huggingface"
-    hf_dir = os.path.join(actor_dir, "huggingface")
-    if not os.path.isdir(hf_dir):
-        print(f"Checkpoint {ckpt_path} is missing the 'huggingface' directory.")
+        print(f"Checkpoint {ckpt_path} is missing the 'checkpoint' directory inside 'actor'.")
         return False
 
-    # Check if there is at least one .pt file in the actor folder
-    actor_pt_files = [f for f in os.listdir(actor_dir) if f.endswith('.pt')]
-    if not actor_pt_files:
-        print(f"Checkpoint {ckpt_path} is missing .pt files in the 'actor' folder.")
+    hf_dir = os.path.join(actor_dir, "huggingface")
+    if not os.path.isdir(hf_dir):
+        print(f"Checkpoint {ckpt_path} is missing the 'huggingface' directory inside 'actor'.")
         return False
-    
-    # If all checks pass, we consider it a valid checkpoint.
+
+    # 4) Check for .pt files in 'actor' that start with specific prefixes
+    required_prefixes = [
+        "model_world_size",
+        "optim_world_size",
+        "extra_state_world_size"
+    ]
+    actor_files = os.listdir(actor_dir)
+
+    for prefix in required_prefixes:
+        # Find files that start with the prefix and end with '.pt'
+        matched_files = [f for f in actor_files if f.startswith(prefix) and f.endswith('.pt')]
+        if not matched_files:
+            print(f"Checkpoint {ckpt_path} is missing required .pt files with prefix '{prefix}' in the 'actor' folder.")
+            return False
+
+    # If all checks pass, the checkpoint is considered valid
     return True
 
 
