@@ -126,6 +126,7 @@ verl is inspired by the design of Nemo-Aligner, Deepspeed-chat and OpenRLHF. The
 - [TinyZero](https://github.com/Jiayi-Pan/TinyZero): a reproduction of DeepSeek R1 Zero recipe for reasoning tasks
 - [RAGEN](https://github.com/ZihanWang314/ragen): a general-purpose reasoning agent training framework
 - [Logic R1](https://github.com/Unakar/Logic-RL): a reproduced DeepSeek R1 Zero on 2K Tiny Logic Puzzle Dataset.
-- [Deepscaler](https://github.com/agentica-project/deepscaler): iterative context scaling with GRPO
+- [deepscaler](https://github.com/agentica-project/deepscaler): iterative context scaling with GRPO
+- [critic-rl](https://github.com/HKUNLP/critic-rl): Teaching Language Models to Critique via Reinforcement Learning
 
 We are HIRING! Send us an [email](mailto:haibin.lin@bytedance.com) if you are interested in internship/FTE opportunities in MLSys/LLM reasoning/multimodal alignment.
