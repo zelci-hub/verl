@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import re
 import shutil
 from filelock import FileLock
 import tempfile
@@ -111,24 +112,134 @@ class BaseCheckpointManager:
         random.setstate(rng_state['random'])
 
 
+# def find_latest_ckpt_path(path, directory_format="global_step_{}"):
+#     if path is None:
+#         return None
+
+#     tracker_file = get_checkpoint_tracker_filename(path)
+#     if not os.path.exists(tracker_file):
+#         print("Checkpoint tracker file does not exist: %s", tracker_file)
+#         return None
+
+#     with open(tracker_file, "rb") as f:
+#         iteration = int(f.read().decode())
+#     ckpt_path = os.path.join(path, directory_format.format(iteration))
+#     if not os.path.exists(ckpt_path):
+#         print("Checkpoint does not exist: %s", ckpt_path)
+#         return None
+
+#     print("Found checkpoint: %s", ckpt_path)
+#     return ckpt_path
+
+def is_valid_checkpoint(ckpt_path):
+    """
+    Returns True if the checkpoint directory has all required files/folders.
+    Adjust the checks below to match your own project requirements.
+    """
+    # Example required .pt files:
+    required_pt_files = [
+        'actor.lock',
+        'data.pt'
+    ]
+    for fname in required_pt_files:
+        full_file = os.path.join(ckpt_path, fname)
+        if not os.path.exists(full_file):
+            print(f"Checkpoint {ckpt_path} is missing required file: {fname}")
+            return False
+
+    actor_dir = os.path.join(ckpt_path, "actor")
+    if not os.path.isdir(actor_dir):
+        print(f"Checkpoint {ckpt_path} is missing the 'actor' folder.")
+        return False
+
+
+    # Example required folder: "checkpoint"
+    checkpoint_dir = os.path.join(actor_dir, "checkpoint")
+    if not os.path.isdir(checkpoint_dir):
+        print(f"Checkpoint {ckpt_path} is missing the 'checkpoint' directory.")
+        return False
+    
+    # Example required folder: "huggingface"
+    hf_dir = os.path.join(actor_dir, "huggingface")
+    if not os.path.isdir(hf_dir):
+        print(f"Checkpoint {ckpt_path} is missing the 'huggingface' directory.")
+        return False
+
+    # Check if there is at least one .pt file in the actor folder
+    actor_pt_files = [f for f in os.listdir(actor_dir) if f.endswith('.pt')]
+    if not actor_pt_files:
+        print(f"Checkpoint {ckpt_path} is missing .pt files in the 'actor' folder.")
+        return False
+    
+    # If all checks pass, we consider it a valid checkpoint.
+    return True
+
+
 def find_latest_ckpt_path(path, directory_format="global_step_{}"):
+    """
+    1. Tries to read the latest checkpoint from a tracker file (if it exists).
+    2. If that fails or is invalid, scans all `global_step_X` folders in descending order
+       and returns the first that passes `is_valid_checkpoint`.
+    """
     if path is None:
         return None
 
     tracker_file = get_checkpoint_tracker_filename(path)
-    if not os.path.exists(tracker_file):
-        print("Checkpoint tracker file does not exist: %s", tracker_file)
+    tracker_candidate = None
+
+    # Try reading the tracker file first
+    if os.path.exists(tracker_file):
+        try:
+            with open(tracker_file, "rb") as f:
+                iteration = int(f.read().decode())
+            tracker_candidate = os.path.join(path, directory_format.format(iteration))
+            if os.path.exists(tracker_candidate) and is_valid_checkpoint(tracker_candidate):
+                print(f"Found valid checkpoint from tracker: {tracker_candidate}")
+                return tracker_candidate
+            else:
+                print(f"Tracker checkpoint is invalid or missing: {tracker_candidate}")
+        except Exception as e:
+            print(f"Error reading tracker file {tracker_file}: {e}")
+    else:
+        print(f"Checkpoint tracker file does not exist: {tracker_file}")
+
+    # If tracker-based checkpoint is invalid, try all possible `global_step_X` folders
+    try:
+        entries = os.listdir(path)
+    except Exception as e:
+        print(f"Failed to list directory {path}: {e}")
         return None
 
-    with open(tracker_file, "rb") as f:
-        iteration = int(f.read().decode())
-    ckpt_path = os.path.join(path, directory_format.format(iteration))
-    if not os.path.exists(ckpt_path):
-        print("Checkpoint does not exist: %s", ckpt_path)
+    pattern = re.compile(r'^global_step_(\d+)$')
+    candidates = []
+    for entry in entries:
+        full_path = os.path.join(path, entry)
+        if os.path.isdir(full_path):
+            m = pattern.match(entry)
+            if m:
+                step = int(m.group(1))
+                candidates.append((step, full_path))
+
+    if not candidates:
+        print(f"No checkpoint directories found in {path}")
         return None
 
-    print("Found checkpoint: %s", ckpt_path)
-    return ckpt_path
+    # Sort in descending order of global step
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    # Return the first valid checkpoint
+    for step, candidate in candidates:
+        if is_valid_checkpoint(candidate):
+            print(f"Found valid checkpoint: {candidate} (global step: {step})")
+            return candidate
+        else:
+            print(f"Checkpoint {candidate} is malformed, skipping.")
+
+    print(f"No valid checkpoint found in {path}")
+    return None
+
+
+
 
 
 def get_checkpoint_tracker_filename(root_path: str):
