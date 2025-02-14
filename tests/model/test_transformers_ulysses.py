@@ -25,7 +25,7 @@ from verl.workers.sharding_manager import FSDPUlyssesShardingManager
 from verl.models.transformers.llama import llama_flash_attn_forward
 from verl.models.transformers.qwen2 import qwen2_flash_attn_forward
 from verl.protocol import DataProto
-from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis, rearrange
+from verl.models.bert_padding import unpad_input, pad_input, index_first_axis, rearrange
 
 from transformers import LlamaConfig, MistralConfig, GemmaConfig, Qwen2Config
 from transformers.models.llama.modeling_llama import LlamaFlashAttention2

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from verl.utils.model import create_random_mask
-from flash_attn.bert_padding import unpad_input
+from verl.models.bert_padding import unpad_input
 import torch
 import pytest
 

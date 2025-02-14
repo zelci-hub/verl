@@ -15,7 +15,7 @@
 import torch
 from verl.utils.model import create_random_mask, compute_position_id_with_mask
 from verl.utils.torch_functional import masked_mean, log_probs_from_logits_all_rmpad, logprobs_from_logits
-from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis, rearrange
+from verl.models.bert_padding import unpad_input, pad_input, index_first_axis, rearrange
 
 from transformers import LlamaConfig, MistralConfig, GemmaConfig, Qwen2Config
 from transformers import AutoModelForCausalLM, AutoModelForTokenClassification, AutoModelForSequenceClassification

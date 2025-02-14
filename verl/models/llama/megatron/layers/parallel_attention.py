@@ -293,7 +293,7 @@ from einops import rearrange
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
-    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
+    from verl.models.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
 
 def apply_rotary_pos_emb_rmpad(q, k, cos, sin, position_ids, indices, sequence_length):
@@ -312,7 +312,7 @@ def apply_rotary_pos_emb_rmpad(q, k, cos, sin, position_ids, indices, sequence_l
     return q_embed, k_embed
 
 
-from flash_attn.layers.rotary import apply_rotary_emb
+from verl.models.layers.rotary import apply_rotary_emb
 
 
 # use flash-attn rotary embeddings with rmpad

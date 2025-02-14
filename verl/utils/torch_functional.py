@@ -24,7 +24,7 @@ from tensordict import TensorDict
 from torch import nn
 
 try:
-    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
+    from verl.models.ops.triton.cross_entropy import cross_entropy_loss
     FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
 except ImportError:
     FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
@@ -328,7 +328,7 @@ def log_probs_from_logits_response_rmpad(input_ids, attention_mask, logits_rmpad
         logits_rmpad: [total_nnz, vocab_size]
         response_length: int
     """
-    from flash_attn.bert_padding import pad_input, unpad_input
+    from verl.models.bert_padding import pad_input, unpad_input
 
     batch_size, seqlen = input_ids.shape
     input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask=attention_mask)
@@ -357,7 +357,7 @@ def log_probs_from_logits_all_rmpad(input_ids_rmpad, logits_rmpad, indices, batc
         seqlen: int
         response_length: int
     """
-    from flash_attn.bert_padding import pad_input
+    from verl.models.bert_padding import pad_input
     input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # transpose back to [total_nnz, 1]
     input_ids_rmpad = input_ids_rmpad.squeeze(-1)
     input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=0)
