@@ -48,7 +48,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                  lr_scheduler: torch.optim.lr_scheduler.LRScheduler, tokenizer: PreTrainedTokenizer, *args, **kwargs):
         super().__init__(model, optimizer, lr_scheduler, tokenizer)
 
-    def load_checkpoint(self, path=None, del_local_after_load=True, *args, **kwargs):
+    def load_checkpoint(self, path=None, del_local_after_load=False, *args, **kwargs):
         if path is None:
             return
 
