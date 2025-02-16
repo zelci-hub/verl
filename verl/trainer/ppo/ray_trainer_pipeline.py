@@ -133,7 +133,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.rollout_wg.world_size)
             test_gen_batch_padded.meta_info['val_temperature'] = self.config.rollout_ref.rollout.val_temperature
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            test_output_gen_batch_padded = self.rollout_wg.generate_sequences(test_gen_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
@@ -173,6 +173,23 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
             metric_dict[f'val/test_score/{data_source}'] = np.mean(rewards)
 
         return metric_dict
+
+    def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
+        """Reorder the data on single controller such that each dp rank gets similar total tokens"""
+        attention_mask = batch.batch['attention_mask']
+        batch_size = attention_mask.shape[0]
+        global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
+        world_size = self.actor_wg.world_size
+        global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
+                                                              k_partitions=world_size,
+                                                              equal_size=True)
+        # reorder based on index. The data will be automatically equally partitioned by dispatch function
+        global_idx = torch.tensor([j for partition in global_partition_lst for j in partition])
+        batch.reorder(global_idx)
+        global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst,
+                                                    partitions=global_partition_lst,
+                                                    prefix=logging_prefix)
+        metrics.update(global_balance_stats)
 
     def init_workers(self):
         """Init resource pool and worker group"""
@@ -482,7 +499,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         else:
                             # Recompute old_log_probs using Pytorch FSDP.
                             with _timer('old_log_prob', timing_raw):
-                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                                old_log_prob = self.actor_wg.compute_log_prob(batch)
                                 batch = batch.union(old_log_prob)
 
                         if self.use_reference_policy:
