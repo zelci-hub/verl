@@ -24,9 +24,11 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
+import asyncio
 from typing import List
 from contextlib import contextmanager
 from omegaconf import DictConfig
+import uuid
 import torch
 import torch.distributed
 from tensordict import TensorDict
@@ -36,7 +38,8 @@ from verl import DataProto
 from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 from vllm.distributed import parallel_state as vllm_ps
-from vllm import LLM, SamplingParams
+from vllm import AsyncLLMEngine, LLM, SamplingParams, TokensPrompt
+from vllm.engine.arg_utils import AsyncEngineArgs
 from verl.third_party.vllm import vllm_version
 
 # TODO
@@ -52,6 +55,51 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
+
+# Monkey patch for AsyncLLMEngine
+import time
+def sleep(self, level: int = 1):
+        """
+        Put the engine to sleep. The engine should not process any requests.
+        The caller should guarantee that no requests are being processed
+        during the sleep period, before `wake_up` is called.
+
+        :param level: The sleep level. Level 1 sleep will offload the model 
+            weights and discard the kv cache. The content of kv cache is 
+            forgotten. Level 1 sleep is good for sleeping and waking up the 
+            engine to run the same model again. The model weights are backed 
+            up in CPU memory. Please make sure there's enough CPU memory to 
+            store the model weights. Level 2 sleep will discard both the model 
+            weights and the kv cache. The content of both the model weights 
+            and kv cache is forgotten. Level 2 sleep is good for sleeping and 
+            waking up the engine to run a different model or update the model, 
+            where previous model weights are not needed. It reduces CPU memory 
+            pressure.
+        """
+        # if self.is_seleping is not initialized
+        if not hasattr(self, 'is_sleeping'):
+            self.is_sleeping = False
+
+        if self.is_sleeping:
+            return
+
+        self.engine.reset_prefix_cache()
+
+        time_before_sleep = time.perf_counter()
+        self.engine.sleep(level=level)
+        time_after_sleep = time.perf_counter()
+        self.is_sleeping = True
+        print("It took %.6f seconds to fall asleep.",time_after_sleep - time_before_sleep)
+
+def wake_up(self):
+    """
+    Wake up the engine from sleep mode. See the :meth:`sleep` method
+    for more details."""
+    self.engine.wake_up()
+
+AsyncLLMEngine.sleep = sleep
+AsyncLLMEngine.wake_up = wake_up
+
 
 
 class vLLMRollout(BaseRollout):
@@ -89,22 +137,40 @@ class vLLMRollout(BaseRollout):
         assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
             "model context length should be greater than total sequence length"
 
-        self.inference_engine = LLM(
-            model=model_path,
-            enable_sleep_mode=True,
-            tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend="external_launcher",
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            disable_custom_all_reduce=True,
-            skip_tokenizer_init=False,
-            max_model_len=config.prompt_length + config.response_length,
-            disable_log_stats=config.disable_log_stats,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-        )
-
+        if config.async_engine:
+            self.inference_engine = AsyncLLMEngine.from_engine_args(
+                AsyncEngineArgs(
+                    model=model_path,
+                    enable_sleep_mode=True,
+                    tensor_parallel_size=tensor_parallel_size,
+                    distributed_executor_backend="external_launcher",
+                    dtype=config.dtype,
+                    enforce_eager=config.enforce_eager,
+                    gpu_memory_utilization=config.gpu_memory_utilization,
+                    disable_custom_all_reduce=True,
+                    skip_tokenizer_init=False,
+                    max_model_len=config.prompt_length + config.response_length,
+                    disable_log_stats=config.disable_log_stats,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    enable_chunked_prefill=config.enable_chunked_prefill,
+                )
+            )
+        else:     
+            self.inference_engine = LLM(
+                model=model_path,
+                enable_sleep_mode=True,
+                tensor_parallel_size=tensor_parallel_size,
+                distributed_executor_backend="external_launcher",
+                dtype=config.dtype,
+                enforce_eager=config.enforce_eager,
+                gpu_memory_utilization=config.gpu_memory_utilization,
+                disable_custom_all_reduce=True,
+                skip_tokenizer_init=False,
+                max_model_len=config.prompt_length + config.response_length,
+                disable_log_stats=config.disable_log_stats,
+                max_num_batched_tokens=max_num_batched_tokens,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+            )
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
 
@@ -178,24 +244,53 @@ class vLLMRollout(BaseRollout):
         
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
-
+        
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=None,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
-                use_tqdm=False)
+            if self.config.async_engine:
+                async def _process_task(task):
+                    async for output in task:
+                        last_output = output
+                    return last_output
 
-        # TODO(sgm): disable logprob when recompute_log_prob is enable
-        # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-
+                async def _async_generate():
+                    tasks = [
+                        self.inference_engine.generate(
+                            prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
+                            sampling_params=self.sampling_params,
+                            request_id=str(uuid.uuid4()),
+                        ) for prompt_tokens in idx_list
+                    ]
+                    
+                    all_outputs = await asyncio.gather(
+                        *[_process_task(task) for task in tasks]
+                    )
+                    return all_outputs
+                outputs = asyncio.run(_async_generate())
+            else:
+                outputs = self.inference_engine.generate(
+                    prompts=None,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    prompt_token_ids=idx_list,
+                    use_tqdm=False)
+        
+        # Extract token IDs and log probabilities
         response = []
+        log_probs = []
         for output in outputs:
             for sample_id in range(len(output.outputs)):
                 response.append(output.outputs[sample_id].token_ids)
-
+                if hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
+                    # Directly use the list of floats returned by vLLM
+                    log_prob_list = []
+                    for log_prob in output.outputs[sample_id].logprobs:
+                        log_prob_list.append(next(iter(log_prob.values())).logprob)
+                    log_probs.append(log_prob_list)
+                else:
+                    log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
         response = pad_2d_list_to_length(response, self.pad_token_id,
+                                         max_length=self.config.response_length).to(idx.device)
+        log_probs = pad_2d_list_to_length(log_probs, 0.0,
                                          max_length=self.config.response_length).to(idx.device)
 
         if self.config.n > 1 and do_sample:
@@ -203,6 +298,7 @@ class vLLMRollout(BaseRollout):
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
             batch_size = batch_size * self.config.n
+
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
@@ -223,13 +319,12 @@ class vLLMRollout(BaseRollout):
             {
                 'prompts': idx,
                 'responses': response,
-                'input_ids': seq,  # here input_ids become the whole sentences
-                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
+                'input_ids': seq,
+                #'old_log_probs': log_probs,  # Added log probabilities
                 'attention_mask': attention_mask,
                 'position_ids': position_ids
             },
             batch_size=batch_size)
-
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
