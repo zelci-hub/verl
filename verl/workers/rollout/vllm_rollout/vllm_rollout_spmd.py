@@ -76,20 +76,8 @@ def sleep(self, level: int = 1):
             where previous model weights are not needed. It reduces CPU memory 
             pressure.
         """
-        # if self.is_seleping is not initialized
-        if not hasattr(self, 'is_sleeping'):
-            self.is_sleeping = False
-
-        if self.is_sleeping:
-            return
-
         self.engine.reset_prefix_cache()
-
-        time_before_sleep = time.perf_counter()
         self.engine.sleep(level=level)
-        time_after_sleep = time.perf_counter()
-        self.is_sleeping = True
-        print("It took %.6f seconds to fall asleep.",time_after_sleep - time_before_sleep)
 
 def wake_up(self):
     """
@@ -325,6 +313,9 @@ class vLLMRollout(BaseRollout):
                 'position_ids': position_ids
             },
             batch_size=batch_size)
+        if self.config.vllm_log_prob:
+            batch['old_log_probs'] = log_probs
+        
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()

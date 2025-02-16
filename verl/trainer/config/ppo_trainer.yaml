@@ -62,7 +62,8 @@ actor_rollout_ref:
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
   rollout:
     name: vllm
-    async_engine: True
+    vllm_log_prob: True # Append log_prob from vllm rollout, disables FSDP log_prob.
+    async_engine: True # Enable async engine for vllm rollout.
     temperature: 1.0
     val_temperature: 0.6
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
