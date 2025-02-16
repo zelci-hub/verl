@@ -13,6 +13,8 @@
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
 from rllm.rewards.math_reward import rllm_reward_fn
+from rllm.rewards.code_reward import rllm_code_reward_fn
+import json 
 
 def _default_compute_score(data_source, solution_str, ground_truth):
     if data_source == 'openai/gsm8k':
@@ -28,8 +30,17 @@ def _default_compute_score(data_source, solution_str, ground_truth):
         from . import prime_math
         res = prime_math.compute_score(solution_str, ground_truth)
     elif data_source in ['codecontests', 'apps', 'codeforces', 'taco']:
-        from . import prime_code
-        res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+        # from . import prime_code
+        # res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+        #covert groud_truth into json
+        assert isinstance(ground_truth,str), f"Expected code groudtturh str, got {type(ground_truth)}"
+        try :
+            ground_truth = json.loads(ground_truth)
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON: {e}")
+            return 0.0
+        res = rllm_code_reward_fn(solution_str, ground_truth)
+        return res
     else:
         return rllm_reward_fn(solution_str, ground_truth)
 
