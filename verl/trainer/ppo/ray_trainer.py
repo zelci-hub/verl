@@ -349,7 +349,8 @@ class RayPPOTrainer(object):
         self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, 'Currently, only support hybrid engine'
+        # TODO: now we also support hybrid engine
+        # assert self.hybrid_engine, 'Currently, only support hybrid engine'
 
         if self.hybrid_engine:
             assert Role.ActorRollout in role_worker_mapping, f'{role_worker_mapping.keys()=}'
