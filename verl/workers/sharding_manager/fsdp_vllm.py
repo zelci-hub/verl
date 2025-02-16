@@ -14,10 +14,13 @@
 
 import os
 import logging
+from typing import Union
 import torch
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.api import ShardingStrategy, ShardedStateDictConfig, StateDictType, FullStateDictConfig
 from torch.distributed.device_mesh import DeviceMesh
+from vllm import AsyncLLMEngine
+
 
 from verl.third_party.vllm import LLM
 from verl.third_party.vllm import parallel_state as vllm_ps
@@ -78,10 +81,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         else:
             self.inference_engine.wake_up()
             # TODO(ZSL): deal with 'hf' format
-            if load_format == 'dtensor':
+            if load_format == 'dtensor' or load_format == 'hf':
                 from verl.third_party.vllm import load_dtensor_weights
-                load_dtensor_weights(
-                    params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
+                if isinstance(self.inference_engine, AsyncLLMEngine):
+                    load_dtensor_weights(
+                        params, self.inference_engine.engine.model_executor.driver_worker.worker.model_runner.model)
+                else:
+                    load_dtensor_weights(
+                        params, self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model)
             else:
                 raise NotImplementedError(f'load_format {load_format} not implemented')
         log_gpu_memory_usage('After sync model weights in sharding manager', logger=logger)
