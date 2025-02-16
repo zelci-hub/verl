@@ -11,8 +11,8 @@ pyarrow>=15.0.0
 pybind11
 ray>=2.38
 tensordict<0.6
-transformers<4.48
-vllm
+transformers<=4.48.2
+vllm @ git+https://github.com/vllm-project/vllm.git@54ed913f3437f9107791e8ea410170b86c968d52#egg=vllm
 wandb
 liger-kernel
 pylatexenc
