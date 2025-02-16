@@ -27,6 +27,9 @@ from verl.workers.fsdp_workers import create_device_mesh, get_sharding_strategy
 
 from codetiming import Timer
 
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
+
 class ActorRolloutRefPipelineWorker(Worker):
     """
     This worker can be instantiated as a standalone actor or a standalone rollout or a standalone reference policy
