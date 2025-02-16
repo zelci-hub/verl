@@ -18,7 +18,16 @@ from verl.single_controller.base import Worker
 from verl.single_controller.ray import RayWorkerGroup, RayClassWithInitArgs
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer, Role
+from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer, 
+    Role, 
+    _timer, 
+    compute_timing_metrics, 
+    compute_data_metrics,
+    dataprotoitem_to_dataproto,
+    compute_advantage,
+    reduce_metrics,
+)
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
