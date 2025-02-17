@@ -27,7 +27,7 @@ import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
 from verl import DataProto
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import register, Dispatch
+from verl.single_controller.base.decorator import register, Dispatch, Execute
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils import hf_tokenizer
 from verl.utils.debug import log_gpu_memory_usage
@@ -69,7 +69,6 @@ def get_sharding_strategy(device_mesh):
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy
-
 
 class ActorRolloutRefWorker(Worker):
     """
@@ -491,6 +490,69 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
+
+    @register(dispatch_mode=Dispatch.GENERATOR, execute_mode=Execute.ALL, blocking=True)
+    def generate_sequences_fn(self, prompts: DataProto = None, **kwargs):
+        """Generator function that yields outputs as they complete.
+        
+        Args:
+            prompts: DataProto containing the input prompts
+            **kwargs: Additional arguments to modify sampling parameters
+            
+        Yields:
+            DataProto: Generated sequence outputs as they complete
+        """
+        assert self._is_rollout, "generate_sequences_fn requires rollout capability"
+        assert hasattr(self.rollout, 'generate_sequences_fn'), "Rollout engine must support generate_sequences_fn"
+        
+        if not hasattr(self, '_generator'):
+            self._generator = None
+        
+        if self._generator is None:
+            if self._is_offload_param:
+                load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                        device_id=torch.cuda.current_device(),
+                                        load_grad=self._is_offload_grad)
+
+            prompts = prompts.to('cuda')
+            prompts.batch = prompts.batch.cuda()
+            meta_info = {
+                'eos_token_id':
+                    self.generation_config.eos_token_id
+                    if self.generation_config is not None else self.tokenizer.eos_token_id,
+                'pad_token_id':
+                    self.generation_config.pad_token_id
+                    if self.generation_config is not None else self.tokenizer.pad_token_id,
+            }
+            prompts.meta_info.update(meta_info)
+            self.rollout_sharding_manager.__enter__()
+            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            self._generator = self.rollout.generate_sequences_fn(prompts=prompts, **kwargs)
+            return None
+        
+        try:
+            _, output = next(self._generator)
+            if output is None:
+                self._generator = None
+                self.rollout_sharding_manager.__exit__(None, None, None)
+                if self._is_offload_param:
+                    offload_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                                offload_grad=self._is_offload_grad)
+                torch.cuda.empty_cache()
+                log_gpu_memory_usage('After generate sequences', logger=logger)
+                return None
+            else:
+                output = self.rollout_sharding_manager.postprocess_data(output)
+                return output.to('cpu')
+        except StopIteration:
+            self._generator = None
+            self.rollout_sharding_manager.__exit__(None, None, None)
+            if self._is_offload_param:
+                offload_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                            offload_grad=self._is_offload_grad)
+            torch.cuda.empty_cache()
+            return None
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):

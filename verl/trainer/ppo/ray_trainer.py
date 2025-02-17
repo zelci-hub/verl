@@ -865,11 +865,23 @@ class RayPPOTrainer(object):
 
                 # pop those keys for generation
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
-
                 with _timer('step', timing_raw):
                     # generate a batch
                     with _timer('gen', timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        # gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        n_responses = self.config.actor_rollout_ref.rollout.n
+                        gen_batch.meta_info['n_responses'] = n_responses
+                        
+                        # Get the generator function which will yield results as they complete
+                        gen_seq_generator = self.actor_rollout_wg.generate_sequences_fn(gen_batch)
+                        # Collect outputs as they become available
+                        all_outputs = []
+                        for output in gen_seq_generator:
+                            print(output)
+                            # output is already a DataProto object
+                            all_outputs.append(output)
+                        # Combine all outputs
+                        gen_batch_output = DataProto.concat(all_outputs)
 
                     if self.config.algorithm.adv_estimator == 'remax':
                         with _timer('gen_max', timing_raw):
