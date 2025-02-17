@@ -14,9 +14,12 @@
 
 from enum import Enum
 from functools import wraps
+import inspect
 from typing import Dict, List, Tuple
 from types import FunctionType
 from verl.protocol import DataProtoFuture
+
+import ray
 
 # here we add a magic number of avoid user-defined function already have this attribute
 MAGIC_ATTR = 'attrs_3141562937'
@@ -35,6 +38,7 @@ class Dispatch(Enum):
     DP_COMPUTE_PROTO = 9
     DP_COMPUTE_PROTO_WITH_FUNC = 10
     DP_COMPUTE_METRIC = 11
+    GENERATOR = 12  # used when first launching a generator function
 
 
 class Execute(Enum):
@@ -297,6 +301,39 @@ def collect_dp_compute_data_proto(worker_group, output):
     return _concat_data_proto_or_future(output)
 
 
+def dispatch_generic_generator(worker_group, *args, **kwargs):
+    return dispatch_dp_compute_data_proto(worker_group, *args, **kwargs)
+
+
+def collect_generic_generator(worker_group, _):
+    """
+    Poll every worker's remote method and yield available results.
+    When a worker returns None (generator exhausted), remove it from polling.
+    """
+    # Initialize with remote calls to generate_sequences_fn
+    active_workers = {worker: worker.actor_rollout_generate_sequences_fn.remote() 
+                     for worker in worker_group._workers}
+    
+    while active_workers:
+        ready_futures, _ = ray.wait(list(active_workers.values()), num_returns=1)
+        for fut in ready_futures:
+            result = ray.get(fut)
+            # Find the worker corresponding to this future
+            worker = None
+            for w, pending in active_workers.items():
+                if pending == fut:
+                    worker = w
+                    break
+            
+            if result is not None:
+                yield result
+                # Queue up next result from this worker by calling the remote method
+                active_workers[worker] = worker.actor_rollout_generate_sequences_fn.remote()
+            else:
+                # Worker is done, remove it
+                del active_workers[worker]
+
+
 def get_predefined_dispatch_fn(dispatch_mode):
     predefined_dispatch_mode_fn = {
         Dispatch.ONE_TO_ALL: {
@@ -342,7 +379,11 @@ def get_predefined_dispatch_fn(dispatch_mode):
         Dispatch.DP_COMPUTE_METRIC: {
             'dispatch_fn': dispatch_dp_compute_data_proto,
             'collect_fn': collect_dp_compute
-        }
+        },
+        Dispatch.GENERATOR: {  # For launching remote generators.
+            'dispatch_fn': dispatch_generic_generator,
+            'collect_fn': collect_generic_generator,
+        },
     }
     return predefined_dispatch_mode_fn[dispatch_mode]
 
@@ -396,13 +437,23 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
     _check_execute_mode(execute_mode=execute_mode)
 
     def decorator(func):
+        is_gen_func = inspect.isgeneratorfunction(func)
 
         @wraps(func)
-        def inner(*args, **kwargs):
+        @ray.method(num_returns='dynamic')
+        def inner_gen(*args, **kwargs):
+            if materialize_futures:
+                args, kwargs = _materialize_futures(*args, **kwargs)
+            for item in func(*args, **kwargs):
+                yield item
+
+        @wraps(func) 
+        def inner_regular(*args, **kwargs):
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
             return func(*args, **kwargs)
 
+        inner = inner_gen if is_gen_func else inner_regular
         attrs = {'dispatch_mode': dispatch_mode, 'execute_mode': execute_mode, 'blocking': blocking}
         setattr(inner, MAGIC_ATTR, attrs)
         return inner

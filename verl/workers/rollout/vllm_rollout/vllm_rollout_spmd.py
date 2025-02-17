@@ -321,3 +321,153 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.free_cache_engine()
 
         return DataProto(batch=batch)
+
+    @torch.no_grad()
+    def generate_sequences_fn(self, prompts: DataProto, **kwargs):
+        """Generator function that yields outputs as they complete (may be out of order).
+        
+        Args:
+            prompts: DataProto containing the input prompts
+            **kwargs: Additional arguments to modify sampling parameters
+        
+        Yields:
+            tuple: (prompt_idx, DataProto) containing the original prompt index and its generated sequence
+        """
+        assert self.config.async_engine, "generate_sequences_fn requires async_engine=True"
+        
+        # rebuild vllm cache engine
+        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+            self.inference_engine.init_cache_engine()
+
+        idx = prompts.batch['input_ids']
+        attention_mask = prompts.batch['attention_mask']
+        position_ids = prompts.batch['position_ids']
+        eos_token_id = prompts.meta_info['eos_token_id']
+        do_sample = prompts.meta_info.get('do_sample', True)
+        if not do_sample:
+            kwargs = {
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 0,
+                'n': 1  # if greedy, only 1 response
+            }
+        if prompts.meta_info.get('val_temperature', None):
+            kwargs['temperature'] = prompts.meta_info['val_temperature']
+
+        # Convert prompts to token lists
+        idx_list = [_pre_process_inputs(self.pad_token_id, x) for x in idx]
+
+        async def _create_task(prompt_idx, task):
+            """Process a single generation task and return its result with original index"""
+            async for output in task:
+                last_output = output
+            return prompt_idx, last_output
+
+        async def _async_generate():
+            # Create all tasks
+            tasks = [
+                _create_task(
+                    prompt_idx,
+                    self.inference_engine.generate(
+                        prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
+                        sampling_params=self.sampling_params,
+                        request_id=str(uuid.uuid4()),
+                    )
+                ) for prompt_idx, prompt_tokens in enumerate(idx_list)
+            ]
+            
+            # Use as_completed to yield results as they finish
+            for completed_task in asyncio.as_completed(tasks):
+                prompt_idx, output = await completed_task
+                
+                # Process output
+                response = []
+                log_probs = []
+                for sample_id in range(len(output.outputs)):
+                    response.append(output.outputs[sample_id].token_ids)
+                    if hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
+                        log_prob_list = []
+                        for log_prob in output.outputs[sample_id].logprobs:
+                            log_prob_list.append(next(iter(log_prob.values())).logprob)
+                        log_probs.append(log_prob_list)
+                    else:
+                        log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
+
+                response = pad_2d_list_to_length(response, self.pad_token_id,
+                                               max_length=self.config.response_length).to(idx.device)
+                log_probs = pad_2d_list_to_length(log_probs, 0.0,
+                                               max_length=self.config.response_length).to(idx.device)
+
+                # Process single sequence
+                single_idx = idx[prompt_idx:prompt_idx+1]
+                single_attention_mask = attention_mask[prompt_idx:prompt_idx+1]
+                single_position_ids = position_ids[prompt_idx:prompt_idx+1]
+                
+                # Handle multiple samples per prompt when n > 1 and sampling
+                if self.config.n > 1 and do_sample:
+                    single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
+                    single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
+                    single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)
+
+                seq = torch.cat([single_idx, response], dim=-1)
+                
+                response_length = response.size(1)
+                delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+                delta_position_id = delta_position_id.unsqueeze(0).repeat(response.size(0), 1)
+                
+                response_position_ids = single_position_ids[:, -1:] + delta_position_id
+                position_ids_out = torch.cat([single_position_ids, response_position_ids], dim=-1)
+                response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+                attention_mask_out = torch.cat((single_attention_mask, response_attention_mask), dim=-1)
+
+                batch = TensorDict(
+                    {
+                        'prompts': single_idx,
+                        'responses': response,
+                        'input_ids': seq,
+                        'attention_mask': attention_mask_out,
+                        'position_ids': position_ids_out
+                    },
+                    batch_size=response.size(0))  # Use actual batch size including n samples
+                if self.config.vllm_log_prob:
+                    batch['old_log_probs'] = log_probs
+                final_batch = DataProto(batch=batch)
+                yield prompt_idx, final_batch
+
+        with self.update_sampling_params(**kwargs):
+            # Create new event loop for this generator
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # Create async generator
+                async_gen = _async_generate()
+                
+                while True:
+                    try:
+                        # Run until next result is ready
+                        prompt_idx, result = loop.run_until_complete(async_gen.__anext__())
+                        yield prompt_idx, result
+                    except StopAsyncIteration:
+                        break
+                    except Exception as e:
+                        # Ensure loop is cleaned up on error
+                        if not loop.is_closed():
+                            loop.close()
+                        raise e
+            finally:
+                # Clean up
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                
+                if not loop.is_closed():
+                    # Run loop one final time to execute any remaining callbacks
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.close()
+
+        # free vllm cache engine
+        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+            self.inference_engine.free_cache_engine()
