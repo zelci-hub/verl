@@ -132,7 +132,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
 
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.rollout_wg.world_size)
-            test_gen_batch_padded.meta_info['val_temperature'] = self.config.rollout_ref.rollout.val_temperature
+            test_gen_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
             test_output_gen_batch_padded = self.rollout_wg.generate_sequences(test_gen_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -416,9 +416,10 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         metrics.update(actor_output_metrics)
                     mini_batch_replay_buffer = []
                     # TODO: update actor policy
-                    updated_actor_module_fsdp = self.actor_wg.get_state_dict()[0]
-                    print('haha ', len(self.actor_wg.get_state_dict()))
-                    self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp)
+                    with _timer('rollout_model_update', timing_raw):
+                        updated_actor_module_fsdp = self.actor_wg.get_state_dict()[0]
+                        print('haha ', len(self.actor_wg.get_state_dict()))
+                        self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp)
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 

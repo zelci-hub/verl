@@ -539,7 +539,10 @@ class ActorRolloutRefPipelineWorker(Worker):
         self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
         # Recreate the rollout instance (and its sharding manager) so that it uses the updated module.
-        self.rollout, self.rollout_sharding_manager = self._build_rollout()
+        # self.rollout, self.rollout_sharding_manager = self._build_rollout()
+        # TODO: we might not need this, double check
+        # with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
+        #     self.rollout_sharding_manager.module.load_state_dict(new_state_dict)
         logger.info("Updated local actor_module_fsdp from new module and recreated rollout instance.")
 
         # Optionally, clear CUDA cache.
