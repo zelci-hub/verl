@@ -876,7 +876,6 @@ class RayPPOTrainer(object):
                         # Collect outputs as they become available
                         all_outputs = []
                         for output in gen_seq_generator:
-                            print(output)
                             # output is already a DataProto object
                             all_outputs.append(output)
                         # Combine all outputs

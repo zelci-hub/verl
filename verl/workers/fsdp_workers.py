@@ -504,9 +504,7 @@ class ActorRolloutRefWorker(Worker):
         
         if self._generator is None:
             if self._is_offload_param:
-                load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                        device_id=torch.cuda.current_device(),
-                                        load_grad=self._is_offload_grad)
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
             prompts = prompts.to('cuda')
             prompts.batch = prompts.batch.cuda()
@@ -520,6 +518,13 @@ class ActorRolloutRefWorker(Worker):
             }
             prompts.meta_info.update(meta_info)
             self.rollout_sharding_manager.__enter__()
+            
+            # after parameters sync with rollout, offload actor model to CPU
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             self._generator = self.rollout.generate_sequences_fn(prompts=prompts, **kwargs)
@@ -528,24 +533,14 @@ class ActorRolloutRefWorker(Worker):
         try:
             _, output = next(self._generator)
             if output is None:
-                self._generator = None
-                self.rollout_sharding_manager.__exit__(None, None, None)
-                if self._is_offload_param:
-                    offload_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                                offload_grad=self._is_offload_grad)
-                torch.cuda.empty_cache()
-                log_gpu_memory_usage('After generate sequences', logger=logger)
-                return None
-            else:
-                output = self.rollout_sharding_manager.postprocess_data(output)
-                return output.to('cpu')
+                raise StopIteration
+            output = self.rollout_sharding_manager.postprocess_data(output)
+            return output.to('cpu')
         except StopIteration:
             self._generator = None
             self.rollout_sharding_manager.__exit__(None, None, None)
-            if self._is_offload_param:
-                offload_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                            offload_grad=self._is_offload_grad)
             torch.cuda.empty_cache()
+            log_gpu_memory_usage('After generate sequences', logger=logger)
             return None
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
