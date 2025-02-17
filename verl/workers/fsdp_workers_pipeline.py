@@ -10,7 +10,7 @@ import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, open_dict
 from verl import DataProto
 from verl.single_controller.base import Worker
-from verl.single_controller.base.decorator import register, Dispatch
+from verl.single_controller.base.decorator import register, Dispatch, Execute
 import verl.utils.hdfs_io as hdfs_io
 from verl.utils import hf_tokenizer
 from verl.utils.debug import log_gpu_memory_usage
@@ -490,16 +490,19 @@ class ActorRolloutRefPipelineWorker(Worker):
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    # @register(dispatch_mode=Dispatch.ONE_TO_ALL, execute_mode=Execute.RANK_ZERO)
+    # @register(execute_mode=Execute.RANK_ZERO)
     def get_state_dict(self):
         """Return the state dict of the FSDP-wrapped module with tensors moved to CPU."""
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT, cfg):
+        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
             new_state_dict = self.actor_module_fsdp.state_dict()
-        return new_state_dict
+        import ray
+        return ray.put(new_state_dict)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def update_rollout_actor_module(self, new_state_dict):
+    def update_rollout_actor_module(self, new_state_dict_ref):
         """
         Update the rollout worker’s actor_module_fsdp with the new FSDP-wrapped actor module.
         This function handles the case where the new module is on a different GPU and may have a 
@@ -510,23 +513,21 @@ class ActorRolloutRefPipelineWorker(Worker):
         Args:
             new_actor_module_fsdp: The new FSDP-wrapped actor module (possibly on a different GPU).
         """
+        import ray
+        new_state_dict = ray.get(new_state_dict_ref)
         # Ensure we are in a rollout role.
         if self.role not in ['rollout', 'actor_rollout', 'actor_rollout_ref']:
             raise ValueError("update_rollout_actor_module should only be called on a rollout worker.")
 
-        # Determine the expected dtype from our local actor_module_fsdp.
-        # For example, we can inspect the dtype of its first parameter.
         local_dtype = None
         for p in self.actor_module_fsdp.parameters():
             local_dtype = p.dtype
             break
         if local_dtype is None:
             raise ValueError("Unable to determine the dtype of the local actor_module_fsdp.")
-
-        # Convert each tensor in the state dict to the local dtype.
-        # This also ensures that the values will be moved to the proper device when loaded.
+        # Convert each tensor in the state dict to the correct dtype and device
         new_state_dict = {
-            k: v.to(local_dtype)
+            k: v.to(dtype=local_dtype)
             for k, v in new_state_dict.items()
         }
 
@@ -539,7 +540,10 @@ class ActorRolloutRefPipelineWorker(Worker):
         self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
         # Recreate the rollout instance (and its sharding manager) so that it uses the updated module.
-        self.rollout, self.rollout_sharding_manager = self._build_rollout()
+        # self.rollout, self.rollout_sharding_manager = self._build_rollout()
+        # TODO: we might not need this, double check
+        # with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
+        #     self.rollout_sharding_manager.module.load_state_dict(new_state_dict)
         logger.info("Updated local actor_module_fsdp from new module and recreated rollout instance.")
 
         # Optionally, clear CUDA cache.
