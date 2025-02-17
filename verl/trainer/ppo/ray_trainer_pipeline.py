@@ -314,6 +314,39 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
         self.rollout_wg = all_wg['rollout']
         self.rollout_wg.init_model()
 
+    def _save_checkpoint(self):
+        # path: given_path + `/global_step_{global_steps}` + `/actor`
+        local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
+                                                f'global_step_{self.global_steps}')
+        actor_local_path = os.path.join(local_global_step_folder, 'actor')
+
+        actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
+            self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'actor')
+        self.actor_wg.save_checkpoint(actor_local_path,
+                                              actor_remote_path,
+                                              self.global_steps,
+                                              remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
+
+        if self.use_critic:
+            critic_local_path = os.path.join(local_global_step_folder, 'critic')
+            critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
+                self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'critic')
+            self.critic_wg.save_checkpoint(critic_local_path,
+                                           critic_remote_path,
+                                           self.global_steps,
+                                           remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
+
+        # save dataloader
+        dataloader_local_path = os.path.join(local_global_step_folder, 'data.pt')
+        import dill
+        torch.save(self.train_dataloader, dataloader_local_path, pickle_module=dill)
+
+        # latest checkpointed iteration tracker (for atomic usage)
+        local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
+                                                           'latest_checkpointed_iteration.txt')
+        with open(local_latest_checkpointed_iteration, 'w') as f:
+            f.write(str(self.global_steps))
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == 'disable':
             return 0
@@ -417,9 +450,8 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                     mini_batch_replay_buffer = []
                     # TODO: update actor policy
                     with _timer('rollout_model_update', timing_raw):
-                        updated_actor_module_fsdp = self.actor_wg.get_state_dict()[0]
-                        print('haha ', len(self.actor_wg.get_state_dict()))
-                        self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp)
+                        updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()[0]
+                        self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
