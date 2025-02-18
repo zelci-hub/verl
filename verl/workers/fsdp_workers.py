@@ -32,9 +32,9 @@ import verl.utils.hdfs_io as hdfs_io
 from verl.utils import hf_tokenizer
 from verl.utils.debug import log_gpu_memory_usage
 from verl.utils.fs import copy_local_path_from_hdfs
-from verl.utils.fsdp_utils import get_fsdp_wrap_policy, offload_fsdp_grad, init_fn, get_init_weight_context_manager
-from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer, \
-    load_fsdp_param_and_grad
+from verl.utils.fsdp_utils import get_fsdp_wrap_policy, init_fn, get_init_weight_context_manager
+from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_model_to_cpu, load_fsdp_optimizer, \
+    load_fsdp_model_to_gpu
 from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.flops_counter import FlopsCounter
@@ -107,11 +107,9 @@ class ActorRolloutRefWorker(Worker):
         self._is_ref = self.role in ['ref', 'actor_rollout_ref']
 
         self._is_offload_param = False
-        self._is_offload_grad = False
         self._is_offload_optimizer = False
         if self._is_actor:
             self._is_offload_param = self.config.actor.fsdp_config.get('param_offload', False)
-            self._is_offload_grad = self.config.actor.fsdp_config.get('grad_offload', False)
             self._is_offload_optimizer = self.config.actor.fsdp_config.get('optimizer_offload', False)
         elif self._is_ref:
             # TODO: it seems that manual offload is slowly than FSDP offload
@@ -363,10 +361,6 @@ class ActorRolloutRefWorker(Worker):
             # get the original unwrapped module
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
 
-            if self._is_offload_param:
-                # param is require during state_dict in sharding manager
-                offload_fsdp_grad(module=self.actor_module_fsdp)
-                log_gpu_memory_usage('After offload actor grad during init', logger=logger)
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
                 log_gpu_memory_usage('After offload actor optimizer during init', logger=logger)
@@ -412,9 +406,7 @@ class ActorRolloutRefWorker(Worker):
 
         assert self._is_actor
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
 
@@ -445,7 +437,7 @@ class ActorRolloutRefWorker(Worker):
             output = output.to('cpu')
 
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
         torch.cuda.empty_cache()
@@ -457,9 +449,7 @@ class ActorRolloutRefWorker(Worker):
 
         assert self._is_rollout
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         prompts.batch = prompts.batch.cuda()
         meta_info = {
@@ -472,6 +462,13 @@ class ActorRolloutRefWorker(Worker):
         }
         prompts.meta_info.update(meta_info)
         with self.rollout_sharding_manager:
+
+            # after parameters sync with rollout, offload actor model to CPU
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
@@ -483,16 +480,13 @@ class ActorRolloutRefWorker(Worker):
 
         output = output.to('cpu')
 
-        if self._is_offload_param:
-            # NOTE(sgm): the grad is already in CPU, only offload param here
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
         # clear kv cache
         torch.cuda.empty_cache()
         log_gpu_memory_usage('After recompute log prob', logger=logger)
         return output
 
     @register(dispatch_mode=Dispatch.GENERATOR, execute_mode=Execute.ALL, blocking=True)
-    def generate_sequences_fn(self, prompts: DataProto = None, **kwargs):
+    def generate_sequences_async(self, prompts: DataProto = None, **kwargs):
         """Generator function that yields outputs as they complete.
         
         Args:
@@ -502,17 +496,18 @@ class ActorRolloutRefWorker(Worker):
         Yields:
             DataProto: Generated sequence outputs as they complete
         """
-        assert self._is_rollout, "generate_sequences_fn requires rollout capability"
-        assert hasattr(self.rollout, 'generate_sequences_fn'), "Rollout engine must support generate_sequences_fn"
+        assert self._is_rollout, "generate_sequences_async requires rollout capability"
+        assert hasattr(self.rollout, 'generate_sequences_async'), "Rollout engine must support generate_sequences_async"
         
         if not hasattr(self, '_generator'):
             self._generator = None
         
+        if prompts is None and self._generator is None:
+            return None
+        
         if self._generator is None:
             if self._is_offload_param:
-                load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                        device_id=torch.cuda.current_device(),
-                                        load_grad=self._is_offload_grad)
+                load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
             prompts = prompts.to('cuda')
             prompts.batch = prompts.batch.cuda()
@@ -526,41 +521,35 @@ class ActorRolloutRefWorker(Worker):
             }
             prompts.meta_info.update(meta_info)
             self.rollout_sharding_manager.__enter__()
+            
+            # after parameters sync with rollout, offload actor model to CPU
+            if self._is_offload_param:
+                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            if self._is_offload_optimizer:
+                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            self._generator = self.rollout.generate_sequences_fn(prompts=prompts, **kwargs)
+            self._generator = self.rollout.generate_sequences_async(prompts=prompts, **kwargs)
             return None
-        
         try:
-            _, output = next(self._generator)
+            output = next(self._generator)
             if output is None:
-                self._generator = None
-                self.rollout_sharding_manager.__exit__(None, None, None)
-                if self._is_offload_param:
-                    offload_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                                offload_grad=self._is_offload_grad)
-                torch.cuda.empty_cache()
-                log_gpu_memory_usage('After generate sequences', logger=logger)
-                return None
-            else:
-                output = self.rollout_sharding_manager.postprocess_data(output)
-                return output.to('cpu')
+                raise StopIteration
+            output = self.rollout_sharding_manager.postprocess_data(output)
+            return output.to('cpu')
         except StopIteration:
             self._generator = None
             self.rollout_sharding_manager.__exit__(None, None, None)
-            if self._is_offload_param:
-                offload_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                            offload_grad=self._is_offload_grad)
             torch.cuda.empty_cache()
+            log_gpu_memory_usage('After generate sequences', logger=logger)
             return None
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
         data = data.to('cuda')
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size_per_gpu
@@ -583,8 +572,7 @@ class ActorRolloutRefWorker(Worker):
             self.actor.actor_module._handle.reshard(True)
 
         if self._is_offload_param:
-            # NOTE(sgm): the grad is already in CPU, only offload param here
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
         # clear kv cache
         torch.cuda.empty_cache()
@@ -624,9 +612,7 @@ class ActorRolloutRefWorker(Worker):
         assert self._is_actor
         import torch
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.save_checkpoint(local_path=local_path,
                                                 hdfs_path=hdfs_path,
@@ -655,19 +641,17 @@ class ActorRolloutRefWorker(Worker):
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, path, del_local_after_load=False):
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         self.checkpoint_manager.load_checkpoint(path=path, del_local_after_load=del_local_after_load)
 
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
 
 class CriticWorker(Worker):
@@ -698,7 +682,6 @@ class CriticWorker(Worker):
 
         # set FSDP offload params
         self._is_offload_param = self.config.model.fsdp_config.param_offload
-        self._is_offload_grad = self.config.model.fsdp_config.grad_offload
         self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
 
         # normalize config
@@ -839,7 +822,7 @@ class CriticWorker(Worker):
             self.config)
 
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.critic_module)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
 
@@ -860,9 +843,7 @@ class CriticWorker(Worker):
         data = data.to('cuda')
 
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.critic_module,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.critic_module)
         micro_batch_size = self.config.forward_micro_batch_size_per_gpu
         data.meta_info['micro_batch_size'] = micro_batch_size
         data.meta_info['max_token_len'] = self.config.forward_max_token_len_per_gpu
@@ -876,17 +857,14 @@ class CriticWorker(Worker):
 
         output = output.to('cpu')
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
-        torch.cuda.empty_cache()
+            offload_fsdp_model_to_cpu(self.critic_module)
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_critic(self, data: DataProto):
         data = data.to('cuda')
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.critic_module,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.critic_module)
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=torch.cuda.current_device())
 
@@ -910,7 +888,7 @@ class CriticWorker(Worker):
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
 
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.critic_module)
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
         torch.cuda.empty_cache()
@@ -921,9 +899,7 @@ class CriticWorker(Worker):
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, remove_previous_ckpt=False):
         import torch
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.critic_module,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.critic_module)
 
         self.checkpoint_manager.save_checkpoint(local_path=local_path,
                                                 hdfs_path=hdfs_path,
@@ -933,21 +909,19 @@ class CriticWorker(Worker):
         torch.distributed.barrier()
 
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.critic_module)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, path, del_local_after_load=True):
         import torch
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.critic_module,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_model_to_gpu(self.critic_module)
 
         self.checkpoint_manager.load_checkpoint(path=path, del_local_after_load=del_local_after_load)
 
         torch.distributed.barrier()
         if self._is_offload_param:
-            offload_fsdp_param_and_grad(module=self.critic_module, offload_grad=self._is_offload_grad)
+            offload_fsdp_model_to_cpu(self.critic_module)
 
 
 # TODO(sgm): we may need to extract it to dp_reward_model.py

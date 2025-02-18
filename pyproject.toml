@@ -39,19 +39,26 @@ dependencies = [
     "pybind11",
     "ray>=2.38",
     "tensordict",
-    "transformers<=4.48.2",
+    "transformers",
     "vllm @ git+https://github.com/vllm-project/vllm.git@54ed913f3437f9107791e8ea410170b86c968d52#egg=vllm",
+    "pandas",
     "peft",
-    "liger-kernel",
+    "pyarrow>=15.0.0",
     "pylatexenc",
+    "ray>=2.10",
+    "tensordict<0.6",
+    "transformers",
+    "vllm<=0.6.3.post1",
+    'wandb',
 ]
 
 # Optional dependencies (extras_require in setup.py)
 [project.optional-dependencies]
 test = [
-  "pytest", "yapf"
+  "pytest", "yapf", "py-spy",
 ]
 prime = ["pyext"]
+gpu = ["liger-kernel", "flash-attn"]
 
 # URLs
 [project.urls]

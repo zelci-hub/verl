@@ -55,7 +55,15 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
         remaining_pad = pad_size
         while remaining_pad > 0:
             take_size = min(remaining_pad, len(data))
-            padding_protos.append(data[:take_size])
+            # Create padding proto with None values for non-tensor batch
+            padding_proto = copy.deepcopy(data[:take_size])
+            if padding_proto.non_tensor_batch is not None:
+                for key in padding_proto.non_tensor_batch:
+                    if isinstance(padding_proto.non_tensor_batch[key], np.ndarray):
+                        # Create array of None values with same shape except first dimension
+                        none_array = np.array([None] * take_size, dtype=object)
+                        padding_proto.non_tensor_batch[key] = none_array
+            padding_protos.append(padding_proto)
             remaining_pad -= take_size
         data_padded = DataProto.concat([data] + padding_protos)
     else:
@@ -66,7 +74,21 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
 
 def unpad_dataproto(data: 'DataProto', pad_size):
     if pad_size != 0:
-        data = data[:-pad_size]
+        # Remove padding where non_tensor_batch values are None
+        if data.non_tensor_batch is not None:
+            valid_indices = []
+            for i in range(len(data)):
+                is_valid = True
+                for key in data.non_tensor_batch:
+                    if isinstance(data.non_tensor_batch[key], np.ndarray):
+                        if data.non_tensor_batch[key][i] is None:
+                            is_valid = False
+                            break
+                if is_valid:
+                    valid_indices.append(i)
+            data = data[valid_indices]
+        else:
+            data = data[:-pad_size]
     return data
 
 

@@ -33,6 +33,8 @@ import torch
 import torch.distributed
 from tensordict import TensorDict
 from torch import nn
+import numpy as np
+from copy import deepcopy
 
 from verl import DataProto
 from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
@@ -236,25 +238,10 @@ class vLLMRollout(BaseRollout):
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             if self.config.async_engine:
-                async def _process_task(task):
-                    async for output in task:
-                        last_output = output
-                    return last_output
-
-                async def _async_generate():
-                    tasks = [
-                        self.inference_engine.generate(
-                            prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
-                            sampling_params=self.sampling_params,
-                            request_id=str(uuid.uuid4()),
-                        ) for prompt_tokens in idx_list
-                    ]
-                    
-                    all_outputs = await asyncio.gather(
-                        *[_process_task(task) for task in tasks]
-                    )
-                    return all_outputs
-                outputs = asyncio.run(_async_generate())
+                outputs = []
+                for output in self.generate_sequences_async(prompts):
+                    outputs.append(output)
+                return DataProto.concat(outputs)
             else:
                 outputs = self.inference_engine.generate(
                     prompts=None,  # because we have already convert it to prompt token id
@@ -281,11 +268,18 @@ class vLLMRollout(BaseRollout):
         log_probs = pad_2d_list_to_length(log_probs, 0.0,
                                          max_length=self.config.response_length).to(idx.device)
 
+        non_tensor_batch = deepcopy(prompts.non_tensor_batch)
         if self.config.n > 1 and do_sample:
             idx = idx.repeat_interleave(self.config.n, dim=0)
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
             batch_size = batch_size * self.config.n
+            # Create interleaved non_tensor_batch
+            non_tensor_batch = {}
+            for key, val in prompts.non_tensor_batch.items():
+                # Repeat each element n times (interleaved)
+                repeated_val = np.repeat(val, self.config.n)
+                non_tensor_batch[key] = repeated_val
 
         seq = torch.cat([idx, response], dim=-1)
 
@@ -308,7 +302,6 @@ class vLLMRollout(BaseRollout):
                 'prompts': idx,
                 'responses': response,
                 'input_ids': seq,
-                #'old_log_probs': log_probs,  # Added log probabilities
                 'attention_mask': attention_mask,
                 'position_ids': position_ids
             },
@@ -319,11 +312,15 @@ class vLLMRollout(BaseRollout):
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
-
-        return DataProto(batch=batch)
+        
+        return DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info=prompts.meta_info
+        )
 
     @torch.no_grad()
-    def generate_sequences_fn(self, prompts: DataProto, **kwargs):
+    def generate_sequences_async(self, prompts: DataProto, **kwargs):
         """Generator function that yields outputs as they complete (may be out of order).
         
         Args:
@@ -333,8 +330,7 @@ class vLLMRollout(BaseRollout):
         Yields:
             tuple: (prompt_idx, DataProto) containing the original prompt index and its generated sequence
         """
-        assert self.config.async_engine, "generate_sequences_fn requires async_engine=True"
-        
+        assert self.config.async_engine, "generate_sequences_async requires async_engine=True"
         # rebuild vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
@@ -343,6 +339,14 @@ class vLLMRollout(BaseRollout):
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
         eos_token_id = prompts.meta_info['eos_token_id']
+
+        batch_size = idx.size(0)
+
+        idx_list = []
+        # parse idx from torch.Tensor to List[List[str]]
+        for i in range(batch_size):
+            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+
         do_sample = prompts.meta_info.get('do_sample', True)
         if not do_sample:
             kwargs = {
@@ -356,8 +360,7 @@ class vLLMRollout(BaseRollout):
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
 
-        # Convert prompts to token lists
-        idx_list = [_pre_process_inputs(self.pad_token_id, x) for x in idx]
+        self.update_sampling_params(**kwargs)
 
         async def _create_task(prompt_idx, task):
             """Process a single generation task and return its result with original index"""
@@ -404,12 +407,21 @@ class vLLMRollout(BaseRollout):
                 single_idx = idx[prompt_idx:prompt_idx+1]
                 single_attention_mask = attention_mask[prompt_idx:prompt_idx+1]
                 single_position_ids = position_ids[prompt_idx:prompt_idx+1]
-                
+                non_tensor_batch = {}
+                for key, val in prompts.non_tensor_batch.items():
+                    # Get single value and repeat n times
+                    single_val = val[prompt_idx:prompt_idx+1]
+                    non_tensor_batch[key] = single_val
                 # Handle multiple samples per prompt when n > 1 and sampling
                 if self.config.n > 1 and do_sample:
                     single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
                     single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
                     single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)
+                    # Create interleaved non_tensor_batch for this subset
+                    for key, val in non_tensor_batch.items():
+                        # Get single value and repeat n times
+                        repeated_val = np.repeat(val, self.config.n)
+                        non_tensor_batch[key] = repeated_val
 
                 seq = torch.cat([single_idx, response], dim=-1)
                 
@@ -430,44 +442,48 @@ class vLLMRollout(BaseRollout):
                         'attention_mask': attention_mask_out,
                         'position_ids': position_ids_out
                     },
-                    batch_size=response.size(0))  # Use actual batch size including n samples
+                    batch_size=response.size(0))
                 if self.config.vllm_log_prob:
                     batch['old_log_probs'] = log_probs
-                final_batch = DataProto(batch=batch)
-                yield prompt_idx, final_batch
+                final_batch = DataProto(
+                    batch=batch,
+                    non_tensor_batch=non_tensor_batch,
+                    meta_info=prompts.meta_info
+                )
+                yield final_batch
 
-        with self.update_sampling_params(**kwargs):
-            # Create new event loop for this generator
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
+        # Create new event loop for this generator
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # Create async generator
+            async_gen = _async_generate()
             
-            try:
-                # Create async generator
-                async_gen = _async_generate()
-                
-                while True:
-                    try:
-                        # Run until next result is ready
-                        prompt_idx, result = loop.run_until_complete(async_gen.__anext__())
-                        yield prompt_idx, result
-                    except StopAsyncIteration:
-                        break
-                    except Exception as e:
-                        # Ensure loop is cleaned up on error
-                        if not loop.is_closed():
-                            loop.close()
-                        raise e
-            finally:
-                # Clean up
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                
-                if not loop.is_closed():
-                    # Run loop one final time to execute any remaining callbacks
-                    loop.run_until_complete(loop.shutdown_asyncgens())
-                    loop.close()
+            while True:
+                try:
+                    # Run until next result is ready
+                    result = loop.run_until_complete(async_gen.__anext__())
+                    yield result
+                except StopAsyncIteration:
+                    break
+                except Exception as e:
+                    # Ensure loop is cleaned up on error
+                    if not loop.is_closed():
+                        loop.close()
+                    raise e
+        finally:
+            # Clean up
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            
+            if not loop.is_closed():
+                # Run loop one final time to execute any remaining callbacks
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
 
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
+        return None
