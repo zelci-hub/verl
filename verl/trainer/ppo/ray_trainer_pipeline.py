@@ -119,6 +119,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
 
                         with Timer('adv', timing_raw):
                             reward_tensor = self.reward_fn(mini_batch)
+                            print('Reward tensor:', reward_tensor.sum(-1))
                             mini_batch.batch['token_level_scores'] = reward_tensor
                         
                                                 # Rejection sampling based on rewards
@@ -186,7 +187,9 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         update_metrics(metrics, mini_batch_metrics)
 
                     with Timer('rollout_model_update', timing_raw):
-                        updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()[0]
+                        updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
+                        if isinstance(updated_actor_module_fsdp_ref, list):
+                            updated_actor_module_fsdp_ref = updated_actor_module_fsdp_ref[0]
                         self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
                     training_batch = DataProto.concat(training_batch)
                     
