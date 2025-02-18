@@ -670,7 +670,25 @@ class RayPPOTrainer(object):
                                                      role='actor_rollout')
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         else:
-            raise NotImplementedError
+            assert Role.Actor in self.role_worker_mapping and Role.Rollout in self.role_worker_mapping, "Actor and Rollout must be in role_worker_mapping"
+            actor_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
+            # actor_gpu_ids = actor_resource_pool.gpu_assignments if isinstance(actor_resource_pool, RayResourcePool) else None
+            actor_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.Actor],
+                config=self.config.actor_rollout_ref,
+                role='actor',
+            )
+            self.resource_pool_to_cls[actor_resource_pool]['actor'] = actor_cls
+
+            # Get rollout resource pool
+            rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+            # rollout_gpu_ids = rollout_resource_pool.gpu_assignments if isinstance(rollout_resource_pool, RayResourcePool) else None
+            rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.Rollout],
+                config=self.config.actor_rollout_ref,
+                role='rollout',
+            )
+            self.resource_pool_to_cls[rollout_resource_pool]['rollout'] = rollout_cls
 
         # create critic
         if self.use_critic:
@@ -720,8 +738,14 @@ class RayPPOTrainer(object):
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg['actor_rollout']
-        self.actor_rollout_wg.init_model()
+        if self.hybrid_engine:
+            self.actor_rollout_wg = all_wg['actor_rollout']
+            self.actor_rollout_wg.init_model()
+        else:
+            self.actor_wg = all_wg['actor']
+            self.actor_wg.init_model()
+            self.rollout_wg = all_wg['rollout']
+            self.rollout_wg.init_model()
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -812,7 +836,10 @@ class RayPPOTrainer(object):
         attention_mask = batch.batch['attention_mask']
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
-        world_size = self.actor_rollout_wg.world_size
+        if self.hybrid_engine:
+            world_size = self.actor_rollout_wg.world_size
+        else:
+            world_size = self.actor_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
                                                               k_partitions=world_size,
                                                               equal_size=True)

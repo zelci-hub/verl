@@ -310,8 +310,16 @@ def collect_generic_generator(worker_group, _):
     Poll every worker's remote method and yield available results.
     When a worker returns None (generator exhausted), remove it from polling.
     """
-    # Initialize with remote calls to generate_sequences_async
-    active_workers = {worker: worker.actor_rollout_generate_sequences_async.remote() 
+    # Determine which method to call based on what's available
+    if hasattr(worker_group._workers[0], 'actor_rollout_generate_sequences_async'):
+        method_name = 'actor_rollout_generate_sequences_async'
+    elif hasattr(worker_group._workers[0], 'rollout_generate_sequences_async'):
+        method_name = 'rollout_generate_sequences_async'
+    else:
+        method_name = 'generate_sequences_async'
+
+    # Initialize with remote calls to the appropriate method
+    active_workers = {worker: getattr(worker, method_name).remote() 
                      for worker in worker_group._workers}
     
     while active_workers:
@@ -327,8 +335,8 @@ def collect_generic_generator(worker_group, _):
             
             if result is not None:
                 yield result
-                # Queue up next result from this worker by calling the remote method
-                active_workers[worker] = worker.actor_rollout_generate_sequences_async.remote()
+                # Queue up next result from this worker using the same method
+                active_workers[worker] = getattr(worker, method_name).remote()
             else:
                 # Worker is done, remove it
                 del active_workers[worker]
