@@ -603,19 +603,18 @@ class RayPPOTrainer(object):
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
-            test_gen_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
-            test_gen_batch.meta_info = {
+            #test_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
+            test_batch.meta_info = {
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
                 'recompute_log_prob': False,
                 'do_sample': False,
                 'validate': True,
             }
-
             # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            test_gen_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
+            test_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
+            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
@@ -625,7 +624,7 @@ class RayPPOTrainer(object):
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
-            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch = test_output_gen_batch #test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
             reward_tensor = self.val_reward_fn(test_batch)
@@ -871,7 +870,6 @@ class RayPPOTrainer(object):
                         # Collect outputs in a dict keyed by prompt_idx
                         outputs = []
                         for output in gen_seq_generator:
-                            # output is already a DataProto object
                             outputs.append(output)
                         # Combine all outputs
                         batch = DataProto.concat(outputs)
