@@ -447,7 +447,7 @@ class ActorRolloutRefWorker(Worker):
 
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO, blocking=True)
-    def update_actor_mini_batch_step(self, data: DataProto):
+    def update_actor_mini_batch(self, data: DataProto):
         data = data.to('cuda')
 
         assert self._is_actor
@@ -463,7 +463,7 @@ class ActorRolloutRefWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
-                metrics = self.actor.update_policy_mini_batch_step(data=data)
+                metrics = self.actor.update_policy_mini_batch(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -652,7 +652,7 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, execute_mode=Execute.RANK_ZERO, blocking=False)
     def get_state_dict(self):
         """Return the state dict of the FSDP-wrapped module with tensors moved to CPU."""
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)

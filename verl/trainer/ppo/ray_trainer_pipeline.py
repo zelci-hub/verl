@@ -1,24 +1,15 @@
-import os
 import uuid
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from enum import Enum
 from pprint import pprint
 from typing import Any, List, Type, Dict
 import torch
 from copy import deepcopy
 import time
+import threading
+import queue
 
 import numpy as np
-from codetiming import Timer
-from omegaconf import OmegaConf, open_dict
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
-from verl.single_controller.base import Worker
-# from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
-from verl.single_controller.ray import RayWorkerGroup, RayClassWithInitArgs
-from verl.single_controller.ray.base import create_colocated_worker_cls
-from verl.trainer.ppo import core_algos
+
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer, 
     Role, 
@@ -28,7 +19,6 @@ from verl.trainer.ppo.ray_trainer import (
     compute_advantage,
     reduce_metrics,
 )
-
 
 class Timer:
     def __init__(self, name, timing_dict):
@@ -85,11 +75,6 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
 
         # we start from step 1
         self.global_steps += 1
-        # import pdb; pdb.set_trace()
-        # timing_raw = {}
-        # with Timer('broadcast_actor', timing_raw):
-        #     updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()[0]
-        #     self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
     
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
@@ -99,10 +84,18 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                 batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                 
                 with Timer('step', timing_raw):
+                    replay_queue = queue.Queue()
+                    
+                    def create_replay_queue(generator, q):
+                        with Timer('gen', timing_raw):
+                            for item in generator:
+                                if item is None:
+                                    return
+                                q.put(item)     
                     # Get the generator function which will yield results as they complete
                     gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=batch)
-                    # Collect outputs in a dict keyed by prompt_idx
-                    outputs = []
+                    thread = threading.Thread(target=create_replay_queue, args=(gen_seq_generator, replay_queue))
+                    thread.start()
                     
                     ppo_train_batch_size = self.config.data.train_batch_size
                     ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
@@ -112,13 +105,15 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                     training_batch = []
                     for mini_batch_iter in range(ppo_step_minibatch_iter):
                         mini_batch_metrics = {}
-                        with Timer('gen', timing_raw):
+                        start_time = time.perf_counter()         
+                        with Timer('pipeline_gen', timing_raw):
                             outputs = []
                             for _ in range(ppo_mini_batch_size):
-                                output = next(gen_seq_generator)
+                                output = replay_queue.get()
                                 outputs.append(output)
                             mini_batch = DataProto.concat(outputs)
-                        
+                        end_time = time.perf_counter()
+                        print(f"Generate mini batch took {end_time - start_time:.2f} seconds")
                         if  mini_batch_iter == ppo_step_minibatch_iter - 1:
                             mini_batch.meta_info['last_mini_batch'] = True
 
@@ -180,9 +175,12 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         # compute global_valid tokens
                         mini_batch.meta_info['global_token_num'] = torch.sum(mini_batch.batch['attention_mask'], dim=-1).tolist()
                         # update actor
+                        start_time = time.perf_counter()
                         with Timer('update_actor', timing_raw):
-                            actor_output = self.actor_wg.update_actor(mini_batch)
+                            actor_output = self.actor_wg.update_actor_mini_batch(mini_batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                        end_time = time.perf_counter()
+                        print(f"Actor update took {end_time - start_time:.2f} seconds")
                         mini_batch_metrics.update(actor_output_metrics)
                         training_batch.append(mini_batch)
                         update_metrics(metrics, mini_batch_metrics)
@@ -229,4 +227,3 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         with Timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
                     return
-
