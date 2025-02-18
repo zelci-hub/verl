@@ -502,6 +502,9 @@ class ActorRolloutRefWorker(Worker):
         if not hasattr(self, '_generator'):
             self._generator = None
         
+        if prompts is None and self._generator is None:
+            return None
+        
         if self._generator is None:
             if self._is_offload_param:
                 load_fsdp_model_to_gpu(self.actor_module_fsdp)
@@ -529,9 +532,8 @@ class ActorRolloutRefWorker(Worker):
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
             self._generator = self.rollout.generate_sequences_fn(prompts=prompts, **kwargs)
             return None
-        
         try:
-            _, output = next(self._generator)
+            output = next(self._generator)
             if output is None:
                 raise StopIteration
             output = self.rollout_sharding_manager.postprocess_data(output)

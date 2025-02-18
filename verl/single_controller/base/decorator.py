@@ -437,23 +437,13 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
     _check_execute_mode(execute_mode=execute_mode)
 
     def decorator(func):
-        is_gen_func = inspect.isgeneratorfunction(func)
 
         @wraps(func)
-        @ray.method(num_returns='dynamic')
-        def inner_gen(*args, **kwargs):
-            if materialize_futures:
-                args, kwargs = _materialize_futures(*args, **kwargs)
-            for item in func(*args, **kwargs):
-                yield item
-
-        @wraps(func) 
-        def inner_regular(*args, **kwargs):
+        def inner(*args, **kwargs):
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
             return func(*args, **kwargs)
 
-        inner = inner_gen if is_gen_func else inner_regular
         attrs = {'dispatch_mode': dispatch_mode, 'execute_mode': execute_mode, 'blocking': blocking}
         setattr(inner, MAGIC_ATTR, attrs)
         return inner

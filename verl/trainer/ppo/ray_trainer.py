@@ -861,29 +861,24 @@ class RayPPOTrainer(object):
                 timing_raw = {}
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
 
-                # pop those keys for generation
-                gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids'])
                 with _timer('step', timing_raw):
-                    # generate a batch
                     with _timer('gen', timing_raw):
-                        # gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        n_responses = self.config.actor_rollout_ref.rollout.n
-                        gen_batch.meta_info['n_responses'] = n_responses
-                        
-                        # Get the generator function which will yield results as they complete
-                        gen_seq_generator = self.actor_rollout_wg.generate_sequences_fn(gen_batch)
-                        # Collect outputs as they become available
-                        all_outputs = []
+                        # batch = self.actor_rollout_wg.generate_sequences(batch)
+                        #Get the generator function which will yield results as they complete
+                        gen_seq_generator = self.actor_rollout_wg.generate_sequences_fn(prompts=batch)
+                        # Collect outputs in a dict keyed by prompt_idx
+                        outputs = []
                         for output in gen_seq_generator:
                             # output is already a DataProto object
-                            all_outputs.append(output)
+                            outputs.append(output)
                         # Combine all outputs
-                        gen_batch_output = DataProto.concat(all_outputs)
+                        batch = DataProto.concat(outputs)
 
                     if self.config.algorithm.adv_estimator == 'remax':
                         with _timer('gen_max', timing_raw):
-                            gen_baseline_batch = deepcopy(gen_batch)
+                            gen_baseline_batch = deepcopy(batch)
                             gen_baseline_batch.meta_info['do_sample'] = False
                             gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
 
@@ -896,12 +891,6 @@ class RayPPOTrainer(object):
                             batch.batch['reward_baselines'] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
-
-                    # This code matches a prompt ID with its N responses.
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
 
                     with _timer('adv', timing_raw):
                         # compute scores using reward model and/or reward function
