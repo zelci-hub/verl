@@ -864,15 +864,17 @@ class RayPPOTrainer(object):
 
                 with _timer('step', timing_raw):
                     with _timer('gen', timing_raw):
-                        # batch = self.actor_rollout_wg.generate_sequences(batch)
-                        #Get the generator function which will yield results as they complete
-                        gen_seq_generator = self.actor_rollout_wg.generate_sequences_fn(prompts=batch)
-                        # Collect outputs in a dict keyed by prompt_idx
-                        outputs = []
-                        for output in gen_seq_generator:
-                            outputs.append(output)
-                        # Combine all outputs
-                        batch = DataProto.concat(outputs)
+                        if not self.config.actor_rollout_ref.rollout.async_engine:
+                            batch = self.actor_rollout_wg.generate_sequences(batch)
+                        else:
+                            #Get the generator function which will yield results as they complete
+                            gen_seq_generator = self.actor_rollout_wg.generate_sequences_async(prompts=batch)
+                            # Collect outputs in a dict keyed by prompt_idx
+                            outputs = []
+                            for output in gen_seq_generator:
+                                outputs.append(output)
+                            # Combine all outputs
+                            batch = DataProto.concat(outputs)
 
                     if self.config.algorithm.adv_estimator == 'remax':
                         with _timer('gen_max', timing_raw):

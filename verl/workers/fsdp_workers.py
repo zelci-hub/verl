@@ -486,7 +486,7 @@ class ActorRolloutRefWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.GENERATOR, execute_mode=Execute.ALL, blocking=True)
-    def generate_sequences_fn(self, prompts: DataProto = None, **kwargs):
+    def generate_sequences_async(self, prompts: DataProto = None, **kwargs):
         """Generator function that yields outputs as they complete.
         
         Args:
@@ -496,8 +496,8 @@ class ActorRolloutRefWorker(Worker):
         Yields:
             DataProto: Generated sequence outputs as they complete
         """
-        assert self._is_rollout, "generate_sequences_fn requires rollout capability"
-        assert hasattr(self.rollout, 'generate_sequences_fn'), "Rollout engine must support generate_sequences_fn"
+        assert self._is_rollout, "generate_sequences_async requires rollout capability"
+        assert hasattr(self.rollout, 'generate_sequences_async'), "Rollout engine must support generate_sequences_async"
         
         if not hasattr(self, '_generator'):
             self._generator = None
@@ -530,7 +530,7 @@ class ActorRolloutRefWorker(Worker):
 
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            self._generator = self.rollout.generate_sequences_fn(prompts=prompts, **kwargs)
+            self._generator = self.rollout.generate_sequences_async(prompts=prompts, **kwargs)
             return None
         try:
             output = next(self._generator)

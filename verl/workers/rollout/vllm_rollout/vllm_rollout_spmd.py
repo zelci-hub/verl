@@ -239,7 +239,7 @@ class vLLMRollout(BaseRollout):
         with self.update_sampling_params(**kwargs):
             if self.config.async_engine:
                 outputs = []
-                for output in self.generate_sequences_fn(prompts):
+                for output in self.generate_sequences_async(prompts):
                     outputs.append(output)
                 return DataProto.concat(outputs)
             else:
@@ -320,7 +320,7 @@ class vLLMRollout(BaseRollout):
         )
 
     @torch.no_grad()
-    def generate_sequences_fn(self, prompts: DataProto, **kwargs):
+    def generate_sequences_async(self, prompts: DataProto, **kwargs):
         """Generator function that yields outputs as they complete (may be out of order).
         
         Args:
@@ -330,7 +330,7 @@ class vLLMRollout(BaseRollout):
         Yields:
             tuple: (prompt_idx, DataProto) containing the original prompt index and its generated sequence
         """
-        assert self.config.async_engine, "generate_sequences_fn requires async_engine=True"
+        assert self.config.async_engine, "generate_sequences_async requires async_engine=True"
         # rebuild vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
