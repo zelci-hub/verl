@@ -623,8 +623,8 @@ class RayPPOTrainer(object):
             output_ids = test_output_gen_batch.batch['responses']
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
-
-            test_batch = test_output_gen_batch #test_batch.union(test_output_gen_batch)
+            
+            test_batch =  dataprotoitem_to_dataproto(test_output_gen_batch) #test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
             reward_tensor = self.val_reward_fn(test_batch)
