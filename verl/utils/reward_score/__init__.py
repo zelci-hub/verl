@@ -29,20 +29,8 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
     ]:
         from . import prime_math
         res = prime_math.compute_score(solution_str, ground_truth)
-    # elif data_source in ['codecontests', 'apps', 'codeforces', 'taco']:
-    #     # from . import prime_code
-    #     # res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
-    #     #covert groud_truth into json
-    #     assert isinstance(ground_truth,str), f"Expected code groudtturh str, got {type(ground_truth)}"
-    #     try :
-    #         ground_truth = json.loads(ground_truth)
-    #     except json.JSONDecodeError as e:
-    #         print(f"Error decoding JSON: {e}")
-    #         return 0.0
-    #     res = rllm_code_reward_fn(solution_str, ground_truth)
-    #     return res
     else:
-        return rllm_reward_fn(solution_str, ground_truth)
+        return rllm_reward_fn(data_source, solution_str, ground_truth)
 
     if isinstance(res, (int, float, bool)):
         return float(res)
