@@ -761,7 +761,13 @@ class RayPPOTrainer(object):
 
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'actor')
-        self.actor_rollout_wg.save_checkpoint(actor_local_path,
+        
+        if self.hybrid_engine:
+            save_actor_cls = self.actor_rollout_wg
+        else:
+            save_actor_cls = self.actor_wg
+        
+        save_actor_cls.save_checkpoint(actor_local_path,
                                               actor_remote_path,
                                               self.global_steps,
                                               remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
