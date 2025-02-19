@@ -101,10 +101,12 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                     ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
                     assert ppo_train_batch_size % ppo_mini_batch_size == 0, "PPO mini batch size must be a divisor of the total training batch size"
                     ppo_step_minibatch_iter = ppo_train_batch_size // ppo_mini_batch_size
+                    num_loops = ppo_step_minibatch_iter +1 if batch_iter > 0 else  ppo_step_minibatch_iter 
                     # Initialize Empty data proto
                     training_batch = []
-                    for mini_batch_iter in range(ppo_step_minibatch_iter):
-                        if mini_batch_iter == ppo_step_minibatch_iter - 1:
+                    for mini_batch_iter in range(num_loops):
+                        
+                        if mini_batch_iter == num_loops - 1:
                             while True:
                                 if replay_queue.qsize() == ppo_mini_batch_size:
                                     break
@@ -121,10 +123,8 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         end_time = time.perf_counter()
                         print(f"Generate mini batch took {end_time - start_time:.2f} seconds")
                         
-                        if total_mini_batch_iters%ppo_step_minibatch_iter == ppo_step_minibatch_iter - 1:
+                        if total_mini_batch_iters % ppo_step_minibatch_iter == ppo_step_minibatch_iter - 1:
                             mini_batch.meta_info['last_mini_batch'] = True
-                        #if #mini_batch_iter + last_iter_mini_batch_iter == ppo_step_minibatch_iter - 1:
-                        #    mini_batch.meta_info['last_mini_batch'] = True
 
                         with Timer('adv', timing_raw):
                             reward_tensor = self.reward_fn(mini_batch)
