@@ -236,7 +236,10 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                 
                 for k, v in metrics.items():
                     if isinstance(v, (list, np.ndarray)):
-                        metrics[k] = np.mean(v)
+                        if 'batch/' in k:
+                            metrics[k] = np.sum(v)
+                        else:
+                            metrics[k] = np.mean(v)
                 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
