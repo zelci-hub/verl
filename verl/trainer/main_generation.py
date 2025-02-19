@@ -30,6 +30,7 @@ from verl.utils.model import compute_position_id_with_mask
 import pandas as pd
 
 from transformers import AutoTokenizer
+import wandb
 
 from verl import DataProto
 from verl.utils.fs import copy_local_path_from_hdfs
@@ -44,6 +45,8 @@ def main(config):
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
+
+    wandb.init(project='verl')
 
     # Check if output file already exists
     if os.path.exists(config.data.output_path):
@@ -215,7 +218,8 @@ def select_reward_fn(data_source):
         return math.compute_score
     else:
         from rllm.rewards.math_reward import rllm_reward_fn
-        return rllm_reward_fn
+        reward_fn = lambda s, gt: rllm_reward_fn(data_source, s, gt)
+        return reward_fn
 
 if __name__ == '__main__':
     main()

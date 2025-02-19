@@ -42,7 +42,7 @@ rollout:
   n: 1
   n_val: 1
   enable_chunked_prefill: True
-  async_engine: False
+  async_engine: True
   disable_log_stats: True
   vllm_log_prob: True # Append log_prob from vllm rollout, disables FSDP log_prob.
 
