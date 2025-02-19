@@ -613,7 +613,10 @@ class RayPPOTrainer(object):
                 'validate': True,
             }
             # pad to be divisible by dp_size
-            test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
+            if self.hybrid_engine:
+                test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
+            else:
+                test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.rollout_wg.world_size)
             test_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
             if self.hybrid_engine:
                 test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_batch_padded)
