@@ -42,6 +42,20 @@ def update_metrics(metrics, new_metrics):
             metrics[k] = []
         metrics[k].append(v)
 
+class SortedQueue(queue.PriorityQueue):
+    def __init__(self):
+        super().__init__()
+
+    def put(self, data):
+        """Sort by attention mask sum before inserting into queue."""
+        batch_size = data[-1].batch["attention_mask"].shape[0]
+        priority = -data[-1].batch["attention_mask"].view(batch_size, -1).sum().item()
+        super().put((priority, data))  # Priority queue sorts by first element
+
+    def get(self):
+        """Retrieve and return the highest-priority item."""
+        return super().get()[1]
+
 class RayPPOPipelineTrainer(RayPPOTrainer):
     
     def fit(self):
@@ -75,7 +89,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
 
         # we start from step 1
         self.global_steps += 1
-        replay_queue = queue.Queue()
+        replay_queue = SortedQueue() #queue.Queue()
         total_mini_batch_iters = 0
         for epoch in range(self.config.trainer.total_epochs):
             for batch_iter, batch_dict in enumerate(self.train_dataloader):
@@ -155,17 +169,17 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                             mini_batch_metrics['batch/solve_all'] = solve_all
                             
                             
-                            # if self.config.actor_rollout_ref.rollout.vllm_log_prob:
-                            #     # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
-                            #     mini_batch.meta_info['micro_batch_size'] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-                            #     mini_batch.meta_info['max_token_len'] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
-                            #     mini_batch.meta_info['use_dynamic_bsz'] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
-                            #     mini_batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
-                            # else:
-                            # Recompute old_log_probs using Pytorch FSDP.
-                            with Timer('old_log_prob', timing_raw):
-                                old_log_prob = self.actor_wg.compute_log_prob(mini_batch)
-                                mini_batch = mini_batch.union(old_log_prob)
+                            if self.config.actor_rollout_ref.rollout.vllm_log_prob:
+                                # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
+                                mini_batch.meta_info['micro_batch_size'] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+                                mini_batch.meta_info['max_token_len'] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
+                                mini_batch.meta_info['use_dynamic_bsz'] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+                                mini_batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
+                            else:
+                                # Recompute old_log_probs using Pytorch FSDP.
+                                with Timer('old_log_prob', timing_raw):
+                                    old_log_prob = self.actor_wg.compute_log_prob(mini_batch)
+                                    mini_batch = mini_batch.union(old_log_prob)
 
                             if self.use_reference_policy:
                                 # compute reference log_prob
