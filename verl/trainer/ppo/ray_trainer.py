@@ -349,7 +349,8 @@ class RayPPOTrainer(object):
         self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
-        assert self.hybrid_engine, 'Currently, only support hybrid engine'
+        # TODO: now we also support hybrid engine
+        # assert self.hybrid_engine, 'Currently, only support hybrid engine'
 
         if self.hybrid_engine:
             assert Role.ActorRollout in role_worker_mapping, f'{role_worker_mapping.keys()=}'
@@ -395,8 +396,8 @@ class RayPPOTrainer(object):
 
         # 1. Check total batch size for data correctness
         real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        assert real_train_batch_size % n_gpus == 0, \
-            f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
+        # assert real_train_batch_size % n_gpus == 0, \
+        #     f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
         # We throw an error if the user sets both. The new convention is "..._micro_batch_size_per_gpu".
@@ -612,9 +613,15 @@ class RayPPOTrainer(object):
                 'validate': True,
             }
             # pad to be divisible by dp_size
-            test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
+            if self.hybrid_engine:
+                test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
+            else:
+                test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.rollout_wg.world_size)
             test_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
-            test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_batch_padded)
+            if self.hybrid_engine:
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_batch_padded)
+            else:
+                test_output_gen_batch_padded = self.rollout_wg.generate_sequences(test_batch_padded)
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
@@ -669,7 +676,25 @@ class RayPPOTrainer(object):
                                                      role='actor_rollout')
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         else:
-            raise NotImplementedError
+            assert Role.Actor in self.role_worker_mapping and Role.Rollout in self.role_worker_mapping, "Actor and Rollout must be in role_worker_mapping"
+            actor_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Actor)
+            # actor_gpu_ids = actor_resource_pool.gpu_assignments if isinstance(actor_resource_pool, RayResourcePool) else None
+            actor_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.Actor],
+                config=self.config.actor_rollout_ref,
+                role='actor',
+            )
+            self.resource_pool_to_cls[actor_resource_pool]['actor'] = actor_cls
+
+            # Get rollout resource pool
+            rollout_resource_pool = self.resource_pool_manager.get_resource_pool(Role.Rollout)
+            # rollout_gpu_ids = rollout_resource_pool.gpu_assignments if isinstance(rollout_resource_pool, RayResourcePool) else None
+            rollout_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.Rollout],
+                config=self.config.actor_rollout_ref,
+                role='rollout',
+            )
+            self.resource_pool_to_cls[rollout_resource_pool]['rollout'] = rollout_cls
 
         # create critic
         if self.use_critic:
@@ -719,8 +744,14 @@ class RayPPOTrainer(object):
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg['actor_rollout']
-        self.actor_rollout_wg.init_model()
+        if self.hybrid_engine:
+            self.actor_rollout_wg = all_wg['actor_rollout']
+            self.actor_rollout_wg.init_model()
+        else:
+            self.actor_wg = all_wg['actor']
+            self.actor_wg.init_model()
+            self.rollout_wg = all_wg['rollout']
+            self.rollout_wg.init_model()
 
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
@@ -730,7 +761,13 @@ class RayPPOTrainer(object):
 
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'actor')
-        self.actor_rollout_wg.save_checkpoint(actor_local_path,
+        
+        if self.hybrid_engine:
+            save_actor_cls = self.actor_rollout_wg
+        else:
+            save_actor_cls = self.actor_wg
+        
+        save_actor_cls.save_checkpoint(actor_local_path,
                                               actor_remote_path,
                                               self.global_steps,
                                               remove_previous_ckpt=self.config.trainer.remove_previous_ckpt_in_save)
@@ -811,7 +848,10 @@ class RayPPOTrainer(object):
         attention_mask = batch.batch['attention_mask']
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch['attention_mask'].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
-        world_size = self.actor_rollout_wg.world_size
+        if self.hybrid_engine:
+            world_size = self.actor_rollout_wg.world_size
+        else:
+            world_size = self.actor_wg.world_size
         global_partition_lst = get_seqlen_balanced_partitions(global_seqlen_lst,
                                                               k_partitions=world_size,
                                                               equal_size=True)

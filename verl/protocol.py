@@ -659,6 +659,13 @@ class DataProtoFuture:
             arg_future_lst.append(arg_future)
         return arg_future_lst
 
+    def wait(self):
+        ready_refs, remaining_refs = ray.wait(self.futures, timeout=0)  # dp_size.
+        if len(ready_refs) == len(self.futures):
+            return True
+        else:
+            return False
+
     def get(self):
         output = ray.get(self.futures)  # dp_size.
         for o in output:
