@@ -76,7 +76,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
         # we start from step 1
         self.global_steps += 1
         replay_queue = queue.Queue()
-        last_iter_mini_batch_iter = 0
+        total_mini_batch_iters = 0
         for epoch in range(self.config.trainer.total_epochs):
             for batch_iter, batch_dict in enumerate(self.train_dataloader):
                 metrics = {}
@@ -85,7 +85,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                 batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                 
                 with Timer('step', timing_raw):
-                    
+
                     def create_replay_queue(generator, q):
                         with Timer('gen', timing_raw):
                             for gen_idx, item in enumerate(generator):
@@ -104,7 +104,11 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                     # Initialize Empty data proto
                     training_batch = []
                     for mini_batch_iter in range(ppo_step_minibatch_iter):
-                        if not replay_queue.empty() and replay_queue.queue[-1][1] == ppo_train_batch_size - 1 and replay_queue.queue[-1][0] == batch_iter:
+                        if mini_batch_iter == ppo_step_minibatch_iter - 1:
+                            while True:
+                                if replay_queue.qsize() == ppo_mini_batch_size:
+                                    break
+                                time.sleep(1)
                             break
                         mini_batch_metrics = {}
                         start_time = time.perf_counter()         
@@ -116,8 +120,11 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                             mini_batch = DataProto.concat(outputs)
                         end_time = time.perf_counter()
                         print(f"Generate mini batch took {end_time - start_time:.2f} seconds")
-                        if  mini_batch_iter + last_iter_mini_batch_iter == ppo_step_minibatch_iter - 1:
+                        
+                        if total_mini_batch_iters%ppo_step_minibatch_iter == ppo_step_minibatch_iter - 1:
                             mini_batch.meta_info['last_mini_batch'] = True
+                        #if #mini_batch_iter + last_iter_mini_batch_iter == ppo_step_minibatch_iter - 1:
+                        #    mini_batch.meta_info['last_mini_batch'] = True
 
                         with Timer('adv', timing_raw):
                             reward_tensor = self.reward_fn(mini_batch)
@@ -148,17 +155,17 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                             mini_batch_metrics['batch/solve_all'] = solve_all
                             
                             
-                            if self.config.actor_rollout_ref.rollout.vllm_log_prob:
-                                # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
-                                mini_batch.meta_info['micro_batch_size'] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-                                mini_batch.meta_info['max_token_len'] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
-                                mini_batch.meta_info['use_dynamic_bsz'] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
-                                mini_batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
-                            else:
-                                # Recompute old_log_probs using Pytorch FSDP.
-                                with Timer('old_log_prob', timing_raw):
-                                    old_log_prob = self.actor_wg.compute_log_prob(mini_batch)
-                                    mini_batch = mini_batch.union(old_log_prob)
+                            # if self.config.actor_rollout_ref.rollout.vllm_log_prob:
+                            #     # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
+                            #     mini_batch.meta_info['micro_batch_size'] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+                            #     mini_batch.meta_info['max_token_len'] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
+                            #     mini_batch.meta_info['use_dynamic_bsz'] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
+                            #     mini_batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
+                            # else:
+                            # Recompute old_log_probs using Pytorch FSDP.
+                            with Timer('old_log_prob', timing_raw):
+                                old_log_prob = self.actor_wg.compute_log_prob(mini_batch)
+                                mini_batch = mini_batch.union(old_log_prob)
 
                             if self.use_reference_policy:
                                 # compute reference log_prob
@@ -187,8 +194,9 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         mini_batch_metrics.update(actor_output_metrics)
                         training_batch.append(mini_batch)
                         update_metrics(metrics, mini_batch_metrics)
+                        total_mini_batch_iters += 1
 
-                    last_iter_mini_batch_iter = (mini_batch_iter + last_iter_mini_batch_iter - 1) % ppo_step_minibatch_iter
+                    # last_iter_mini_batch_iter = (mini_batch_iter + last_iter_mini_batch_iter - 1) % ppo_step_minibatch_iter
                     with Timer('rollout_model_update', timing_raw):
                         updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
                         if isinstance(updated_actor_module_fsdp_ref, list):
