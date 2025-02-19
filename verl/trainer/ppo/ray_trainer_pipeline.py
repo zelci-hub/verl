@@ -174,7 +174,6 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
-                        last_iter_mini_batch_iter = (mini_batch_iter + last_iter_mini_batch_iter - 1) % ppo_step_minibatch_iter
                         self._balance_batch(mini_batch, metrics=mini_batch_metrics)
                         # compute global_valid tokens
                         mini_batch.meta_info['global_token_num'] = torch.sum(mini_batch.batch['attention_mask'], dim=-1).tolist()
@@ -189,6 +188,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         training_batch.append(mini_batch)
                         update_metrics(metrics, mini_batch_metrics)
 
+                    last_iter_mini_batch_iter = (mini_batch_iter + last_iter_mini_batch_iter - 1) % ppo_step_minibatch_iter
                     with Timer('rollout_model_update', timing_raw):
                         updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
                         if isinstance(updated_actor_module_fsdp_ref, list):
