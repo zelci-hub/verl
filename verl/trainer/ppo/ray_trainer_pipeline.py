@@ -75,23 +75,23 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
 
         # we start from step 1
         self.global_steps += 1
-    
+        replay_queue = queue.Queue()
+        last_iter_mini_batch_iter = 0
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_iter, batch_dict in enumerate(self.train_dataloader):
                 metrics = {}
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                 
                 with Timer('step', timing_raw):
-                    replay_queue = queue.Queue()
                     
                     def create_replay_queue(generator, q):
                         with Timer('gen', timing_raw):
-                            for item in generator:
+                            for gen_idx, item in enumerate(generator):
                                 if item is None:
                                     return
-                                q.put(item)     
+                                q.put((batch_iter, gen_idx, item))     
                     # Get the generator function which will yield results as they complete
                     gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=batch)
                     thread = threading.Thread(target=create_replay_queue, args=(gen_seq_generator, replay_queue))
@@ -104,17 +104,19 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                     # Initialize Empty data proto
                     training_batch = []
                     for mini_batch_iter in range(ppo_step_minibatch_iter):
+                        if not replay_queue.empty() and replay_queue.queue[-1][1] == ppo_train_batch_size - 1 and replay_queue.queue[-1][0] == batch_iter:
+                            break
                         mini_batch_metrics = {}
                         start_time = time.perf_counter()         
                         with Timer('pipeline_gen', timing_raw):
                             outputs = []
                             for _ in range(ppo_mini_batch_size):
-                                output = replay_queue.get()
+                                _, _, output = replay_queue.get()
                                 outputs.append(output)
                             mini_batch = DataProto.concat(outputs)
                         end_time = time.perf_counter()
                         print(f"Generate mini batch took {end_time - start_time:.2f} seconds")
-                        if  mini_batch_iter == ppo_step_minibatch_iter - 1:
+                        if  mini_batch_iter + last_iter_mini_batch_iter == ppo_step_minibatch_iter - 1:
                             mini_batch.meta_info['last_mini_batch'] = True
 
                         with Timer('adv', timing_raw):
@@ -172,6 +174,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
 
+                        last_iter_mini_batch_iter = (mini_batch_iter + last_iter_mini_batch_iter - 1) % ppo_step_minibatch_iter
                         self._balance_batch(mini_batch, metrics=mini_batch_metrics)
                         # compute global_valid tokens
                         mini_batch.meta_info['global_token_num'] = torch.sum(mini_batch.batch['attention_mask'], dim=-1).tolist()
