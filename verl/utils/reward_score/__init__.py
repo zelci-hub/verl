@@ -30,8 +30,7 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
         from . import prime_math
         res = prime_math.compute_score(solution_str, ground_truth)
     else:
-        # return rllm_reward_fn(data_source, solution_str, ground_truth)
-        return rllm_reward_fn(solution_str, ground_truth)
+        return rllm_reward_fn(data_source, solution_str, ground_truth)
 
     if isinstance(res, (int, float, bool)):
         return float(res)
