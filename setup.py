@@ -36,7 +36,7 @@ install_requires = [
   'ray>=2.10',
   'tensordict<0.6',
   'transformers',
-  'vllm<=0.6.3.post1',
+  'vllm @ git+https://github.com/vllm-project/vllm.git@54ed913f3437f9107791e8ea410170b86c968d52#egg=vllm',
   'wandb',
 ]
 
