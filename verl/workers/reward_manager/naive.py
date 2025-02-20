@@ -62,12 +62,10 @@ class NaiveRewardManager:
             sequences_str = self.tokenizer.decode(sequences)
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
-
             # select rm_score
             data_source = data_item.non_tensor_batch['data_source']
 
             extra_info = data_item.non_tensor_batch.get('extra_info', None)
-
             score = self.compute_score(
                 data_source=data_source,
                 solution_str=sequences_str,
@@ -81,7 +79,7 @@ class NaiveRewardManager:
 
                 if already_print_data_sources[data_source] < self.num_examine:
                     already_print_data_sources[data_source] += 1
-                    print(sequences_str)      
+                    print(sequences_str, ground_truth)      
             return i, score, valid_response_length
 
         # Process items in parallel using ThreadPoolExecutor
