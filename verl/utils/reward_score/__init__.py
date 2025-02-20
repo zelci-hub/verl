@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
-from rllm.rewards.math_reward import rllm_reward_fn
+from rllm.rewards.rl_reward import rllm_reward_fn
 # from rllm.rewards.code_reward import rllm_code_reward_fn
 import json 
 

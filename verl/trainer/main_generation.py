@@ -217,7 +217,7 @@ def select_reward_fn(data_source):
         from verl.utils.reward_score import math
         return math.compute_score
     else:
-        from rllm.rewards.math_reward import rllm_reward_fn
+        from rllm.rewards.rl_reward import rllm_reward_fn
         reward_fn = lambda s, gt: rllm_reward_fn(data_source, s, gt)
         return reward_fn
 

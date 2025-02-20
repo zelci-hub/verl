@@ -23,7 +23,7 @@ from verl.utils.reward_score import math, gsm8k
 import pandas as pd
 import numpy as np
 
-from rllm.rewards.math_reward import rllm_reward_fn
+from rllm.rewards.rl_reward import rllm_reward_fn
 
 
 def select_reward_fn(data_source):
