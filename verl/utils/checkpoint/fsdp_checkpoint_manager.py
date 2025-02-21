@@ -93,6 +93,14 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if self.lr_scheduler is not None:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
 
+        del model_state_dict
+        del optimizer_state_dict
+        del extra_state_dict
+        torch.cuda.empty_cache()
+
+        # wait for everyone to load
+        torch.distributed.barrier()
+
     def save_checkpoint(self, local_path: str, global_step: int, remove_previous_ckpt=False, *args, **kwargs):
         # record the previous global step
         self.previous_global_step = global_step
@@ -143,6 +151,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             os.makedirs(hf_local_path, exist_ok=True)
             self.model._fsdp_wrapped_module.config.save_pretrained(hf_local_path)
             self.tokenizer.save_pretrained(hf_local_path)
+
+        del model_state_dict
+        del optimizer_state_dict
+        del lr_scheduler_state_dict
+        torch.cuda.empty_cache()
 
         torch.distributed.barrier()
 
