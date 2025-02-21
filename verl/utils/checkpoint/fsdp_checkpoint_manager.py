@@ -152,11 +152,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             self.model._fsdp_wrapped_module.config.save_pretrained(hf_local_path)
             self.tokenizer.save_pretrained(hf_local_path)
 
-        del model_state_dict
-        del optimizer_state_dict
-        del lr_scheduler_state_dict
-        torch.cuda.empty_cache()
-
         torch.distributed.barrier()
 
         self.previous_save_local_path = local_path
