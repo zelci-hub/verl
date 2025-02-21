@@ -829,7 +829,12 @@ class RayPPOTrainer(object):
         actor_path = os.path.join(global_step_folder, 'actor')
         critic_path = os.path.join(global_step_folder, 'critic')
         # load actor
-        self.actor_rollout_wg.load_checkpoint(actor_path,
+        if self.hybrid_engine:
+            load_actor_cls = self.actor_rollout_wg
+        else:
+            load_actor_cls = self.actor_wg
+            
+        load_actor_cls.load_checkpoint(actor_path,
                                               del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # load critic
         if self.use_critic:
