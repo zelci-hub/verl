@@ -711,7 +711,7 @@ class ActorRolloutRefWorker(Worker):
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
         return ray.put(new_state_dict)
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def update_rollout_actor_module(self, new_state_dict_ref):
         """
         Update the rollout worker’s actor_module_fsdp with the new FSDP-wrapped actor module.
