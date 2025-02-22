@@ -122,7 +122,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         
                         if mini_batch_iter == num_loops - 1:
                             while True:
-                                if replay_queue.qsize() == ppo_mini_batch_size:
+                                if replay_queue.qsize() >= ppo_mini_batch_size:
                                     break
                                 time.sleep(1)
                             break
