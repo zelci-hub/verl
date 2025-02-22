@@ -837,7 +837,7 @@ class RayPPOTrainer(object):
         load_actor_cls.load_checkpoint(actor_path,
                                               del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
-        if self.hybrid_engine:
+        if not self.hybrid_engine:
             self.rollout_wg.load_checkpoint(actor_path,
                                                   del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
         # load critic

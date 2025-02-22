@@ -122,6 +122,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                         
                         if mini_batch_iter == num_loops - 1:
                             while True:
+                                print(f"Replay queue size: {replay_queue.qsize()}")
                                 if replay_queue.qsize() >= ppo_mini_batch_size:
                                     break
                                 time.sleep(1)
@@ -177,6 +178,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                                 mini_batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
                             else:
                                 # Recompute old_log_probs using Pytorch FSDP.
+                                # This is also incorrect in the async version.
                                 with Timer('old_log_prob', timing_raw):
                                     old_log_prob = self.actor_wg.compute_log_prob(mini_batch)
                                     mini_batch = mini_batch.union(old_log_prob)
