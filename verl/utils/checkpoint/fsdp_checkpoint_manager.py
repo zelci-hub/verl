@@ -51,7 +51,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
     def load_checkpoint(self, path=None, del_local_after_load=False, *args, **kwargs):
         if path is None:
             return
-
         # every rank download its own checkpoint
         remote_model_path = os.path.join(path, f'model_world_size_{self.world_size}_rank_{self.rank}.pt')
         remote_optim_path = os.path.join(path, f'optim_world_size_{self.world_size}_rank_{self.rank}.pt')
@@ -63,10 +62,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         local_optim_path = copy_local_path_from_hdfs(remote_optim_path)
         local_extra_state_path = copy_local_path_from_hdfs(remote_extra_state_path)
 
-        model_state_dict = torch.load(local_model_path)
-        optimizer_state_dict = torch.load(local_optim_path)
-        extra_state_dict = torch.load(local_extra_state_path)
-
         if del_local_after_load:
             try:
                 os.remove(local_model_path) if is_non_local(local_model_path) else None
@@ -77,7 +72,18 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     f'[rank-{self.rank}]: remove local resume ckpt file after loading failed, exception {e} will be ignored'
                 )
 
-        lr_scheduler_state_dict = extra_state_dict['lr_scheduler']
+        model_state_dict = torch.load(local_model_path)
+        optimizer_state_dict = None
+        if self.optimizer is not None:
+            optimizer_state_dict = torch.load(local_optim_path)
+        
+        extra_state_dict = None
+        if self.lr_scheduler is not None:
+            extra_state_dict = torch.load(local_extra_state_path)
+
+        lr_scheduler_state_dict = None
+        if self.lr_scheduler is not None:
+            lr_scheduler_state_dict = extra_state_dict['lr_scheduler']
 
         state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
@@ -86,7 +92,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             if self.optimizer is not None:
                 self.optimizer.load_state_dict(optimizer_state_dict)
         # recover random state
-        if 'rng' in extra_state_dict:
+        if extra_state_dict is not None and 'rng' in extra_state_dict:
             # 'rng' may not exist for backward compatibility
             self.load_rng_state(extra_state_dict['rng'])
 

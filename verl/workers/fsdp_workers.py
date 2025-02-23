@@ -400,6 +400,12 @@ class ActorRolloutRefWorker(Worker):
                                                             optimizer=self.actor.actor_optimizer,
                                                             lr_scheduler=self.actor_lr_scheduler,
                                                             tokenizer=self.tokenizer)
+        elif self._is_rollout:
+            self.flops_counter = FlopsCounter(self.actor_model_config)
+            self.checkpoint_manager = FSDPCheckpointManager(model=self.actor_module_fsdp,
+                                                            optimizer=None,
+                                                            lr_scheduler=None,
+                                                            tokenizer=self.tokenizer)
 
         torch.cuda.empty_cache()
 

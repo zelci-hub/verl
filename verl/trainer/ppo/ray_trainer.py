@@ -846,8 +846,15 @@ class RayPPOTrainer(object):
                                               del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
         if not self.hybrid_engine:
-            self.rollout_wg.load_checkpoint(actor_path,
-                                                  del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+            # Broadcast actor to rollout workers if not using hybrid engine
+            updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
+            if isinstance(updated_actor_module_fsdp_ref, list):
+                updated_actor_module_fsdp_ref = updated_actor_module_fsdp_ref[0]
+            self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
+        # if not self.hybrid_engine:
+        #     self.rollout_wg.load_checkpoint(actor_path,
+        #                                           del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
+        
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(critic_path,
