@@ -148,7 +148,6 @@ def is_valid_checkpoint(ckpt_path):
 
     # 1) Check for required top-level files
     required_pt_files = [
-        'actor.lock',
         'data.pt'
     ]
     for fname in required_pt_files:
@@ -202,24 +201,23 @@ def find_latest_ckpt_path(path, directory_format="global_step_{}"):
     if path is None:
         return None
 
-    tracker_file = get_checkpoint_tracker_filename(path)
-    tracker_candidate = None
-
+    # tracker_file = get_checkpoint_tracker_filename(path)
+    # tracker_candidate = None
     # Try reading the tracker file first
-    if os.path.exists(tracker_file):
-        try:
-            with open(tracker_file, "rb") as f:
-                iteration = int(f.read().decode())
-            tracker_candidate = os.path.join(path, directory_format.format(iteration))
-            if os.path.exists(tracker_candidate) and is_valid_checkpoint(tracker_candidate):
-                print(f"Found valid checkpoint from tracker: {tracker_candidate}")
-                return tracker_candidate
-            else:
-                print(f"Tracker checkpoint is invalid or missing: {tracker_candidate}")
-        except Exception as e:
-            print(f"Error reading tracker file {tracker_file}: {e}")
-    else:
-        print(f"Checkpoint tracker file does not exist: {tracker_file}")
+    # if os.path.exists(tracker_file):
+    #     try:
+    #         with open(tracker_file, "rb") as f:
+    #             iteration = int(f.read().decode())
+    #         tracker_candidate = os.path.join(path, directory_format.format(iteration))
+    #         if os.path.exists(tracker_candidate) and is_valid_checkpoint(tracker_candidate):
+    #             print(f"Found valid checkpoint from tracker: {tracker_candidate}")
+    #             return tracker_candidate
+    #         else:
+    #             print(f"Tracker checkpoint is invalid or missing: {tracker_candidate}")
+    #     except Exception as e:
+    #         print(f"Error reading tracker file {tracker_file}: {e}")
+    # else:
+    #     print(f"Checkpoint tracker file does not exist: {tracker_file}")
 
     # If tracker-based checkpoint is invalid, try all possible `global_step_X` folders
     try:
