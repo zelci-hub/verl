@@ -499,12 +499,6 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             reward_positions,
         ) = zip(*results)
 
-        # initial_state_batch = torch.nn.utils.rnn.pad_sequence(
-        #     all_initial_tokens_list,
-        #     batch_first=True,
-        #     padding_value=self.tokenizer.pad_token_id,
-        # )
-
         # reverse the list and create tensors, pad, then flip to achieve left padding
         initial_state_batch = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(i[::-1]) for i in all_initial_tokens_list], 
