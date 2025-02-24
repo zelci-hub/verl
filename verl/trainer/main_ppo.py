@@ -19,6 +19,29 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import ray
 import hydra
 
+from rllm.environments.browsergym import BatchBrowserGym
+from rllm.models.web_agent import WebAgent
+
+ENV_CLASS_MAPPING = {
+    'browsergym': BatchBrowserGym,
+}
+
+AGENT_CLASS_MAPPING = {
+    'webagent': WebAgent,
+}
+
+def setup_environment(config):
+    if config.env.name == 'browsergym':
+        if config.env.subtask == 'miniwob':
+            import os
+            import importlib
+            import browsergym.miniwob
+            importlib.reload(browsergym.miniwob)
+            os.environ["MINIWOB_URL"] = config.env.miniwob_url
+            return
+
+    raise ValueError(f"Environment subtask not supported, env: {config.env.name}, subtask: {config.env.subtask == 'miniwob'}")
+
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
@@ -114,6 +137,11 @@ def main_task(config, compute_score=None):
     val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    
+    # Below are agent specific initialization
+    env_class = ENV_CLASS_MAPPING[config.env.name]
+    agent_class = AGENT_CLASS_MAPPING[config.agent.name]
+    setup_environment(config)    
 
     trainer = RayPPOTrainer(config=config,
                             tokenizer=tokenizer,
@@ -121,9 +149,17 @@ def main_task(config, compute_score=None):
                             resource_pool_manager=resource_pool_manager,
                             ray_worker_group_cls=ray_worker_group_cls,
                             reward_fn=reward_fn,
-                            val_reward_fn=val_reward_fn)
+                            val_reward_fn=val_reward_fn,
+                            env_class=env_class,
+                            agent_class=agent_class,
+                            agent_trajectory_episode_len=config.agent.trajectory_episode_len,
+                            agent_safe_batch_size=config.agent.safe_batch_size)
+    
     trainer.init_workers()
-    trainer.fit()
+    if config.agent.use_agent:
+        trainer.fit_agent()
+    else:
+        trainer.fit()
 
 
 if __name__ == '__main__':
