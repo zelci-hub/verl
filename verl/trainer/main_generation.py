@@ -16,6 +16,7 @@ Generate responses given a dataset of prompts
 """
 import csv
 import ray
+import json
 import numpy as np
 import hydra
 import os
@@ -184,6 +185,7 @@ def main(config):
 
     # Save metrics to CSV
     csv_path = os.path.join(output_dir, 'pass.csv')
+    results_path = os.path.join(output_dir, 'results.csv')
     
     # Prepare the row data
     # Extract the dataset name from the path
@@ -204,6 +206,9 @@ def main(config):
         if not file_exists:
             writer.writeheader()
         writer.writerow(row_data)
+
+    with open(results_path, 'w') as f:
+        json.dump(total_scores, f)
 
     # Convert the row data into a list of lists format for tabulate
     table_data = [[k, v] for k, v in row_data.items()]
