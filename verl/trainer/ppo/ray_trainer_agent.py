@@ -434,7 +434,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 "content": convert_observation_to_prompt(env, idx, traj[0]["observation"]),
             }
             inital_message_text = self.tokenizer.apply_chat_template(
-                [initial_message], tokenize=False, add_generation_prompt=True
+                [initial_message], tokenize=False, add_generation_prompt=False
             )
             prompts_tokens = self.tokenizer.encode(
                 inital_message_text, add_special_tokens=False
@@ -499,11 +499,18 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             reward_positions,
         ) = zip(*results)
 
+        # initial_state_batch = torch.nn.utils.rnn.pad_sequence(
+        #     all_initial_tokens_list,
+        #     batch_first=True,
+        #     padding_value=self.tokenizer.pad_token_id,
+        # )
+
+        # reverse the list and create tensors, pad, then flip to achieve left padding
         initial_state_batch = torch.nn.utils.rnn.pad_sequence(
-            all_initial_tokens_list,
-            batch_first=True,
+            [torch.tensor(i[::-1]) for i in all_initial_tokens_list], 
+            batch_first=True,  
             padding_value=self.tokenizer.pad_token_id,
-        )
+        ).flip(dims=[1])                
 
         response_batch = torch.nn.utils.rnn.pad_sequence(
             all_response_tokens_list,

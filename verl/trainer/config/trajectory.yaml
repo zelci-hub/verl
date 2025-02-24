@@ -18,6 +18,8 @@ model:
 
 rollout:
   name: vllm
+  vllm_log_prob: True # Append log_prob from vllm rollout, disables FSDP log_prob.
+  async_engine: True # Enable async engine for vllm rollout.
   temperature: 0.6
   top_k: -1 # 0 for hf rollout, -1 for vllm rollout
   top_p: 0.95
@@ -35,14 +37,15 @@ rollout:
   max_num_seqs: 1024
   log_prob_micro_batch_size: 1 # will be deprecated, use log_prob_micro_batch_size_per_gpu
   log_prob_micro_batch_size_per_gpu: 8
+  disable_log_stats: True
+  enable_chunked_prefill: True
   # for hf rollout
   do_sample: True
   # This must be set to one for eval script to work.
   # Use data.num_samples instead.
   n: 1
   n_val: 1
-  enable_chunked_prefill: True
-
+  
 # Unneccessary parameters for generation.
 # Just for properly instantiating FSDP workers.
 actor:
