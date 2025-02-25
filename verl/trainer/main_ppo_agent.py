@@ -45,10 +45,10 @@ def setup_environment(config):
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
-    run_ppo(config)
+    run_ppo_agent(config)
 
 
-def run_ppo(config, compute_score=None):
+def run_ppo_agent(config, compute_score=None):
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})

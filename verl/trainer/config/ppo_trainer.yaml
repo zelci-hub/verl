@@ -63,7 +63,7 @@ actor_rollout_ref:
   rollout:
     name: vllm
     vllm_log_prob: True # Append log_prob from vllm rollout, disables FSDP log_prob.
-    async_engine: True # Enable async engine for vllm rollout.
+    async_engine: True # Enable async engine for vllm rollout. Must be False for non-pipelined agent training
     temperature: 1.0
     val_temperature: 0.6
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout

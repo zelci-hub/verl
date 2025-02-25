@@ -51,6 +51,8 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         self.agent_class = agent_class
         self.agent_trajectory_episode_len = agent_trajectory_episode_len
         self.agent_safe_batch_size = agent_safe_batch_size
+
+        assert config.rollout.async_engine, "Must use synchronous engine for non-pipelined agent training"
     
     def init_workers(self):
         super().init_workers()
@@ -428,7 +430,6 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 traj and "observation" in traj[0]
             ), f"Trajectory is in wrong format. traj: {traj}, traj[0]: {traj[0]}"
 
-            # TODO: check role of first message, should it be system or user, should sys prompt be included?
             initial_message = {
                 "role": "user",
                 "content": convert_observation_to_prompt(env, idx, traj[0]["observation"]),
@@ -501,7 +502,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
         # reverse the list and create tensors, pad, then flip to achieve left padding
         initial_state_batch = torch.nn.utils.rnn.pad_sequence(
-            [torch.tensor(i[::-1]) for i in all_initial_tokens_list], 
+            [torch.flip(i, dims=[0]) for i in all_initial_tokens_list], 
             batch_first=True,  
             padding_value=self.tokenizer.pad_token_id,
         ).flip(dims=[1])                

@@ -202,6 +202,7 @@ class vLLMRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        assert not self.config.async_engine, "Engine must be synchronous for generate_sequences"
         # rebuild vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
@@ -237,17 +238,11 @@ class vLLMRollout(BaseRollout):
         
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            if self.config.async_engine:
-                outputs = []
-                for output in self.generate_sequences_async(prompts):
-                    outputs.append(output)
-                return DataProto.concat(outputs)
-            else:
-                outputs = self.inference_engine.generate(
-                    prompts=None,  # because we have already convert it to prompt token id
-                    sampling_params=self.sampling_params,
-                    prompt_token_ids=idx_list,
-                    use_tqdm=False)
+            outputs = self.inference_engine.generate(
+                prompts=None,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
+                prompt_token_ids=idx_list,
+                use_tqdm=False)
         
         # Extract token IDs and log probabilities
         response = []
