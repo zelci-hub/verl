@@ -1,60 +1,21 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
-"""
-
 import ray
 import hydra
 
 # Local application imports
 from verl.single_controller.ray import RayWorkerGroup
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
-from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.workers.reward_manager import NaiveRewardManager
 from verl.trainer.ppo.ray_trainer_agent import RayPPOAgentTrainer
-
-from rllm.environments.browsergym import BatchBrowserGym
-from rllm.models.web_agent import WebAgent
-
-ENV_CLASS_MAPPING = {
-    'browsergym': BatchBrowserGym,
-}
-
-AGENT_CLASS_MAPPING = {
-    'webagent': WebAgent,
-}
-
-def setup_environment(config):
-    if config.env.name == 'browsergym':
-        if config.env.subtask == 'miniwob':
-            import os
-            import importlib
-            import browsergym.miniwob
-            importlib.reload(browsergym.miniwob)
-            os.environ["MINIWOB_URL"] = config.env.miniwob_url
-            return
-
-    raise ValueError(f"Environment subtask not supported, env: {config.env.name}, subtask: {config.env.subtask == 'miniwob'}")
-
+from verl.trainer.main_ppo_agent import ENV_CLASS_MAPPING, AGENT_CLASS_MAPPING, setup_environment
+from verl.trainer.ppo.ray_trainer_agent_pipeline import RayPPOPipelineAgentTrainer
 
 @hydra.main(config_path='config', config_name='ppo_trainer', version_base=None)
 def main(config):
-    run_ppo_agent(config)
+    run_ppo_agent_pipeline(config)
 
 
-def run_ppo_agent(config, compute_score=None):
+def run_ppo_agent_pipeline(config, compute_score=None):
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
@@ -78,14 +39,17 @@ def main_task(config, compute_score=None):
     from verl.utils import hf_tokenizer
     tokenizer = hf_tokenizer(local_path)
 
-    global_pool_id = 'global_pool'
+    actor_pool_id = 'actor_pool'
+    rollout_pool_id = 'rollout_pool'
+    num_training_gpus = 2
     resource_pool_spec = {
-        global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
+        actor_pool_id: [num_training_gpus] * config.trainer.nnodes,
+        rollout_pool_id: [config.trainer.n_gpus_per_node - num_training_gpus] * config.trainer.nnodes,
     }
     mapping = {
-        Role.ActorRollout: global_pool_id,
-        Role.Critic: global_pool_id,
-        Role.RefPolicy: global_pool_id,
+        Role.Actor: actor_pool_id,
+        Role.Rollout: rollout_pool_id,
+        Role.RefPolicy: actor_pool_id,
     }
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
@@ -94,9 +58,9 @@ def main_task(config, compute_score=None):
     val_reward_fn = NaiveRewardManager(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
 
     role_worker_mapping = {
-        Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
-        Role.Critic: ray.remote(CriticWorker),
-        Role.RefPolicy: ray.remote(ActorRolloutRefWorker)
+        Role.Actor: ray.remote(ActorRolloutRefWorker),
+        Role.Rollout: ray.remote(ActorRolloutRefWorker),
+        Role.RefPolicy: ray.remote(ActorRolloutRefWorker),
     }
     
     # Below are agent specific initialization
@@ -104,7 +68,7 @@ def main_task(config, compute_score=None):
     agent_class = AGENT_CLASS_MAPPING[config.agent.name]
     setup_environment(config)    
 
-    trainer = RayPPOAgentTrainer(config=config,
+    trainer = RayPPOPipelineAgentTrainer(config=config,
                             tokenizer=tokenizer,
                             role_worker_mapping=role_worker_mapping,
                             resource_pool_manager=resource_pool_manager,

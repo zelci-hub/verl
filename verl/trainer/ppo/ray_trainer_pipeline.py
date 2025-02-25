@@ -146,7 +146,7 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                             print('Reward tensor:', reward_tensor.sum(-1))
                             mini_batch.batch['token_level_scores'] = reward_tensor
                         
-                                                # Rejection sampling based on rewards
+                            # Rejection sampling based on rewards
                             # Group rewards by uid
                             uids = mini_batch.non_tensor_batch['uid']
                             unique_uids = np.unique(uids)
