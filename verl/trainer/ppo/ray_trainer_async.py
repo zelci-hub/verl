@@ -78,14 +78,14 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         replay_queue = queue.Queue()
         
         print('Initializing replay queue.')
-        for batch_iter, batch_dict in enumerate(self.train_dataloader):
-            batch: DataProto = DataProto.from_single_dict(batch_dict)
-            batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-            gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=batch)
-            outputs = []
-            for item in gen_seq_generator:
-                outputs.append(item)
-            replay_queue.put(DataProto.concat(outputs))
+        batch_dict = next(self.train_dataloader)
+        batch: DataProto = DataProto.from_single_dict(batch_dict)
+        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+        gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=batch)
+        outputs = []
+        for item in gen_seq_generator:
+            outputs.append(item)
+        replay_queue.put(DataProto.concat(outputs))
         print('Done initializing replay queue.')
         
         total_mini_batch_iters = 0
