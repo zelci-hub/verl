@@ -42,6 +42,31 @@ def update_metrics(metrics, new_metrics):
             metrics[k] = []
         metrics[k].append(v)
 
+
+def split(batch: DataProto, batch_size: int):
+    """Split the DataProto into smaller batches of specified size.
+    
+    Args:
+        batch (DataProto): The DataProto to split
+        batch_size (int): Size of each mini batch
+        
+    Yields:
+        DataProto: Mini batches of the specified size
+    """
+    total_size = len(batch)
+    
+    # Validate batch size
+    assert batch_size > 0, "Batch size must be positive"
+    assert total_size >= batch_size, f"Total size {total_size} must be >= batch size {batch_size}"
+    
+    # Split into chunks
+    num_chunks = (total_size + batch_size - 1) // batch_size
+    chunks = batch.chunk(num_chunks)
+    
+    for chunk in chunks:
+        yield chunk
+
+
 class RayPPOAsyncTrainer(RayPPOTrainer):
     
     def fit(self):
@@ -78,7 +103,8 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         replay_queue = queue.Queue()
         
         print('Initializing replay queue.')
-        batch_dict = next(self.train_dataloader)
+        train_dataloader_gen = iter(self.train_dataloader)
+        batch_dict = next(train_dataloader_gen)
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
         gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=batch)
@@ -87,17 +113,17 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
             outputs.append(item)
         replay_queue.put(DataProto.concat(outputs))
         print('Done initializing replay queue.')
-        
         total_mini_batch_iters = 0
         for epoch in range(self.config.trainer.total_epochs):
-            for batch_iter, batch_dict in enumerate(self.train_dataloader):
+            if not train_dataloader_gen:
+                train_dataloader_gen = iter(self.train_dataloader)
+            for batch_iter, batch_dict in enumerate(train_dataloader_gen):
                 metrics = {}
                 timing_raw = {}
                 sample_batch: DataProto = DataProto.from_single_dict(batch_dict)
                 sample_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(sample_batch.batch))], dtype=object)
                 
                 with Timer('step', timing_raw):
-
                     def async_sampler(generator, q):
                         with Timer('gen', timing_raw):
                             outputs = []
@@ -108,7 +134,7 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                             replay_queue.put(DataProto.concat(outputs))
                     # Get the generator function which will yield results as they complete
                     gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=sample_batch)
-                    thread = threading.Thread(async_sampler, args=(gen_seq_generator, replay_queue))
+                    thread = threading.Thread(target=async_sampler, args=(gen_seq_generator, replay_queue))
                     thread.start()
                     
                     ppo_train_batch_size = self.config.data.train_batch_size
@@ -120,7 +146,7 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                     assert replay_queue.qsize() >= 1, "Replay queue must have at least one training batch"
                     batch = replay_queue.get()
                     # Split batch into mini batches
-                    mini_batch_generator = batch.split(ppo_mini_batch_size)
+                    mini_batch_generator = split(batch, ppo_mini_batch_size*self.config.actor_rollout_ref.rollout.n)
                     for mini_batch in mini_batch_generator:
                         mini_batch_metrics = {}
                         if total_mini_batch_iters % ppo_step_minibatch_iter == ppo_step_minibatch_iter - 1:
@@ -246,3 +272,4 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                         with Timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
                     return
+            train_dataloader_gen = None
