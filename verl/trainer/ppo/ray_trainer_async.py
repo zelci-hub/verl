@@ -197,6 +197,7 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                         update_metrics(metrics, mini_batch_metrics)
                         total_mini_batch_iters += 1
 
+                    thread.join()
                     # last_iter_mini_batch_iter = (mini_batch_iter + last_iter_mini_batch_iter - 1) % ppo_step_minibatch_iter
                     with Timer('rollout_model_update', timing_raw):
                         updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
@@ -204,8 +205,6 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                             updated_actor_module_fsdp_ref = updated_actor_module_fsdp_ref[0]
                         self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
                     training_batch = DataProto.concat(training_batch)
-                    
-                    thread.join()
                     
                     # Validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
