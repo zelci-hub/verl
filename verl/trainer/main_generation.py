@@ -63,6 +63,7 @@ def main(config):
 
         # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
         dataset = pd.read_parquet(config.data.path)
+        dataset = dataset[:10]
         chat_lst = dataset[config.data.prompt_key].tolist()
 
         chat_lst = [chat.tolist() for chat in chat_lst]
@@ -185,7 +186,7 @@ def main(config):
 
     # Save metrics to CSV
     csv_path = os.path.join(output_dir, 'pass.csv')
-    results_path = os.path.join(output_dir, 'results.csv')
+    results_path = os.path.join(output_dir, 'results.json')
     
     # Prepare the row data
     # Extract the dataset name from the path
