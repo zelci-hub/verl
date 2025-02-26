@@ -144,10 +144,10 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                         thread = threading.Thread(target=async_sampler, args=(gen_seq_generator, replay_queue))
                         thread.start()
                     else:                  
-                        def sync_sampler(q):
+                        def sync_sampler(q, batch):
                             batch = self.rollout_wg.generate_sequences(batch)
                             replay_queue.put(batch)                        
-                        thread = threading.Thread(target=sync_sampler, args=(sample_batch,))
+                        thread = threading.Thread(target=sync_sampler, args=(replay_queue, sample_batch))
                         thread.start()
                     
                     
