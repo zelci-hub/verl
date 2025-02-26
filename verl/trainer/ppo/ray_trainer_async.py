@@ -115,7 +115,7 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                 outputs.append(item)
             replay_queue.put(DataProto.concat(outputs))
         else:
-            batch = self.actor_rollout_wg.generate_sequences(batch)
+            batch = self.rollout_wg.generate_sequences(batch)
             replay_queue.put(batch)
         end_time = time.perf_counter()  
         print(f'Done initializing replay buffer in {end_time - start_time:.2f} seconds')
@@ -145,7 +145,7 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                         thread.start()
                     else:                  
                         def sync_sampler(q):
-                            batch = self.actor_rollout_wg.generate_sequences(batch)
+                            batch = self.rollout_wg.generate_sequences(batch)
                             replay_queue.put(batch)                        
                         thread = threading.Thread(target=sync_sampler, args=(sample_batch,))
                         thread.start()
