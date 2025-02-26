@@ -108,11 +108,15 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         batch_dict = next(train_dataloader_gen)
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-        gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=batch)
-        outputs = []
-        for item in gen_seq_generator:
-            outputs.append(item)
-        replay_queue.put(DataProto.concat(outputs))
+        if self.config.actor_rollout_ref.rollout.async_engine:
+            gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=batch)
+            outputs = []
+            for item in gen_seq_generator:
+                outputs.append(item)
+            replay_queue.put(DataProto.concat(outputs))
+        else:
+            batch = self.actor_rollout_wg.generate_sequences(batch)
+            replay_queue.put(batch)
         end_time = time.perf_counter()  
         print(f'Done initializing replay buffer in {end_time - start_time:.2f} seconds')
 
@@ -126,18 +130,26 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                 sample_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(sample_batch.batch))], dtype=object)
                 
                 with Timer('step', timing_raw):
-                    def async_sampler(generator, q):
-                        with Timer('gen', timing_raw):
-                            outputs = []
-                            for item in generator:
-                                if item is None:
-                                    break
-                                outputs.append(item)
-                            replay_queue.put(DataProto.concat(outputs))
-                    # Get the generator function which will yield results as they complete
-                    gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=sample_batch)
-                    thread = threading.Thread(target=async_sampler, args=(gen_seq_generator, replay_queue))
-                    thread.start()
+                    if self.config.actor_rollout_ref.rollout.async_engine:
+                        def async_sampler(generator, q):
+                            with Timer('gen', timing_raw):
+                                outputs = []
+                                for item in generator:
+                                    if item is None:
+                                        break
+                                    outputs.append(item)
+                                replay_queue.put(DataProto.concat(outputs))
+                        # Get the generator function which will yield results as they complete
+                        gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=sample_batch)
+                        thread = threading.Thread(target=async_sampler, args=(gen_seq_generator, replay_queue))
+                        thread.start()
+                    else:                  
+                        def sync_sampler(q):
+                            batch = self.actor_rollout_wg.generate_sequences(batch)
+                            replay_queue.put(batch)                        
+                        thread = threading.Thread(target=sync_sampler, args=(sample_batch,))
+                        thread.start()
+                    
                     
                     ppo_train_batch_size = self.config.data.train_batch_size
                     ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
