@@ -776,6 +776,8 @@ class RayPPOTrainer(object):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
                                                 f'global_step_{self.global_steps}')
+        # Make dirs from this absolute path
+        os.makedirs(local_global_step_folder, exist_ok=True)
         actor_local_path = os.path.join(local_global_step_folder, 'actor')
 
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
