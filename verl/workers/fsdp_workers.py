@@ -77,7 +77,7 @@ class ActorRolloutRefWorker(Worker):
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str):
+    def __init__(self, config: DictConfig, role: str, reward_config: DictConfig = None):
         super().__init__()
         self.config = config
         import torch.distributed
@@ -99,6 +99,7 @@ class ActorRolloutRefWorker(Worker):
                                                         mesh_dim_names=['dp', 'sp'])
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+        self.reward_config = reward_config
 
         self.role = role
         assert self.role in ['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']
@@ -293,6 +294,21 @@ class ActorRolloutRefWorker(Worker):
         assert self.world_size % infer_tp == 0, f'rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}'
         rollout_device_mesh = init_device_mesh('cuda', mesh_shape=(dp, infer_tp), mesh_dim_names=['dp', 'infer_tp'])
 
+        self.reward_fn = None
+        self.val_reward_fn = None
+        if self.reward_config is not None and self.config.rollout.compute_reward:
+            reward_manager_name = self.reward_config.get("reward_manager", "naive")
+            if reward_manager_name == 'naive':
+                from verl.workers.reward_manager import NaiveRewardManager
+                reward_manager_cls = NaiveRewardManager
+            elif reward_manager_name == 'prime':
+                from verl.workers.reward_manager import PrimeRewardManager
+                reward_manager_cls = PrimeRewardManager
+            else:
+                raise NotImplementedError
+            self.reward_fn = reward_manager_cls(tokenizer=self.tokenizer, num_examine=0)
+            self.val_reward_fn = reward_manager_cls(tokenizer=self.tokenizer, num_examine=1)
+        
         if self.config.rollout.name == 'hf':
             from verl.workers.rollout import HFRollout
             from verl.workers.sharding_manager import BaseShardingManager
@@ -305,6 +321,7 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage('Before building vllm rollout', logger=None)
             local_path = copy_local_path_from_hdfs(self.config.model.path)
             if vllm_mode == 'customized':
+                assert self.config.rollout.compute_reward is False, "Reward computation is not supported for customized vLLM rollout."
                 rollout = vLLMRollout(actor_module=self.actor_module_fsdp,
                                       config=self.config.rollout,
                                       tokenizer=self.tokenizer,
@@ -314,6 +331,8 @@ class ActorRolloutRefWorker(Worker):
                                       config=self.config.rollout,
                                       tokenizer=self.tokenizer,
                                       model_hf_config=self.actor_model_config,
+                                      reward_fn=self.reward_fn,
+                                      val_reward_fn=self.val_reward_fn,
                                       device_mesh=rollout_device_mesh)
             else:
                 raise NotImplementedError("vllm_mode must be 'customized' or 'spmd'")

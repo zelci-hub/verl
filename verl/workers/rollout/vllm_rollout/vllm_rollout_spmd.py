@@ -94,7 +94,7 @@ AsyncLLMEngine.wake_up = wake_up
 
 class vLLMRollout(BaseRollout):
 
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
+    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, reward_fn, val_reward_fn, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -113,7 +113,10 @@ class vLLMRollout(BaseRollout):
         assert tensor_parallel_size <= torch.distributed.get_world_size(), \
             "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get('max_num_batched_tokens', 8192)
-
+        
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
+        
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
             import os
@@ -232,8 +235,10 @@ class vLLMRollout(BaseRollout):
                 'n': 1  # if greedy, only 1 response
             }
         
+        is_validation = False
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
+            is_validation = True
         
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -313,6 +318,15 @@ class vLLMRollout(BaseRollout):
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
         
+        if self.reward_fn is not None and not is_validation:
+            init_batch = DataProto(
+                batch=batch,
+                non_tensor_batch=non_tensor_batch,
+                meta_info=prompts.meta_info
+            )
+            reward_tensor = self.reward_fn(init_batch)
+            batch['token_level_scores'] = reward_tensor
+        
         return DataProto(
             batch=batch,
             non_tensor_batch=non_tensor_batch,
@@ -357,8 +371,10 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+        is_validation = False
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
+            is_validation = True
 
         self.update_sampling_params(**kwargs)
 
@@ -445,12 +461,22 @@ class vLLMRollout(BaseRollout):
                     batch_size=response.size(0))
                 if self.config.vllm_log_prob:
                     batch['old_log_probs'] = log_probs
-                final_batch = DataProto(
+                
+                
+                if self.reward_fn is not None and not is_validation:
+                    init_batch = DataProto(
+                        batch=batch,
+                        non_tensor_batch=non_tensor_batch,
+                        meta_info=prompts.meta_info
+                    )
+                    reward_tensor = self.reward_fn(init_batch)
+                    batch['token_level_scores'] = reward_tensor
+                
+                yield DataProto(
                     batch=batch,
                     non_tensor_batch=non_tensor_batch,
                     meta_info=prompts.meta_info
                 )
-                yield final_batch
 
         # Create new event loop for this generator
         loop = asyncio.new_event_loop()

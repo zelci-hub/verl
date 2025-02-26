@@ -689,7 +689,8 @@ class RayPPOTrainer(object):
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
             actor_rollout_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.ActorRollout],
                                                      config=self.config.actor_rollout_ref,
-                                                     role='actor_rollout')
+                                                     role='actor_rollout',
+                                                     reward_config=self.config.reward_model)
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         else:
             assert Role.Actor in self.role_worker_mapping and Role.Rollout in self.role_worker_mapping, "Actor and Rollout must be in role_worker_mapping"
@@ -699,6 +700,7 @@ class RayPPOTrainer(object):
                 cls=self.role_worker_mapping[Role.Actor],
                 config=self.config.actor_rollout_ref,
                 role='actor',
+                reward_config=self.config.reward_model,
             )
             self.resource_pool_to_cls[actor_resource_pool]['actor'] = actor_cls
 
@@ -709,6 +711,7 @@ class RayPPOTrainer(object):
                 cls=self.role_worker_mapping[Role.Rollout],
                 config=self.config.actor_rollout_ref,
                 role='rollout',
+                reward_config=self.config.reward_model,
             )
             self.resource_pool_to_cls[rollout_resource_pool]['rollout'] = rollout_cls
 

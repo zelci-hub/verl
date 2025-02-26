@@ -77,7 +77,7 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         """
         from verl.utils.tracking import Tracking
         from omegaconf import OmegaConf
-        assert not self.hybrid_engine, "PPO pipeline trainer does not support hybrid engine, assumes Rollout and Actor are in the same worker group"
+        assert not self.hybrid_engine, "PPO async trainer does not support hybrid engine, assumes Rollout and Actor are not in the same worker group"
 
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
@@ -145,8 +145,9 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                         thread.start()
                     else:                  
                         def sync_sampler(q, batch):
-                            batch = self.rollout_wg.generate_sequences(batch)
-                            replay_queue.put(batch)                        
+                            with Timer('gen', timing_raw):
+                                batch = self.rollout_wg.generate_sequences(batch)
+                                replay_queue.put(batch)                        
                         thread = threading.Thread(target=sync_sampler, args=(replay_queue, sample_batch))
                         thread.start()
                     
@@ -158,9 +159,11 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                     batch = replay_queue.get()
                     
                     with Timer('adv', timing_raw):
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
-
+                        if not self.config.actor_rollout_ref.rollout.compute_reward:
+                            reward_tensor = self.reward_fn(batch)
+                            batch.batch['token_level_scores'] = reward_tensor
+                        else:
+                            reward_tensor = batch.batch['token_level_scores']
                         # Rejection sampling based on rewards
                         # Group rewards by uid
                         uids = batch.non_tensor_batch['uid']
