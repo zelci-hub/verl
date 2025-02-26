@@ -35,6 +35,9 @@ from tensordict import TensorDict
 from torch import nn
 import numpy as np
 from copy import deepcopy
+import os
+os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds, effectively no timeout
+
 
 from verl import DataProto
 from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
@@ -104,6 +107,7 @@ class vLLMRollout(BaseRollout):
             model_hf_config: the huggingface config to initiallize the generating model in vllm
             **kwargs: train_tp, for Megatron Backend to initialize hybrid engine (zero redundancy) process group
         """
+        
         super().__init__()
         self.config = config
         assert not (not config.enforce_eager and config.free_cache_engine), \
@@ -119,7 +123,6 @@ class vLLMRollout(BaseRollout):
         
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
-            import os
             os.environ['CUDA_TIMER_STREAM_KAFKA_ENABLE'] = '0'
             os.environ['MEGATRON_IMPORT_TIMERS'] = '0'
             train_tp = kwargs.get('train_tp', None)
