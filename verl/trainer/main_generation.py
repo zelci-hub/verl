@@ -34,7 +34,7 @@ from transformers import AutoTokenizer
 import wandb
 
 from verl import DataProto
-from verl.utils.fs import copy_local_path_from_hdfs
+from verl.utils.fs import copy_to_local
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.utils.hdfs_io import makedirs
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
@@ -63,7 +63,6 @@ def main(config):
 
         # read dataset. Note that the dataset should directly contain chat template format (e.g., a list of dictionary)
         dataset = pd.read_parquet(config.data.path)
-        dataset = dataset[:10]
         chat_lst = dataset[config.data.prompt_key].tolist()
 
         chat_lst = [chat.tolist() for chat in chat_lst]
