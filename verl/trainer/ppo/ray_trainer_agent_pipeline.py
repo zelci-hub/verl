@@ -303,7 +303,7 @@ class RayPPOPipelineAgentTrainer(RayPPOAgentTrainer):
             test_batch = test_batch.union(test_output_gen_batch)
 
             # already evaluated during transformation
-            reward_tensor = test_batch.batch["token_level_scores"]
+            reward_tensor = test_batch.batch["environment_reward_batch"]
 
             rewards_lst.append(reward_tensor.sum(-1).cpu())
             data_source_lst.append(

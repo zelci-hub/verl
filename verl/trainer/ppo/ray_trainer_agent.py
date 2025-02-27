@@ -6,6 +6,8 @@ from pprint import pprint
 from omegaconf import OmegaConf, open_dict
 import uuid
 from functools import partial
+from jinja2 import Template
+import re
 
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import (
@@ -179,7 +181,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                         else:
                             reward_tensor = batch.batch["token_level_scores"]
 
-                        # TODO: need to change rejection sampling with the new reward formation
+                        # TODO: may need to change rejection sampling with the new reward formation
                         # Rejection sampling based on rewards
                         # Group rewards by uid
                         uids = batch.non_tensor_batch["uid"]
@@ -375,7 +377,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             test_batch = test_batch.union(test_output_gen_batch)
 
             # already evaluated during transformation
-            reward_tensor = test_batch.batch["token_level_scores"]
+            reward_tensor = test_batch.batch["environment_reward_batch"]
 
             rewards_lst.append(reward_tensor.sum(-1).cpu())
             data_source_lst.append(
@@ -416,9 +418,26 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             )
 
         return final_gen_batch_output
-    
+
+    def _postprocess_model_chat_template(self, message_text):
+        """
+        Postprocess the formatted message text to the format of pure single message
+        """
+        if any(substring in self.config.actor_rollout_ref.model.path.lower() for substring in ('qwen2', 'qwen2.5')):
+            # from https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/tokenizer_config.json, a default system message is inserted. So we manually remove the first occurance of default system message.
+            # This is currently assuming no tool call.
+            target = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
+            if message_text.startswith(target):
+                return message_text[len(target):]  # Remove only if it’s at the start
+            return message_text
+
+        print("Model not recognized for postprocessing, entire text returned")
+        return message_text
+
+            
+        
     def _transform_single_trajectory(self, env, traj, idx):
-        from rllm.environments import compute_trajectory_score, convert_observation, convert_observation_to_prompt
+        from rllm.environments import compute_trajectory_score, compute_environment_score, convert_observation, convert_observation_to_prompt
         """
         Take in a single trajectory and transform it
         """
@@ -433,10 +452,17 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         }
         inital_message_text = self.tokenizer.apply_chat_template(
             [initial_message], tokenize=False, add_generation_prompt=False
-        )
+        )   
+        inital_message_text = self._postprocess_model_chat_template(inital_message_text)
+        
         prompts_tokens = self.tokenizer.encode(
             inital_message_text, add_special_tokens=False
         )
+
+        #TODO: remove this, debug only
+        if len(prompts_tokens) > 800:
+            prompts_tokens = prompts_tokens[:800]
+            
 
         traj_message = []
         
@@ -462,8 +488,13 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             msg_text = self.tokenizer.apply_chat_template(
                 [msg], tokenize=False, add_generation_prompt=False
             )
+            msg_text = self._postprocess_model_chat_template(msg_text)
 
             msg_tokens = self.tokenizer.encode(msg_text, add_special_tokens=False)
+            #TODO: remove this, debug only
+            if len(msg_tokens) > 800:
+                msg_tokens = msg_tokens[:800]
+
             mask_value = 1 if msg["role"] == "assistant" else 0
             msg_mask = [mask_value] * len(msg_tokens)
 
@@ -474,6 +505,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 reward_positions.append(len(all_response_tokens))
 
         rewards = compute_trajectory_score(traj)
+        env_reward = compute_environment_score(traj)
 
         assert len(rewards) == len(reward_positions),f"Number of rewards {len(rewards)} should equal to number of steps which is same as number of reward positions {len(reward_positions)}"
 
@@ -486,6 +518,8 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             torch.tensor(all_response_masks, dtype=torch.long),
             torch.tensor(rewards, dtype=torch.float32),
             torch.tensor(reward_positions, dtype=torch.long),
+            env_reward,
+            reward_positions[-1],
         )
 
     def _transform_agent_trajectories_helper(self, envs, trajectory_idxs, trajectories: List[List[Dict]]):
@@ -508,6 +542,8 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             all_masks_list,
             all_rewards_list,
             all_reward_positions,
+            environment_rewards,
+            environment_reward_positions
         ) = zip(*results)
 
         # reverse the list and create tensors, pad, then flip to achieve left padding
@@ -543,6 +579,11 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         for i, (reward_row, position_row) in enumerate(zip(all_rewards_list, all_reward_positions)):
             reward_batch[i, position_row] = reward_row
 
+        environment_reward_batch = torch.zeros_like(response_batch, dtype=torch.float32)
+        environment_reward_batch[torch.arange(environment_reward_batch.shape[0]), environment_reward_positions] = (
+            torch.tensor(environment_rewards, dtype=torch.float32)
+        )
+
         print(f"complete trajectory: {trajectory_batch.size()}, responses: {response_batch.size()}, prompts: {prompts_batch.size()}")
 
         tensor_batch = {
@@ -553,6 +594,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             "prompts": prompts_batch,
             "token_level_scores": reward_batch,
             "traj_mask": traj_mask,
+            "environment_reward": environment_reward_batch,
         }
 
         return DataProto.from_dict(tensors=tensor_batch)
