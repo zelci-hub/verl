@@ -246,8 +246,8 @@ def compute_data_metrics(batch, use_critic=True):
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
-    if 'environment_reward_batch' in batch.batch:
-        sequence_environment_reward = batch.batch['environment_reward_batch'].sum(-1)
+    if 'environment_reward' in batch.batch:
+        sequence_environment_reward = batch.batch['environment_reward'].sum(-1)
 
     metrics = {
         # score
@@ -291,7 +291,7 @@ def compute_data_metrics(batch, use_critic=True):
             'critic/environment_reward/mean': torch.mean(sequence_environment_reward).detach().item(),
             'critic/environment_reward/max': torch.max(sequence_environment_reward).detach().item(),
             'critic/environment_reward/min': torch.min(sequence_environment_reward).detach().item(),
-        } if 'environment_reward_batch' in batch.batch else {}),
+        } if 'environment_reward' in batch.batch else {}),
 
         # response length
         'response_length/mean':

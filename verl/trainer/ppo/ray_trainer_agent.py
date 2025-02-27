@@ -377,7 +377,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             test_batch = test_batch.union(test_output_gen_batch)
 
             # already evaluated during transformation
-            reward_tensor = test_batch.batch["environment_reward_batch"]
+            reward_tensor = test_batch.batch["environment_reward"]
 
             rewards_lst.append(reward_tensor.sum(-1).cpu())
             data_source_lst.append(
