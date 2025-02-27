@@ -179,6 +179,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                         else:
                             reward_tensor = batch.batch["token_level_scores"]
 
+                        # TODO: need to change rejection sampling with the new reward formation
                         # Rejection sampling based on rewards
                         # Group rewards by uid
                         uids = batch.non_tensor_batch["uid"]
@@ -441,16 +442,21 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         
         for step in traj:
             next_obs = step["next_observation"]
-            action = step["action"]
-            traj_message.append({"role": "assistant", "content": action})
+            response = step["response"]
+            traj_message.append({"role": "assistant", "content": response})
+            observation_content = convert_observation(env, idx, next_obs)
+            # TODO: remove this, debug only
+            print(f"length of observation: {len(observation_content)}, length of encoded observation: {len(self.tokenizer.encode(observation_content, add_special_tokens=False))}")
+            print(f"length of response: {len(response)}, length of encoded response: {len(self.tokenizer.encode(response, add_special_tokens=False))}")
+
             traj_message.append(
-                {"role": "user", "content": convert_observation(env, idx, next_obs)}
+                {"role": "user", "content": observation_content}
             )
 
         # convert the traj_message to inputs and mask tensors
         all_response_tokens = []
         all_response_masks = []
-        reward_position = 0
+        reward_positions = []
         for idx, msg in enumerate(traj_message):
             # Get template for single message
             msg_text = self.tokenizer.apply_chat_template(
@@ -465,7 +471,11 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             all_response_masks.extend(msg_mask)
 
             if mask_value == 1:
-                reward_position = len(all_response_tokens)
+                reward_positions.append(len(all_response_tokens))
+
+        rewards = compute_trajectory_score(traj)
+
+        assert len(rewards) == len(reward_positions),f"Number of rewards {len(rewards)} should equal to number of steps which is same as number of reward positions {len(reward_positions)}"
 
         return (
             torch.tensor(prompts_tokens, dtype=torch.long),
@@ -474,8 +484,8 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 prompts_tokens + all_response_tokens, dtype=torch.long
             ),
             torch.tensor(all_response_masks, dtype=torch.long),
-            compute_trajectory_score(traj),
-            reward_position,
+            torch.tensor(rewards, dtype=torch.float32),
+            torch.tensor(reward_positions, dtype=torch.long),
         )
 
     def _transform_agent_trajectories_helper(self, envs, trajectory_idxs, trajectories: List[List[Dict]]):
@@ -496,12 +506,12 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             all_response_tokens_list,
             all_trajectory_tokens_list,
             all_masks_list,
-            rewards,
-            reward_positions,
+            all_rewards_list,
+            all_reward_positions,
         ) = zip(*results)
 
         # reverse the list and create tensors, pad, then flip to achieve left padding
-        initial_state_batch = torch.nn.utils.rnn.pad_sequence(
+        prompts_batch = torch.nn.utils.rnn.pad_sequence(
             [torch.flip(i, dims=[0]) for i in all_initial_tokens_list], 
             batch_first=True,  
             padding_value=self.tokenizer.pad_token_id,
@@ -530,16 +540,17 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
         # Place all rewards to last response token
         reward_batch = torch.zeros_like(response_batch, dtype=torch.float32)
-        reward_batch[torch.arange(reward_batch.shape[0]), reward_positions] = (
-            torch.tensor(rewards, dtype=torch.float32)
-        )
+        for i, (reward_row, position_row) in enumerate(zip(all_rewards_list, all_reward_positions)):
+            reward_batch[i, position_row] = reward_row
+
+        print(f"complete trajectory: {trajectory_batch.size()}, responses: {response_batch.size()}, prompts: {prompts_batch.size()}")
 
         tensor_batch = {
             "input_ids": trajectory_batch,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
             "responses": response_batch,
-            "prompts": initial_state_batch,
+            "prompts": prompts_batch,
             "token_level_scores": reward_batch,
             "traj_mask": traj_mask,
         }
@@ -554,10 +565,10 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         Transform a list of trajectories and corresponding raw metadata into a DataProto.
 
         Each trajectory is a list of step dictionaries with keys:
-        "observation", "next_observation", "reward", "done", "action"
+        "observation", "next_observation", "reward", "done", "action", "response", "action", "augmented_reward"
 
         For each trajectory, we:
-        1. Build a single string by concatenating Initial Prompt and then State, Action(Response), Reward repeated.
+        1. Build a single string by concatenating Initial Prompt and then State, Response, Reward repeated.
         2. Compute the cumulative reward and the trajectory length.
         3. Tokenize and pad the resulting strings.
         """
