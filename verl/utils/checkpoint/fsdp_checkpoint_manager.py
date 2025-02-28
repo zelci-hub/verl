@@ -22,7 +22,7 @@ import torch.distributed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
 from torch.distributed.fsdp import FullStateDictConfig, ShardedStateDictConfig, ShardedOptimStateDictConfig
 
-from verl.utils.fs import copy_local_path_from_hdfs, is_non_local
+from verl.utils.fs import copy_to_local, is_non_local
 
 from transformers import PreTrainedTokenizer
 
@@ -59,11 +59,10 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         print(
             f'[rank-{self.rank}]: Loading from {remote_model_path} and {remote_optim_path} and {remote_extra_state_path}'
         )
-        local_model_path = copy_local_path_from_hdfs(remote_model_path)
-        checkpoint_model_path = copy_local_path_from_hdfs(checkpoint_model_path)
-        local_optim_path = copy_local_path_from_hdfs(remote_optim_path)
-        local_extra_state_path = copy_local_path_from_hdfs(remote_extra_state_path)
-        
+        local_model_path = copy_to_local(remote_model_path)
+        checkpoint_model_path = copy_to_local(checkpoint_model_path)
+        local_optim_path = copy_to_local(remote_optim_path)
+        local_extra_state_path = copy_to_local(remote_extra_state_path)
 
         if del_local_after_load:
             try:
