@@ -183,6 +183,7 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self.tokenizer = tokenizer
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -224,17 +225,17 @@ class vLLMRollout(BaseRollout):
         do_sample = prompts.meta_info.get('do_sample', True)
         if not do_sample:
             kwargs = {
-                'best_of': 1,
-                'top_p': 1.0,
-                'top_k': -1,
-                'min_p': 0.0,
-                'temperature': 0,
+                # 'best_of': 1,
+                # 'top_p': 1.0,
+                # 'top_k': -1,
+                # 'min_p': 0.0,
+                # 'temperature': 1.0,
                 'n': 1  # if greedy, only 1 response
             }
         
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
-        
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             if self.config.async_engine:

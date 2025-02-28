@@ -459,11 +459,6 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             inital_message_text, add_special_tokens=False
         )
 
-        #TODO: remove this, debug only
-        if len(prompts_tokens) > 800:
-            prompts_tokens = prompts_tokens[:800]
-            
-
         traj_message = []
         
         for step in traj:
@@ -472,8 +467,8 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             traj_message.append({"role": "assistant", "content": response})
             observation_content = convert_observation(env, idx, next_obs)
             # TODO: remove this, debug only
-            print(f"length of observation: {len(observation_content)}, length of encoded observation: {len(self.tokenizer.encode(observation_content, add_special_tokens=False))}")
-            print(f"length of response: {len(response)}, length of encoded response: {len(self.tokenizer.encode(response, add_special_tokens=False))}")
+            # print(f"length of observation: {len(observation_content)}, length of encoded observation: {len(self.tokenizer.encode(observation_content, add_special_tokens=False))}")
+            # print(f"length of response: {len(response)}, length of encoded response: {len(self.tokenizer.encode(response, add_special_tokens=False))}")
 
             traj_message.append(
                 {"role": "user", "content": observation_content}
@@ -491,9 +486,6 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             msg_text = self._postprocess_model_chat_template(msg_text)
 
             msg_tokens = self.tokenizer.encode(msg_text, add_special_tokens=False)
-            #TODO: remove this, debug only
-            if len(msg_tokens) > 800:
-                msg_tokens = msg_tokens[:800]
 
             mask_value = 1 if msg["role"] == "assistant" else 0
             msg_mask = [mask_value] * len(msg_tokens)
@@ -584,7 +576,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             torch.tensor(environment_rewards, dtype=torch.float32)
         )
 
-        print(f"complete trajectory: {trajectory_batch.size()}, responses: {response_batch.size()}, prompts: {prompts_batch.size()}")
+        print(f"complete trajectory: {trajectory_batch.size()}, responses: {response_batch.size()}, prompts: {prompts_batch.size()}, traj_mask: {traj_mask.size()}")
 
         tensor_batch = {
             "input_ids": trajectory_batch,
