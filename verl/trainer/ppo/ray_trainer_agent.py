@@ -356,6 +356,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 "recompute_log_prob": False,
                 "do_sample": False,
                 "validate": True,
+                "val_temperature": self.config.actor_rollout_ref.rollout.val_temperature,
             }
 
             # TODO: allow more fields from extra_info if future environments require them

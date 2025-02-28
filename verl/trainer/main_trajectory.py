@@ -7,6 +7,8 @@ import hydra
 import os
 from tqdm import tqdm
 import pandas as pd
+import torch
+import csv
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -60,14 +62,13 @@ def init_env(config):
             os.environ["MINIWOB_URL"] = config.env.miniwob_url
 
             dataset = pd.read_parquet(config.data.path)
-            selected_envs = [
+            env_ids = [
                 d["environment_id"] for d in dataset["extra_info"].tolist()
             ]
-            selected_envs = selected_envs[:2]
-
+            env_ids = [x for x in env_ids for _ in range(config.data.n_samples)]
             return BatchBrowserGym(
-                env_id=selected_envs,
-                batch_size=len(selected_envs),
+                env_id=env_ids,
+                batch_size=len(env_ids),
             )
 
     raise ValueError(f"Environment {config.env.name} not supported")
@@ -108,8 +109,47 @@ def main(config):
         safe_batch_size=config.agent.safe_batch_size,
         episode_len=config.agent.trajectory_episode_len,
     )
-    evaluate_trajectories = agent.interact_environment()
+
+    original_batch = DataProto.from_dict({"dummy_batch": torch.empty(env.batch_size, 1)})
+    original_batch.meta_info = {
+        'eos_token_id': tokenizer.eos_token_id,
+        'pad_token_id': tokenizer.pad_token_id,
+        'recompute_log_prob': False,
+        'do_sample': False,
+        'validate': True,
+        'val_temperature': config.rollout.temperature
+    }
+
+    evaluate_trajectories = agent.interact_environment(original_batch=original_batch)
     env.close()
+
+    evaluate_metrics = {
+        "evaluate_rollout.mean": np.mean([
+            d[0]["trajectory_reward"] if d else 0 
+            for d in evaluate_trajectories
+        ]),
+        "evaluate_rollout.max": np.max([
+            d[0]["trajectory_reward"] if d else 0 
+            for d in evaluate_trajectories
+        ]),
+        "evaluate_rollout.min": np.min([
+            d[0]["trajectory_reward"] if d else 0 
+            for d in evaluate_trajectories
+        ]),
+    }
+
+    print(evaluate_metrics)
+
+    if config.data.output_metric_path:
+        os.makedirs(os.path.dirname(config.data.output_metric_path), exist_ok=True)
+        # Save to CSV file
+        with open(config.data.output_metric_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Metric", "Value"])
+            for key, value in evaluate_metrics.items():
+                writer.writerow([key, value])
+        print("Metrics saved")
+
     return evaluate_trajectories
 
 
