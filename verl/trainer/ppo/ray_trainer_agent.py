@@ -116,7 +116,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 # must pop those keys for generation so they no longer exist
                 batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"])
                 batch.meta_info = {
-                    "do_sample": False,  # no need to generate multiple ones since environment is repeated already
+                    "agent_rollout": True,  # no need to generate multiple ones since environment is repeated already
                 }
                 # initialize environment
                 env_ids = [
@@ -325,6 +325,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 "do_sample": False,
                 "validate": True,
                 "val_temperature": self.config.actor_rollout_ref.rollout.val_temperature,
+                "agent_rollout": True
             }
 
             env_ids = [

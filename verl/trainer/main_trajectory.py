@@ -107,12 +107,7 @@ def main(config):
 
     original_batch = DataProto.from_dict({"dummy_batch": torch.empty(env.batch_size, 1)})
     original_batch.meta_info = {
-        'eos_token_id': tokenizer.eos_token_id,
-        'pad_token_id': tokenizer.pad_token_id,
-        'recompute_log_prob': False,
-        'do_sample': False,
-        'validate': True,
-        'val_temperature': config.rollout.temperature
+        "agent_rollout": True
     }
 
     evaluate_trajectories = agent.interact_environment(original_batch=original_batch)
