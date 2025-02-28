@@ -94,7 +94,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if self.optimizer is not None:
             optimizer_state_dict = torch.load(local_optim_path)
             optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
-            with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, optim_cfg):
+            with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, optim_state_dict_config=optim_cfg):
                 self.optimizer.load_state_dict(optimizer_state_dict)
         
         extra_state_dict = None
