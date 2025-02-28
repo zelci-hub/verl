@@ -76,4 +76,3 @@ env:
 agent:
   name: webagent
   trajectory_episode_len: 20
-  safe_batch_size: 128

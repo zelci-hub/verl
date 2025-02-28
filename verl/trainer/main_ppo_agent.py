@@ -112,9 +112,7 @@ def main_task(config, compute_score=None):
                             reward_fn=reward_fn,
                             val_reward_fn=val_reward_fn,
                             env_class=env_class,
-                            agent_class=agent_class,
-                            agent_trajectory_episode_len=config.agent.trajectory_episode_len,
-                            agent_safe_batch_size=config.agent.safe_batch_size)
+                            agent_class=agent_class)
     
     trainer.init_workers()
     trainer.fit_agent()

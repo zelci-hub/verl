@@ -478,7 +478,6 @@ class vLLMRollout(BaseRollout):
             # Clean up
             pending = asyncio.all_tasks(loop)
             for task in pending:
-                print("One generation task is cancelled")
                 task.cancel()
             
             if not loop.is_closed():

@@ -12,9 +12,7 @@ import csv
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
-# os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
-from verl.utils.model import compute_position_id_with_mask
 
 import gymnasium as gym
 
@@ -62,9 +60,7 @@ def init_env(config):
             os.environ["MINIWOB_URL"] = config.env.miniwob_url
 
             dataset = pd.read_parquet(config.data.path)
-            env_ids = [
-                d["environment_id"] for d in dataset["extra_info"].tolist()
-            ]
+            env_ids = [d["environment_id"] for d in dataset["extra_info"].tolist()]
             env_ids = [x for x in env_ids for _ in range(config.data.n_samples)]
             return BatchBrowserGym(
                 env_id=env_ids,
@@ -106,7 +102,6 @@ def main(config):
         agent_class=agent_class,
         n_parallel_agents=env.batch_size,
         env=env,
-        safe_batch_size=config.agent.safe_batch_size,
         episode_len=config.agent.trajectory_episode_len,
     )
 
