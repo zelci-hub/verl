@@ -50,7 +50,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         super().init_workers()
 
         assert not self.config.actor_rollout_ref.rollout.async_engine, "Must use synchronous engine for agent training"
-        assert not self.config.actor_rollout_ref.model.use_remove_padding, "Must set use_remove_padding to false for agent training"
+
         # Initialize additional agent class 
         # Number of agents is set to be 0 initially
         if self.hybrid_engine: 
