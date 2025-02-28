@@ -20,7 +20,7 @@ import warnings
 import torch
 import torch.distributed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
-from torch.distributed.fsdp import ShardedStateDictConfig, ShardedOptimStateDictConfig
+from torch.distributed.fsdp import FullStateDictConfig, ShardedStateDictConfig, ShardedOptimStateDictConfig
 
 from verl.utils.fs import copy_local_path_from_hdfs, is_non_local
 
@@ -53,14 +53,17 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             return
         # every rank download its own checkpoint
         remote_model_path = os.path.join(path, f'model_world_size_{self.world_size}_rank_{self.rank}.pt')
+        checkpoint_model_path = os.path.join(path, f'checkpoint')
         remote_optim_path = os.path.join(path, f'optim_world_size_{self.world_size}_rank_{self.rank}.pt')
         remote_extra_state_path = os.path.join(path, f'extra_state_world_size_{self.world_size}_rank_{self.rank}.pt')
         print(
             f'[rank-{self.rank}]: Loading from {remote_model_path} and {remote_optim_path} and {remote_extra_state_path}'
         )
         local_model_path = copy_local_path_from_hdfs(remote_model_path)
+        checkpoint_model_path = copy_local_path_from_hdfs(checkpoint_model_path)
         local_optim_path = copy_local_path_from_hdfs(remote_optim_path)
         local_extra_state_path = copy_local_path_from_hdfs(remote_extra_state_path)
+        
 
         if del_local_after_load:
             try:
@@ -72,10 +75,28 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                     f'[rank-{self.rank}]: remove local resume ckpt file after loading failed, exception {e} will be ignored'
                 )
 
-        model_state_dict = torch.load(local_model_path)
+        # Check which type of model checkpoint exists and load accordingly
+        model_state_dict = torch.load(checkpoint_model_path)
+        if os.path.exists(checkpoint_model_path):
+            # Load the full model state
+            print(f'[rank-{self.rank}]: Loading full model state from {checkpoint_model_path}')
+            full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+            with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=full_state_dict_config):
+                self.model.load_state_dict(model_state_dict)
+        else:
+            # Load the sharded model state
+            print(f'[rank-{self.rank}]: Loading sharded model state from {local_model_path}')
+            model_state_dict = torch.load(local_model_path)
+            state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
+            with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_config=state_dict_cfg):
+                self.model.load_state_dict(model_state_dict)
+        
         optimizer_state_dict = None
         if self.optimizer is not None:
             optimizer_state_dict = torch.load(local_optim_path)
+            optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
+            with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, optim_cfg):
+                self.optimizer.load_state_dict(optimizer_state_dict)
         
         extra_state_dict = None
         if self.lr_scheduler is not None:
@@ -84,13 +105,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         lr_scheduler_state_dict = None
         if self.lr_scheduler is not None:
             lr_scheduler_state_dict = extra_state_dict['lr_scheduler']
-
-        state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
-        optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
-        with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
-            self.model.load_state_dict(model_state_dict)
-            if self.optimizer is not None:
-                self.optimizer.load_state_dict(optimizer_state_dict)
         # recover random state
         if extra_state_dict is not None and 'rng' in extra_state_dict:
             # 'rng' may not exist for backward compatibility

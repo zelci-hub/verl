@@ -102,8 +102,19 @@ class RLHFDataset(Dataset):
         dataframes = []
         for parquet_file in self.parquet_files:
             # read parquet files and cache
-            dataframe = pd.read_parquet(parquet_file)
-            dataframes.append(dataframe)
+            try:
+                dataframe = pd.read_parquet(parquet_file)
+            except Exception as e:
+                print(f"Error reading parquet file {parquet_file}: {str(e)}")
+                # Try loading json version instead
+                json_file = parquet_file.replace('.parquet', '.json')
+                try:
+                    dataframe = pd.read_json(json_file, orient='records')
+                    print(f"Successfully loaded JSON version from {json_file}")
+                except Exception as json_e:
+                    print(f"Also failed to read JSON file {json_file}: {str(json_e)}")
+                    raise e
+        dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
 
         print(f'original dataset len: {len(self.dataframe)}')
