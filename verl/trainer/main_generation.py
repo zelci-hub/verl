@@ -34,7 +34,7 @@ from transformers import AutoTokenizer
 import wandb
 
 from verl import DataProto
-from verl.utils.fs import copy_local_path_from_hdfs
+from verl.utils.fs import copy_to_local
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.utils.hdfs_io import makedirs
 from verl.single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
@@ -185,7 +185,7 @@ def main(config):
 
     # Save metrics to CSV
     csv_path = os.path.join(output_dir, 'pass.csv')
-    results_path = os.path.join(output_dir, 'results.csv')
+    results_path = os.path.join(output_dir, 'results.json')
     
     # Prepare the row data
     # Extract the dataset name from the path
