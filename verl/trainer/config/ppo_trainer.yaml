@@ -165,7 +165,7 @@ trainer:
   total_training_steps: null
   project_name: verl_examples
   experiment_name: gsm8k
-  logger: [ 'console']
+  logger: [ 'console', 'wandb' ]
   val_generations_to_log_to_wandb: 0
   nnodes: 1
   n_gpus_per_node: 8
@@ -179,12 +179,3 @@ trainer:
   remove_previous_ckpt_in_save: False
   del_local_ckpt_after_load: False
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
-
-env:
-  name: browsergym
-  subtask: miniwob
-  miniwob_url: "file://<PATH_TO_MINIWOB_CLONED_REPO>/miniwob/html/miniwob/" 
-
-agent:
-  name: webagent
-  trajectory_episode_len: 20

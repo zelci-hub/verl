@@ -57,7 +57,7 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
             take_size = min(remaining_pad, len(data))
             # Create padding proto with None values for non-tensor batch
             padding_proto = copy.deepcopy(data[:take_size])
-            if padding_proto.non_tensor_batch is not None and data.non_tensor_batch.keys():
+            if padding_proto.non_tensor_batch is not None:
                 for key in padding_proto.non_tensor_batch:
                     if isinstance(padding_proto.non_tensor_batch[key], np.ndarray):
                         # Create array of None values with same shape except first dimension
@@ -75,7 +75,7 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
 def unpad_dataproto(data: 'DataProto', pad_size):
     if pad_size != 0:
         # Remove padding where non_tensor_batch values are None
-        if data.non_tensor_batch is not None and data.non_tensor_batch.keys():
+        if data.non_tensor_batch is not None:
             valid_indices = []
             for i in range(len(data)):
                 is_valid = True
@@ -521,6 +521,7 @@ class DataProto:
         """
         assert len(
             self) % chunks == 0, f'only support equal chunk. Got size of DataProto {len(self)} and chunk {chunks}.'
+
         if self.batch is not None:
             batch_lst = self.batch.chunk(chunks=chunks, dim=0)
         else:
