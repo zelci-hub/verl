@@ -281,7 +281,7 @@ class vLLMRollout(BaseRollout):
                                          max_length=self.config.response_length).to(idx.device)
 
         non_tensor_batch = deepcopy(prompts.non_tensor_batch)
-        if self.config.n > 1 and do_sample:
+        if self.config.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
             idx = idx.repeat_interleave(self.config.n, dim=0)
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
@@ -440,7 +440,7 @@ class vLLMRollout(BaseRollout):
                     single_val = val[prompt_idx:prompt_idx+1]
                     non_tensor_batch[key] = single_val
                 # Handle multiple samples per prompt when n > 1 and sampling
-                if self.config.n > 1 and do_sample:
+                if self.config.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
                     single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
                     single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
                     single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)
