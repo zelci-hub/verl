@@ -235,7 +235,7 @@ class vLLMRollout(BaseRollout):
                 'top_p': 1.0,
                 'top_k': -1,
                 'min_p': 0.0,
-                'temperature': 1.0,
+                'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
 
