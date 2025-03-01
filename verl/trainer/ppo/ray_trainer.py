@@ -259,9 +259,6 @@ def compute_data_metrics(batch, use_critic=True):
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
-    if 'environment_scores' in batch.batch:
-        sequence_environment_scores = batch.batch['environment_scores'].sum(-1)
-
     metrics = {
         # score
         'critic/score/mean':
@@ -299,12 +296,6 @@ def compute_data_metrics(batch, use_critic=True):
             # vf explained var
             'critic/vf_explained_var': (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
         } if use_critic else {}),
-        **({
-            # values
-            'critic/environment_scores/mean': torch.mean(sequence_environment_scores).detach().item(),
-            'critic/environment_scores/max': torch.max(sequence_environment_scores).detach().item(),
-            'critic/environment_scores/min': torch.min(sequence_environment_scores).detach().item(),
-        } if 'environment_scores' in batch.batch else {}),
 
         # response length
         'response_length/mean':
@@ -357,7 +348,6 @@ def _timer(name: str, timing_raw: Dict[str, float]):
     with Timer(name=name, logger=None) as timer:
         yield
     timing_raw[name] = timer.last
-    timing_raw[f"{name}_accum"] = timing_raw.get(f"{name}_accum", 0.0) + timer.last
 
 
 class RayPPOTrainer(object):
@@ -367,16 +357,15 @@ class RayPPOTrainer(object):
 
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
-    def __init__(
-            self,
-            config,
-            tokenizer,
-            role_worker_mapping: dict[Role, WorkerType],
-            resource_pool_manager: ResourcePoolManager,
-            ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
-            reward_fn=None,
-            val_reward_fn=None,
-        ):
+    def __init__(self,
+                 config,
+                 tokenizer,
+                 role_worker_mapping: dict[Role, WorkerType],
+                 resource_pool_manager: ResourcePoolManager,
+                 ray_worker_group_cls: RayWorkerGroup = RayWorkerGroup,
+                 reward_fn=None,
+                 val_reward_fn=None):
+
         # assert torch.cuda.is_available(), 'cuda must be available on driver'
 
         self.tokenizer = tokenizer
@@ -423,7 +412,6 @@ class RayPPOTrainer(object):
 
         self._validate_config()
         self._create_dataloader()
-        
 
     def _validate_config(self):
         config = self.config
@@ -799,7 +787,6 @@ class RayPPOTrainer(object):
             self.rollout_wg = all_wg['rollout']
             self.rollout_wg.init_model()
 
-
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
@@ -1155,5 +1142,3 @@ class RayPPOTrainer(object):
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
                     return
-
-
