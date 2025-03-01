@@ -189,6 +189,7 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self.tokenizer = tokenizer
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -237,7 +238,10 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
-        
+
+        if prompts.meta_info.get('agent_rollout', False):
+            kwargs['n'] = 1
+
         is_validation = False
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
@@ -277,7 +281,7 @@ class vLLMRollout(BaseRollout):
                                          max_length=self.config.response_length).to(idx.device)
 
         non_tensor_batch = deepcopy(prompts.non_tensor_batch)
-        if self.config.n > 1 and do_sample:
+        if self.config.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
             idx = idx.repeat_interleave(self.config.n, dim=0)
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
@@ -374,6 +378,10 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+            
+        if prompts.meta_info.get('agent_rollout', False):
+            kwargs['n'] = 1
+
         is_validation = False
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
@@ -432,7 +440,7 @@ class vLLMRollout(BaseRollout):
                     single_val = val[prompt_idx:prompt_idx+1]
                     non_tensor_batch[key] = single_val
                 # Handle multiple samples per prompt when n > 1 and sampling
-                if self.config.n > 1 and do_sample:
+                if self.config.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
                     single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
                     single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
                     single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)

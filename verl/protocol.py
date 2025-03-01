@@ -75,7 +75,7 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
 def unpad_dataproto(data: 'DataProto', pad_size):
     if pad_size != 0:
         # Remove padding where non_tensor_batch values are None
-        if data.non_tensor_batch is not None:
+        if data.non_tensor_batch is not None and data.non_tensor_batch.keys():
             valid_indices = []
             for i in range(len(data)):
                 is_valid = True
