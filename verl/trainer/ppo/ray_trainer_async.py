@@ -102,6 +102,15 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         self.global_steps += 1
         replay_queue = queue.Queue()
         
+        print("Broadcasting weights from actor to rollout.")
+        # Broadcast weights from actor to rollout.
+        updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
+        if isinstance(updated_actor_module_fsdp_ref, list):
+            updated_actor_module_fsdp_ref = updated_actor_module_fsdp_ref[0]
+        self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
+        print("Done broadcasting weights from actor to rollout.")
+        
+        
         print('Initializing replay buffer.')
         start_time = time.perf_counter()
         train_dataloader_gen = iter(self.train_dataloader)
