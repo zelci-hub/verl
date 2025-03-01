@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import glob
 import ray
 import os
 
@@ -21,6 +22,7 @@ import torch
 import torch.distributed
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
 from torch.distributed.fsdp import FullStateDictConfig, ShardedStateDictConfig, ShardedOptimStateDictConfig
+from safetensors.torch import load_file
 
 from verl.utils.fs import copy_to_local, is_non_local
 
@@ -75,10 +77,20 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 )
 
         # Check which type of model checkpoint exists and load accordingly
-        model_state_dict = torch.load(checkpoint_model_path)
         if os.path.exists(checkpoint_model_path):
             # Load the full model state
             print(f'[rank-{self.rank}]: Loading full model state from {checkpoint_model_path}')
+            model_state_dict = {}
+            if hasattr(self.model, '_fsdp_wrapped_module'):
+                module = self.model._fsdp_wrapped_module
+                # Glob all the safe tensor files
+                safe_files = glob.glob(os.path.join(checkpoint_model_path, '*.safetensors'))
+                for safe_file in safe_files:
+                    state_dict = load_file(safe_file)
+                    model_state_dict.update(state_dict)
+            else:
+                raise NotImplementedError("Only support FSDP wrapped model for now")
+            
             full_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
             with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=full_state_dict_config):
                 self.model.load_state_dict(model_state_dict)
@@ -94,7 +106,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if self.optimizer is not None:
             optimizer_state_dict = torch.load(local_optim_path)
             optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
-            with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, optim_cfg):
+            with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, optim_state_dict_config=optim_cfg):
                 self.optimizer.load_state_dict(optimizer_state_dict)
         
         extra_state_dict = None
