@@ -153,7 +153,6 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                         else:
                             reward_tensor = batch.batch["token_level_scores"] # filled in by environment collected trajectory transformation
 
-                        # TODO: may need to change rejection sampling with the new reward formation
                         # Rejection sampling based on rewards
                         # Group rewards by uid
                         uids = batch.non_tensor_batch["uid"]
