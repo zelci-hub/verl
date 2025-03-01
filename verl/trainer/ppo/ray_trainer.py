@@ -258,6 +258,9 @@ def compute_data_metrics(batch, use_critic=True):
         valid_values = torch.masked_select(values, response_mask)
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
+    
+    if 'environment_scores' in batch.batch:
+        sequence_environment_scores = batch.batch['environment_scores'].sum(-1)
 
     metrics = {
         # score
@@ -296,7 +299,12 @@ def compute_data_metrics(batch, use_critic=True):
             # vf explained var
             'critic/vf_explained_var': (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
         } if use_critic else {}),
-
+        **({
+            # environment rewards
+            'critic/environment_scores/mean': torch.mean(sequence_environment_scores).detach().item(),
+            'critic/environment_scores/max': torch.max(sequence_environment_scores).detach().item(),
+            'critic/environment_scores/min': torch.min(sequence_environment_scores).detach().item(),
+        } if 'environment_scores' in batch.batch else {}),
         # response length
         'response_length/mean':
             torch.mean(response_length).detach().item(),
