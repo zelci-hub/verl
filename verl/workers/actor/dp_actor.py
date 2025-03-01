@@ -238,6 +238,8 @@ class DataParallelPPOActor(BasePPOActor):
                     response_length = responses.size(1)
                     attention_mask = data['attention_mask']
                     response_mask = attention_mask[:, -response_length:]
+                    if self.config.state_masking and "traj_mask" in data:
+                        response_mask = data['traj_mask']
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
 

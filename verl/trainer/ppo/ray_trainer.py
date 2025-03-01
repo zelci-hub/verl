@@ -259,8 +259,8 @@ def compute_data_metrics(batch, use_critic=True):
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
-    if 'environment_reward' in batch.batch:
-        sequence_environment_reward = batch.batch['environment_reward'].sum(-1)
+    if 'environment_scores' in batch.batch:
+        sequence_environment_scores = batch.batch['environment_scores'].sum(-1)
 
     metrics = {
         # score
@@ -301,10 +301,10 @@ def compute_data_metrics(batch, use_critic=True):
         } if use_critic else {}),
         **({
             # values
-            'critic/environment_reward/mean': torch.mean(sequence_environment_reward).detach().item(),
-            'critic/environment_reward/max': torch.max(sequence_environment_reward).detach().item(),
-            'critic/environment_reward/min': torch.min(sequence_environment_reward).detach().item(),
-        } if 'environment_reward' in batch.batch else {}),
+            'critic/environment_scores/mean': torch.mean(sequence_environment_scores).detach().item(),
+            'critic/environment_scores/max': torch.max(sequence_environment_scores).detach().item(),
+            'critic/environment_scores/min': torch.min(sequence_environment_scores).detach().item(),
+        } if 'environment_scores' in batch.batch else {}),
 
         # response length
         'response_length/mean':
@@ -423,6 +423,7 @@ class RayPPOTrainer(object):
 
         self._validate_config()
         self._create_dataloader()
+        
 
     def _validate_config(self):
         config = self.config

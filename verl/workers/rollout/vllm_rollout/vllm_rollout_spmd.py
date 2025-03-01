@@ -231,14 +231,17 @@ class vLLMRollout(BaseRollout):
         do_sample = prompts.meta_info.get('do_sample', True)
         if not do_sample:
             kwargs = {
-                # 'best_of': 1,
-                # 'top_p': 1.0,
-                # 'top_k': -1,
-                # 'min_p': 0.0,
-                # 'temperature': 1.0,
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 1.0,
                 'n': 1  # if greedy, only 1 response
             }
-        
+
+        if prompts.meta_info.get('agent_rollout', False):
+            kwargs['n'] = 1
+
         is_validation = False
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
@@ -375,6 +378,10 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+            
+        if prompts.meta_info.get('agent_rollout', False):
+            kwargs['n'] = 1
+
         is_validation = False
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
@@ -506,7 +513,6 @@ class vLLMRollout(BaseRollout):
             # Clean up
             pending = asyncio.all_tasks(loop)
             for task in pending:
-                print("One generation task is cancelled")
                 task.cancel()
             
             if not loop.is_closed():

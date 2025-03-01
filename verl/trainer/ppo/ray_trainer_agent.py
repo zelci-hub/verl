@@ -27,12 +27,7 @@ from verl.trainer.ppo.ray_trainer import (
 from rllm.models.batch_agent import BatchAgent
 
 class RayPPOAgentTrainer(RayPPOTrainer):
-    """
-    Note that this trainer runs on the driver process on a single CPU/GPU node.
-    """
 
-    # TODO: support each role have individual ray_worker_group_cls,
-    # i.e., support different backend of different role
     def __init__(
             self,
             config,
@@ -44,36 +39,31 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             val_reward_fn=None,
             env_class=None,
             agent_class=None,
-            agent_trajectory_episode_len=20,
-            agent_safe_batch_size=100,
         ):
         super().__init__(config, tokenizer, role_worker_mapping,
                          resource_pool_manager, ray_worker_group_cls,
                          reward_fn, val_reward_fn)
         self.env_class = env_class
         self.agent_class = agent_class
-        self.agent_trajectory_episode_len = agent_trajectory_episode_len
-        self.agent_safe_batch_size = agent_safe_batch_size
-
     
     def init_workers(self):
         super().init_workers()
 
-        assert not self.config.actor_rollout_ref.rollout.async_engine, "Must use synchronous engine for non-pipelined agent training"
+        assert not self.config.actor_rollout_ref.rollout.async_engine, "Must use synchronous engine for agent training"
+
         # Initialize additional agent class 
         # Number of agents is set to be 0 initially
         if self.hybrid_engine: 
             agent_rollout_wg = self.actor_rollout_wg
         else:
             agent_rollout_wg = self.rollout_wg
-            
+        
         self.agent = BatchAgent(
             rollout_engine=agent_rollout_wg,
             engine_name="verl",
             tokenizer=self.tokenizer,
             agent_class=self.agent_class,
-            episode_len=self.agent_trajectory_episode_len,
-            safe_batch_size=self.agent_safe_batch_size,
+            episode_len=self.config.agent.trajectory_episode_len,
         )
 
 
@@ -123,38 +113,22 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
                 ####################
                 ####################
-                # pop those keys for generation even though not needed
+                # must pop those keys for generation so they no longer exist
                 batch.pop(batch_keys=["input_ids", "attention_mask", "position_ids"])
                 batch.meta_info = {
-                    "do_sample": False,  # no need to generate multiple ones since environment is repeated already
+                    "agent_rollout": True,  # no need to generate multiple ones since environment is repeated already
                 }
-
+                # initialize environment
                 env_ids = [
                     i["environment_id"] for i in batch.non_tensor_batch["extra_info"]
                 ]
                 env = self.env_class(batch_size=len(env_ids), env_id=env_ids)
 
-                with _timer("step", timing_raw):
-                    final_gen_batch_output = self.generate_agent_trajectory(
-                        env, timing_raw=timing_raw, original_batch=batch
-                    )
-                    env.close()
+                batch.non_tensor_batch["uid"] = np.array(env_ids, dtype=object)
 
-                    if (
-                        self.config.algorithm.adv_estimator == "grpo"
-                    ):  # NOTE we currently use env_ids to group
-                        batch.non_tensor_batch["uid"] = np.array(env_ids, dtype=object)
-                    elif self.config.algorithm.adv_estimator == "brpo":
-                        batch.non_tensor_batch["uid"] = np.array(
-                            ["" for _ in range(len(batch.batch))], dtype=object
-                        )
-                    elif self.config.algorithm.adv_estimator == "apo":
-                        batch.non_tensor_batch["uid"] = np.array(
-                            [str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                            dtype=object,
-                        )  # No Relative normalization
-                    else:
-                        batch.non_tensor_batch["uid"] = np.array(env_ids, dtype=object)
+                with _timer("step", timing_raw):
+                    final_gen_batch_output = self.generate_agent_trajectory(env, timing_raw=timing_raw, meta_info=batch.meta_info)
+                    env.close()
 
                     batch = batch.union(final_gen_batch_output)
                     ####################
@@ -173,13 +147,11 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                             batch = batch.union(reward_tensor)
 
                         # reward tensor for env-based trajectory data can be obtained by processing the trajectories
-                        if (
-                            "token_level_scores" not in batch.batch
-                        ):  # filled in by environment collected trajectory transformation
+                        if "token_level_scores" not in batch.batch:  
                             reward_tensor = self.reward_fn(batch)
                             batch.batch["token_level_scores"] = reward_tensor
                         else:
-                            reward_tensor = batch.batch["token_level_scores"]
+                            reward_tensor = batch.batch["token_level_scores"] # filled in by environment collected trajectory transformation
 
                         # TODO: may need to change rejection sampling with the new reward formation
                         # Rejection sampling based on rewards
@@ -258,9 +230,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                         # else:
                         #     batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
-                        batch.batch["token_level_rewards"] = batch.batch[
-                            "token_level_scores"
-                        ]
+                        batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
                         batch = compute_advantage(
@@ -268,7 +238,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                             adv_estimator=self.config.algorithm.adv_estimator,
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
+                            num_repeat=1,
                         )
 
                     # balance the number of valid tokens on each dp rank.
@@ -347,37 +317,32 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
             n_val_samples = self.config.actor_rollout_ref.rollout.n_val
             test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
-            test_batch.pop(
-                ["input_ids", "attention_mask", "position_ids"]
-            )  # these are not needed for environment based interaction
+            test_batch.pop(["input_ids", "attention_mask", "position_ids"])  # these are not needed for environment based interaction
             test_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
                 "recompute_log_prob": False,
                 "do_sample": False,
                 "validate": True,
+                "val_temperature": self.config.actor_rollout_ref.rollout.val_temperature,
+                "agent_rollout": True
             }
 
-            # TODO: allow more fields from extra_info if future environments require them
             env_ids = [
                 i["environment_id"] for i in test_batch.non_tensor_batch["extra_info"]
             ]
+
             env = self.env_class(batch_size=len(env_ids), env_id=env_ids)
 
             test_output_gen_batch = self.generate_agent_trajectory(
-                env, original_batch=test_batch
+                env, meta_info=test_batch.meta_info
             )
             env.close()
 
-            if test_batch.meta_info["recompute_log_prob"]:
-                with torch.no_grad():
-                    output = self.actor_rollout_wg.compute_log_prob(test_output_gen_batch)
-                    test_output_gen_batch = test_output_gen_batch.union(output)
-
             test_batch = test_batch.union(test_output_gen_batch)
 
-            # already evaluated during transformation
-            reward_tensor = test_batch.batch["environment_reward"]
+            # use environment score to report validation reward
+            reward_tensor = test_batch.batch["environment_scores"]
 
             rewards_lst.append(reward_tensor.sum(-1).cpu())
             data_source_lst.append(
@@ -402,17 +367,28 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
         return metric_dict
 
-    def generate_agent_trajectory(self, env, timing_raw={}, original_batch=None):
+    def generate_agent_trajectory(self, env, timing_raw={}, meta_info=None):
+        """
+        Generates agent trajectories by interacting with the environment. Does not close or reset the environment afterwards
+
+        Args:
+            env: The environment in which the agent interacts.
+            timing_raw: Dictionary to store timing information for profiling.
+            meta_info (optional): Metadata for veRL generation.
+
+        Returns:
+            DataProto: Representation of the agent's trajectories.
+        """
         # Reset the agent.
         self.agent.update_env(env)
         with _timer("collect_trajectory", timing_raw):
             # Interact_environment returns list of trajectories.
             trajectories = self.agent.interact_environment(
-                timing_raw=timing_raw, original_batch=original_batch
+                timing_raw=timing_raw, meta_info=meta_info
             )
 
         with _timer("transform_trajectory", timing_raw):
-            # Transform the raw trajectories into a DataProto format.
+            # Transform the raw trajectories into DataProto format.
             final_gen_batch_output = self._transform_agent_trajectories(
                 env, trajectories
             )
@@ -421,7 +397,13 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
     def _postprocess_model_chat_template(self, message_text):
         """
-        Postprocess the formatted message text to the format of pure single message
+        Postprocesses the chat template output by removing any automatically added system message.
+
+        Args:
+            message_text (str): The formatted message text.
+
+        Returns:
+            str: The processed message text without the default system message.
         """
         if any(substring in self.config.actor_rollout_ref.model.path.lower() for substring in ('qwen2', 'qwen2.5')):
             # from https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/tokenizer_config.json, a default system message is inserted. So we manually remove the first occurance of default system message.
@@ -436,19 +418,36 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
             
         
-    def _transform_single_trajectory(self, env, traj, idx):
-        from rllm.environments import compute_trajectory_score, compute_environment_score, convert_observation, convert_observation_to_prompt
+    def _transform_single_trajectory(self, env_id, traj):
+        from rllm.environments import compute_step_score, compute_environment_score, convert_observation_to_string
         """
-        Take in a single trajectory and transform it
+        Transforms a single trajectory into tokenized form.
+
+        Args:
+            env_id: The id of the environment from which the trajectory originates.
+            traj (list[dict]): The trajectory data, each step containing keys:
+                "observation", "next_observation", "reward", "done", "action", "response", "augmented_reward".
+
+        Returns:
+            Tuple of torch tensors containing:
+            - Initial prompt tokens
+            - Response tokens
+            - Full trajectory tokens (concatenation of prompt and response)
+            - Mask for responses
+            - Score values
+            - Score positions (positions of last valid output token for each step)
+            - Environment score
+            - Environment score position (which is same as last reward position)
         """
-        # convert the trajectory to message dictionaries first
+
         assert (
             traj and "observation" in traj[0]
         ), f"Trajectory is in wrong format. traj: {traj}, traj[0]: {traj[0]}"
 
+        # Build initial prompts
         initial_message = {
             "role": "user",
-            "content": convert_observation_to_prompt(env, idx, traj[0]["observation"]),
+            "content": convert_observation_to_string(env_id, traj[0]["observation"]),
         }
         inital_message_text = self.tokenizer.apply_chat_template(
             [initial_message], tokenize=False, add_generation_prompt=False
@@ -459,25 +458,23 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             inital_message_text, add_special_tokens=False
         )
 
+        # Build the trajectory messages
         traj_message = []
         
         for step in traj:
             next_obs = step["next_observation"]
             response = step["response"]
             traj_message.append({"role": "assistant", "content": response})
-            observation_content = convert_observation(env, idx, next_obs)
-            # TODO: remove this, debug only
-            # print(f"length of observation: {len(observation_content)}, length of encoded observation: {len(self.tokenizer.encode(observation_content, add_special_tokens=False))}")
-            # print(f"length of response: {len(response)}, length of encoded response: {len(self.tokenizer.encode(response, add_special_tokens=False))}")
-
+            observation_content = convert_observation_to_string(env_id, next_obs)
+            
             traj_message.append(
                 {"role": "user", "content": observation_content}
             )
 
-        # convert the traj_message to inputs and mask tensors
+        # Convert the traj_message to inputs and mask tensors
         all_response_tokens = []
         all_response_masks = []
-        reward_positions = []
+        score_positions = []
         for idx, msg in enumerate(traj_message):
             # Get template for single message
             msg_text = self.tokenizer.apply_chat_template(
@@ -494,12 +491,12 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             all_response_masks.extend(msg_mask)
 
             if mask_value == 1:
-                reward_positions.append(len(all_response_tokens))
+                score_positions.append(len(all_response_tokens))
 
-        rewards = compute_trajectory_score(traj)
-        env_reward = compute_environment_score(traj)
+        step_scores = compute_step_score(traj)
+        env_score = compute_environment_score(traj)
 
-        assert len(rewards) == len(reward_positions),f"Number of rewards {len(rewards)} should equal to number of steps which is same as number of reward positions {len(reward_positions)}"
+        assert len(step_scores) == len(score_positions),f"Number of scores {len(step_scores)} should equal to number of steps which is same as number of score positions {len(score_positions)}"
 
         return (
             torch.tensor(prompts_tokens, dtype=torch.long),
@@ -508,23 +505,30 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 prompts_tokens + all_response_tokens, dtype=torch.long
             ),
             torch.tensor(all_response_masks, dtype=torch.long),
-            torch.tensor(rewards, dtype=torch.float32),
-            torch.tensor(reward_positions, dtype=torch.long),
-            env_reward,
-            reward_positions[-1],
+            torch.tensor(step_scores, dtype=torch.float32),
+            torch.tensor(score_positions, dtype=torch.long),
+            env_score,
+            score_positions[-1],
         )
 
-    def _transform_agent_trajectories_helper(self, envs, trajectory_idxs, trajectories: List[List[Dict]]):
+    def _transform_agent_trajectories_helper(self, env, env_idxs, trajectories: List[List[Dict]]):
         """
-        Transform a list of trajectories and corresponding raw metadata into a DataProto. But trajectories doesn't all have to be from same env
-        Trajectory i is assumed to be from envs[trajectory_idxs[i]]
+        Helper function to transform a list of trajectories into tokenized DataProto format.
+
+        Args:
+            env: The batched environments corresponding to all trajectories.
+            env_idxs (list): Indices of the trajectories/environments in the batched environment.
+            trajectories (list of list of dict): List of trajectories to process.
+
+        Returns:
+            DataProto: A structured dataset containing input tokens, masks, and rewards.
         """
         # Start threading for parallel execution
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=256) as executor:
             transform_func = partial(self._transform_single_trajectory)
             results = list(
-                executor.map(transform_func, envs, trajectories, trajectory_idxs)
+                executor.map(transform_func, [env.env_id[i] for i in env_idxs], trajectories)
             )
 
         (
@@ -532,10 +536,10 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             all_response_tokens_list,
             all_trajectory_tokens_list,
             all_masks_list,
-            all_rewards_list,
-            all_reward_positions,
-            environment_rewards,
-            environment_reward_positions
+            all_score_list,
+            all_score_positions,
+            environment_scores,
+            environment_score_positions
         ) = zip(*results)
 
         # reverse the list and create tensors, pad, then flip to achieve left padding
@@ -567,16 +571,16 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         position_ids = (torch.cumsum(attention_mask, dim=1) - 1) * attention_mask
 
         # Place all rewards to last response token
-        reward_batch = torch.zeros_like(response_batch, dtype=torch.float32)
-        for i, (reward_row, position_row) in enumerate(zip(all_rewards_list, all_reward_positions)):
-            reward_batch[i, position_row] = reward_row
+        score_batch = torch.zeros_like(response_batch, dtype=torch.float32)
+        for i, (score_row, position_row) in enumerate(zip(all_score_list, all_score_positions)):
+            score_batch[i, position_row] = score_row
 
-        environment_reward_batch = torch.zeros_like(response_batch, dtype=torch.float32)
-        environment_reward_batch[torch.arange(environment_reward_batch.shape[0]), environment_reward_positions] = (
-            torch.tensor(environment_rewards, dtype=torch.float32)
+        environment_score_batch = torch.zeros_like(response_batch, dtype=torch.float32)
+        environment_score_batch[torch.arange(environment_score_batch.shape[0]), environment_score_positions] = (
+            torch.tensor(environment_scores, dtype=torch.float32)
         )
 
-        print(f"complete trajectory: {trajectory_batch.size()}, responses: {response_batch.size()}, prompts: {prompts_batch.size()}, traj_mask: {traj_mask.size()}")
+        print(f"Shapes after convertion: complete trajectory: {trajectory_batch.size()}, responses: {response_batch.size()}, prompts: {prompts_batch.size()}, traj_mask: {traj_mask.size()}")
 
         tensor_batch = {
             "input_ids": trajectory_batch,
@@ -584,9 +588,9 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             "position_ids": position_ids,
             "responses": response_batch,
             "prompts": prompts_batch,
-            "token_level_scores": reward_batch,
+            "token_level_scores": score_batch,
             "traj_mask": traj_mask,
-            "environment_reward": environment_reward_batch,
+            "environment_scores": environment_score_batch,
         }
 
         return DataProto.from_dict(tensors=tensor_batch)
@@ -596,14 +600,13 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         self, env, trajectories: List[List[Dict]]
     ) -> DataProto:
         """
-        Transform a list of trajectories and corresponding raw metadata into a DataProto.
+        Transforms a batch of agent trajectories into a structured DataProto format.
 
-        Each trajectory is a list of step dictionaries with keys:
-        "observation", "next_observation", "reward", "done", "action", "response", "action", "augmented_reward"
+        Args:
+            env: The environment from which trajectories are collected.
+            trajectories (list of list of dict): A batch of agent trajectories.
 
-        For each trajectory, we:
-        1. Build a single string by concatenating Initial Prompt and then State, Response, Reward repeated.
-        2. Compute the cumulative reward and the trajectory length.
-        3. Tokenize and pad the resulting strings.
+        Returns:
+            DataProto: The structured dataset containing tokenized trajectories, masks, and rewards.
         """
-        return self._transform_agent_trajectories_helper(envs=[env] * len(trajectories), trajectory_idxs=range(len(trajectories)), trajectories=trajectories)
+        return self._transform_agent_trajectories_helper(env, env_idxs=range(len(trajectories)), trajectories=trajectories)

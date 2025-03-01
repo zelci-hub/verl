@@ -166,7 +166,7 @@ trainer:
   total_training_steps: null
   project_name: verl_examples
   experiment_name: gsm8k
-  logger: [ 'console', 'wandb' ]
+  logger: [ 'console']
   val_generations_to_log_to_wandb: 0
   nnodes: 1
   n_gpus_per_node: 8
@@ -189,4 +189,3 @@ env:
 agent:
   name: webagent
   trajectory_episode_len: 20
-  safe_batch_size: 128
