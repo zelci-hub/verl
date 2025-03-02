@@ -490,7 +490,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             all_response_masks.extend(msg_mask)
 
             if mask_value == 1:
-                score_positions.append(len(all_response_tokens))
+                score_positions.append(len(all_response_tokens) - 1)
 
         step_scores = compute_step_score(traj)
         env_score = compute_environment_score(traj)
@@ -500,14 +500,10 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         return (
             torch.tensor(prompts_tokens, dtype=torch.long),
             torch.tensor(all_response_tokens, dtype=torch.long),
-            torch.tensor(
-                prompts_tokens + all_response_tokens, dtype=torch.long
-            ),
             torch.tensor(all_response_masks, dtype=torch.long),
             torch.tensor(step_scores, dtype=torch.float32),
             torch.tensor(score_positions, dtype=torch.long),
             env_score,
-            score_positions[-1],
         )
 
     def _transform_agent_trajectories_helper(self, env, env_idxs, trajectories: List[List[Dict]]):
@@ -533,12 +529,10 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         (
             all_initial_tokens_list,
             all_response_tokens_list,
-            all_trajectory_tokens_list,
             all_masks_list,
-            all_score_list,
-            all_score_positions,
+            all_scores_list,
+            all_score_positions, # currently not using step score
             environment_scores,
-            environment_score_positions
         ) = zip(*results)
 
         # reverse the list and create tensors, pad, then flip to achieve left padding
@@ -554,15 +548,11 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             padding_value=self.tokenizer.pad_token_id,
         )
 
-        trajectory_batch = torch.nn.utils.rnn.pad_sequence(
-            all_trajectory_tokens_list,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id,
-        )
-
         traj_mask = torch.nn.utils.rnn.pad_sequence(
             all_masks_list, batch_first=True, padding_value=0
         )
+
+        trajectory_batch = torch.concat([prompts_batch, response_batch], dim=1)
 
         attention_mask = torch.where(trajectory_batch != self.tokenizer.pad_token_id, 1, 0)
 
@@ -571,13 +561,25 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
         # Place all rewards to last response token
         score_batch = torch.zeros_like(response_batch, dtype=torch.float32)
-        for i, (score_row, position_row) in enumerate(zip(all_score_list, all_score_positions)):
-            score_batch[i, position_row] = score_row
-
         environment_score_batch = torch.zeros_like(response_batch, dtype=torch.float32)
-        environment_score_batch[torch.arange(environment_score_batch.shape[0]), environment_score_positions] = (
-            torch.tensor(environment_scores, dtype=torch.float32)
-        )
+
+        prompt_length = prompts_batch.shape[1]
+        valid_response_length_sequences = attention_mask[:, prompt_length:].sum(dim=-1)
+
+        for i, score_list in enumerate(all_scores_list):
+            last_valid_idx = valid_response_length_sequences[i] - 1
+            if last_valid_idx >= 0 and last_valid_idx < score_batch.shape[1]:
+                score_batch[i, last_valid_idx] = sum(score_list) 
+                environment_score_batch[i, last_valid_idx] = environment_scores[i]
+
+        # score_batch = torch.zeros_like(response_batch, dtype=torch.float32)
+        # for i, (score_row, position_row) in enumerate(zip(all_score_list, all_score_positions)):
+        #     score_batch[i, position_row] = score_row
+
+        # environment_score_batch = torch.zeros_like(response_batch, dtype=torch.float32)
+        # environment_score_batch[torch.arange(environment_score_batch.shape[0]), environment_score_positions] = (
+        #     torch.tensor(environment_scores, dtype=torch.float32)
+        # )
 
         print(f"Shapes after convertion: complete trajectory: {trajectory_batch.size()}, responses: {response_batch.size()}, prompts: {prompts_batch.size()}, traj_mask: {traj_mask.size()}")
 
