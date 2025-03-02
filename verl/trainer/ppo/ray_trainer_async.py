@@ -195,6 +195,46 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                         metrics['batch/solve_all'] = solve_all
 
 
+                        if self.config.trainer.rejection_sample:
+                            # If no valid samples remain, skip this batch and get a new one
+                            if not valid_mask.any():
+                                continue
+
+                            # Keep track of valid samples and non-valid samples
+                            valid_indices = torch.where(valid_mask)[0]
+                            non_valid_indices = torch.where(~valid_mask)[0]
+                            
+                            num_valid_samples = len(valid_indices)
+                            num_trainer_replicas = self.actor_rollout_wg.world_size if self.hybrid_engine \
+                                else self.actor_wg.world_size
+                            
+                            # Calculate how many samples we need to add for a full batch
+                            remainder = num_valid_samples % num_trainer_replicas
+                            padding_needed = (num_trainer_replicas - remainder) % num_trainer_replicas
+                            
+                            # If we need padding and have non-valid samples available, use them
+                            combined_indices = valid_indices.tolist()
+                            if padding_needed > 0 and len(non_valid_indices) > 0:
+                                # Select padding_needed non-valid samples (or as many as available)
+                                padding_samples = min(padding_needed, len(non_valid_indices))
+                                # Randomly select from non-valid indices to use as padding
+                                padding_indices = non_valid_indices[torch.randperm(len(non_valid_indices))[:padding_samples]]
+                                combined_indices.extend(padding_indices.tolist())
+                            
+                            # Create a new mask for the combined set of samples
+                            final_mask = torch.zeros(len(batch.batch['input_ids']), dtype=torch.bool)
+                            final_mask[combined_indices] = True
+                            
+                            # Apply the mask to keep only selected samples
+                            batch = batch[final_mask]
+                            batch = dataprotoitem_to_dataproto(batch)
+                            
+                            # Log metrics about rejection sampling
+                            metrics['batch/num_valid_samples'] = num_valid_samples
+                            metrics['batch/num_padding_samples'] = padding_needed
+
+
+
                         
                         if self.config.actor_rollout_ref.rollout.vllm_log_prob:
                             # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)

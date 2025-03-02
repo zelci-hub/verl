@@ -54,7 +54,7 @@ def main(config):
         print(f"Output file {config.data.output_path} already exists. Skipping generation and proceeding to evaluation.")
         dataset = pd.read_parquet(config.data.output_path)
     else:
-        local_path = copy_local_path_from_hdfs(config.model.path)
+        local_path = copy_to_local(config.model.path)
         from verl.utils import hf_tokenizer
         tokenizer = hf_tokenizer(local_path)
 
