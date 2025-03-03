@@ -188,3 +188,4 @@ env:
 agent:
   name: webagent
   trajectory_episode_len: 20
+  max_trajectory_length: 8000

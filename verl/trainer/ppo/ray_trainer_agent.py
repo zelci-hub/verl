@@ -63,7 +63,9 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             engine_name="verl",
             tokenizer=self.tokenizer,
             agent_class=self.agent_class,
+            model_path=self.config.actor_rollout_ref.model.path,
             episode_len=self.config.agent.trajectory_episode_len,
+            max_trajectory_length=self.config.agent.max_trajectory_length,
         )
 
 
@@ -383,7 +385,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         with _timer("collect_trajectory", timing_raw):
             # Interact_environment returns list of trajectories.
             trajectories = self.agent.interact_environment(
-                timing_raw=timing_raw, meta_info=meta_info
+                timing_raw=timing_raw, return_tokens=True, meta_info=meta_info
             )
 
         with _timer("transform_trajectory", timing_raw):
@@ -394,136 +396,29 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
         return final_gen_batch_output
 
-    def _postprocess_model_chat_template(self, message_text):
-        """
-        Postprocesses the chat template output by removing any automatically added system message.
 
-        Args:
-            message_text (str): The formatted message text.
-
-        Returns:
-            str: The processed message text without the default system message.
-        """
-        if any(substring in self.config.actor_rollout_ref.model.path.lower() for substring in ('qwen2', 'qwen2.5')):
-            # from https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/tokenizer_config.json, a default system message is inserted. So we manually remove the first occurance of default system message.
-            # This is currently assuming no tool call.
-            target = "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n"
-            if message_text.startswith(target):
-                return message_text[len(target):]  # Remove only if it’s at the start
-            return message_text
-
-        print("Model not recognized for postprocessing, entire text returned")
-        return message_text
-
-            
-        
-    def _transform_single_trajectory(self, traj_id, traj):
-        from rllm.environments import compute_training_score, compute_environment_score
-        """
-        Transforms a single trajectory into tokenized form.
-
-        Args:
-            traj_idx: The index of the agent from which the trajectory originates.
-            traj (list[dict]): The trajectory data, each step containing keys:
-                "observation", "next_observation", "reward", "done", "action", "response", "augmented_reward".
-
-        Returns:
-            Tuple of torch tensors containing:
-            - Initial prompt tokens
-            - Response tokens
-            - Full trajectory tokens (concatenation of prompt and response)
-            - Mask for responses
-            - Score values
-            - Score positions (positions of last valid output token for each step)
-            - Environment score
-            - Environment score position (which is same as last reward position)
-        """
-
-        assert (
-            traj and "observation" in traj[0]
-        ), f"Trajectory is in wrong format. traj: {traj}, traj[0]: {traj[0]}"
-
-        # Build initial prompts
-        initial_message = {
-            "role": "user",
-            "content": self.agent.agents[traj_id].convert_observation_to_string(traj[0]["observation"], with_system_prompt=True),
-        }
-        inital_message_text = self.tokenizer.apply_chat_template(
-            [initial_message], tokenize=False, add_generation_prompt=False
-        )   
-        inital_message_text = self._postprocess_model_chat_template(inital_message_text)
-        
-        prompts_tokens = self.tokenizer.encode(
-            inital_message_text, add_special_tokens=False
-        )
-
-        # Build the trajectory messages
-        traj_message = []
-        
-        for step in traj:
-            next_obs = step["next_observation"]
-            response = step["response"]
-            traj_message.append({"role": "assistant", "content": response})
-            observation_content = self.agent.agents[traj_id].convert_observation_to_string(next_obs, with_system_prompt=False)
-            traj_message.append(
-                {"role": "user", "content": observation_content}
-            )
-
-        # Convert the traj_message to inputs and mask tensors
-        all_response_tokens = []
-        all_response_masks = []
-        for msg in traj_message:
-            # Get template for single message
-            msg_text = self.tokenizer.apply_chat_template(
-                [msg], tokenize=False, add_generation_prompt=False
-            )
-            msg_text = self._postprocess_model_chat_template(msg_text)
-
-            msg_tokens = self.tokenizer.encode(msg_text, add_special_tokens=False)
-
-            mask_value = 1 if msg["role"] == "assistant" else 0
-            msg_mask = [mask_value] * len(msg_tokens)
-
-            all_response_tokens.extend(msg_tokens)
-            all_response_masks.extend(msg_mask)
-
-
-        traj_score = compute_training_score(traj)
-        env_score = compute_environment_score(traj)
-
-        return (
-            torch.tensor(prompts_tokens, dtype=torch.long),
-            torch.tensor(all_response_tokens, dtype=torch.long),
-            torch.tensor(all_response_masks, dtype=torch.long),
-            traj_score,
-            env_score,
-        )
-
-    def _transform_agent_trajectories_helper(self, trajectories: List[List[Dict]]):
+    def _transform_agent_trajectories(self, trajectories: List[Dict]):
         """
         Helper function to transform a list of trajectories into tokenized DataProto format.
 
         Args:
-            trajectories (list of list of dict): List of trajectories to process.
+            trajectories (list of dict): List of trajectories to process.
 
         Returns:
             DataProto: A structured dataset containing input tokens, masks, and rewards.
         """
-        # Start threading for parallel execution
-        results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=256) as executor:
-            transform_func = partial(self._transform_single_trajectory)
-            results = list(
-                executor.map(transform_func, list(range(len(trajectories))), trajectories)
-            )
 
-        (
-            all_initial_tokens_list,
-            all_response_tokens_list,
-            all_masks_list,
-            traj_scores,
-            environment_scores,
-        ) = zip(*results)
+        all_initial_tokens_list = []
+        all_response_tokens_list = []
+        all_masks_list = []
+        traj_scores = []
+        environment_scores = []
+        for traj in trajectories:
+            all_initial_tokens_list.append(traj["prompt_tokens"])
+            all_response_tokens_list.append(traj["response_tokens"])
+            all_masks_list.append(traj["response_masks"])
+            traj_scores.append(traj["training_reward"])
+            environment_scores.append(traj["environment_reward"])
 
         # reverse the list and create tensors, pad, then flip to achieve left padding
         prompts_batch = torch.nn.utils.rnn.pad_sequence(
@@ -577,17 +472,3 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
         return DataProto.from_dict(tensors=tensor_batch)
     
-
-    def _transform_agent_trajectories(
-        self, trajectories: List[List[Dict]]
-    ) -> DataProto:
-        """
-        Transforms a batch of agent trajectories into a structured DataProto format.
-
-        Args:
-            trajectories (list of list of dict): A batch of agent trajectories.
-
-        Returns:
-            DataProto: The structured dataset containing tokenized trajectories, masks, and rewards.
-        """
-        return self._transform_agent_trajectories_helper(trajectories=trajectories)
