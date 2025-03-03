@@ -348,6 +348,7 @@ class vLLMRollout(BaseRollout):
         Yields:
             tuple: (prompt_idx, DataProto) containing the original prompt index and its generated sequence
         """
+        assert not self.config.vllm_log_prob, "We don't support vllm probability when use tool calling"
         from rllm.environments.tools import PythonInterpreter, ToolCaller
         from rllm.environments.tools.utils import parse_tool_calls
         from types import SimpleNamespace
@@ -355,6 +356,8 @@ class vLLMRollout(BaseRollout):
         # Tianjun TODO: debugging
         tool_stop_tokens = ["</tool_call>"]
         tool_start_tokens = ["<tool_call>"]
+        tool_response_start_tokens = ["<tool_response>"]
+        tool_response_stop_tokens = ["</tool_response>"]
         # tool_stop_tokens = prompts.meta_info['tool_stop_tokens']
         # tool_start_tokens = prompts.meta_info['tool_start_tokens']
 
@@ -443,7 +446,6 @@ class vLLMRollout(BaseRollout):
 
             request_id = str(uuid.uuid4())
             current_tokens = prompt_tokens.copy()
-            all_generated_tokens = [[] for _ in range(self.config.n)]
             all_log_probs = [[] for _ in range(self.config.n)]
             
             while True:
@@ -462,7 +464,13 @@ class vLLMRollout(BaseRollout):
                 for current_token in current_tokens:
                     output = await generate_wrapper(current_token)
                     latest_tokens.append(list(output.outputs[0].token_ids))
-                    latest_logprobs.append(list(output.outputs[0].logprobs) if hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs is not None else None)
+                    if hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs is not None:
+                        log_prob_list = []
+                        for log_prob in output.outputs[0].logprobs:
+                            log_prob_list.append(next(iter(log_prob.values())).logprob)
+                    else:
+                        log_prob_list = [0.0] * len(output.outputs[0].token_ids)
+                    latest_logprobs.append(log_prob_list)
 
                 for response_idx, (latest_token, latest_logprob) in enumerate(zip(latest_tokens, latest_logprobs)):
                     # Check the latest tokens for tool_call
@@ -471,18 +479,16 @@ class vLLMRollout(BaseRollout):
                     if has_tool_call:
                         # Extract tokens up to the tool_call token
                         tool_tokens = latest_token[tool_start_idx:tool_stop_idx]
-                        all_generated_tokens[response_idx].extend(latest_token)
                         
                         # Extract log probs if available
-                        if latest_logprob is not None:
-                            all_log_probs[response_idx].extend(latest_logprob)
+                        all_log_probs[response_idx].extend(latest_logprob)
                         
                         # Extract and decode the tool call code
                         tool_call_text = self.tokenizer.decode(tool_tokens)
                         
                         # Call Python interpreter
                         interpreter_result = await _apply_tool(tool_call_text)
-                        interpreter_result = "\n<tool_response>" + interpreter_result + "</tool_response>"
+                        interpreter_result = "\n" + tool_response_start_tokens + interpreter_result + tool_response_stop_tokens
                         
                         # Tokenize the result and prepare for next generation
                         result_tokens = self.tokenizer.encode(interpreter_result, add_special_tokens=False)
@@ -491,17 +497,11 @@ class vLLMRollout(BaseRollout):
                         current_tokens[response_idx] = current_tokens[response_idx] + latest_token + result_tokens
                         all_log_probs.extend([0.0] * len(result_tokens))
                     else:
-                        # If no tool call, this is the final output
-                        all_generated_tokens[response_idx].extend(latest_token)
-                        
                         # Extract log probs if available
-                        if latest_logprob is not None:
-                            all_log_probs[response_idx].extend(latest_logprob)
-                        else:
-                            all_log_probs[response_idx].extend([0.0] * len(all_generated_tokens))
+                        all_log_probs[response_idx].extend(latest_logprob)
 
                         # Update current tokens for next generation
-                        current_tokens[response_idx] = current_tokens[response_idx] + latest_tokens
+                        current_tokens[response_idx] = current_tokens[response_idx] + latest_token
                 
                 # Check if we need to continue generating
                 final_check = False
@@ -522,10 +522,9 @@ class vLLMRollout(BaseRollout):
                 if overflow:
                     break
         
-            print('generation finished')
             outputs = [
-                SimpleNamespace(token_ids=tokens[-len(probs):], logprobs=probs)
-                for tokens, probs in zip(current_tokens, all_log_probs)
+                SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs) if len(probs) > 0 else SimpleNamespace(token_ids=tokens[len(prompt):])
+                for tokens, probs, prompt in zip(current_tokens, all_log_probs, prompt_tokens)
             ]
 
             final_output = SimpleNamespace(outputs=outputs)
@@ -548,18 +547,12 @@ class vLLMRollout(BaseRollout):
                 log_probs = []
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
-                    if hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
-                        log_prob_list = []
-                        for log_prob in output.outputs[sample_id].logprobs:
-                            log_prob_list.append(next(iter(log_prob.values())).logprob)
-                        log_probs.append(log_prob_list)
-                    else:
-                        log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
+                    log_probs.append(output.outputs[sample_id].logprobs)
 
                 response = pad_2d_list_to_length(response, self.pad_token_id,
-                                            max_length=self.config.response_length).to(idx.device)
+                                               max_length=self.config.response_length).to(idx.device)
                 log_probs = pad_2d_list_to_length(log_probs, 0.0,
-                                            max_length=self.config.response_length).to(idx.device)
+                                               max_length=self.config.response_length).to(idx.device)
 
                 # Process single sequence
                 single_idx = idx[prompt_idx:prompt_idx+1]
