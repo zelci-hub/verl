@@ -351,6 +351,16 @@ class vLLMRollout(BaseRollout):
         from rllm.environments.tools import PythonInterpreter, ToolCaller
         from rllm.environments.tools.utils import parse_tool_calls
         from types import SimpleNamespace
+
+        # Tianjun TODO: debugging
+        tool_stop_tokens = ["</tool_call>"]
+        tool_start_tokens = ["<tool_call>"]
+        # tool_stop_tokens = prompts.meta_info['tool_stop_tokens']
+        # tool_start_tokens = prompts.meta_info['tool_start_tokens']
+
+        # Append the stop tokens with new sampling stop tokens
+        kwargs["stop"] = self.sampling_params.stop + tool_stop_tokens
+        max_token_limit = self.config.prompt_length + self.config.response_length
         
         assert self.config.async_engine, "generate_sequences_async requires async_engine=True"
         # rebuild vllm cache engine
@@ -361,15 +371,7 @@ class vLLMRollout(BaseRollout):
         attention_mask = prompts.batch['attention_mask']
         position_ids = prompts.batch['position_ids']
         eos_token_id = prompts.meta_info['eos_token_id']
-        # Tianjun TODO: debugging
-        tool_stop_tokens = ["</tools>"]
-        tool_start_tokens = ["<tools>"]
 
-        # tool_stop_tokens = prompts.meta_info['tool_stop_tokens']
-        # tool_start_tokens = prompts.meta_info['tool_start_tokens']
-        # Append the stop tokens with new sampling stop tokens
-        kwargs["stop"]  = self.sampling_params["stop"] + tool_stop_tokens
-        max_token_limit = self.config.prompt_length + self.config.response_length
 
         batch_size = idx.size(0)
 
@@ -397,8 +399,8 @@ class vLLMRollout(BaseRollout):
 
         # officially start the task processes
         def contains_tool_call_token(token_ids):
-            tool_start_token_ids = self.tokenizer.encode(tool_start_tokens, add_special_tokens=True)
-            tool_stop_token_ids = self.tokenizer.encode(tool_stop_tokens, add_special_tokens=True)
+            tool_start_token_ids = self.tokenizer.encode(tool_start_tokens[0], add_special_tokens=False)
+            tool_stop_token_ids = self.tokenizer.encode(tool_stop_tokens[0], add_special_tokens=False)
             # TODO: make sure to use special tokens
             assert len(tool_start_token_ids) == 1
             assert len(tool_stop_token_ids) == 1
@@ -419,86 +421,115 @@ class vLLMRollout(BaseRollout):
             except ValueError:
                 return False, -1, -1
 
+        async def _apply_tool(response, id=None):
+            interpreter = PythonInterpreter(n_sandboxes=16)
+            tool_caller = ToolCaller(tools=[interpreter])
+            tool_calls = parse_tool_calls(response)
+
+            if len(tool_calls) > 0:
+                tool_call = tool_calls[0]
+                if id is not None:
+                    tool_call["parameters"]["id"] = id
+                tool_call_result = await tool_caller(tool_call["name"], tool_call["parameters"])
+                return tool_call_result
+
+            return ""
 
         async def _process_single_prompt(prompt_idx, prompt_tokens):
             """Process a single prompt with potential tool calls"""
+            prompt_tokens = [prompt_tokens for _ in range(self.config.n)]
+            kwargs["n"] = 1
+            self.update_sampling_params(**kwargs)
+
             request_id = str(uuid.uuid4())
             current_tokens = prompt_tokens.copy()
-            all_generated_tokens = []
-            all_log_probs = []
-
-            # TODO return cur_tokens
+            all_generated_tokens = [[] for _ in range(self.config.n)]
+            all_log_probs = [[] for _ in range(self.config.n)]
             
             while True:
                 # Generate tokens until "<tool_call>" or completion
-                async for output in self.inference_engine.generate(
-                    prompt=TokensPrompt(prompt_token_ids=current_tokens),
-                    sampling_params=self.sampling_params,
-                    request_id=request_id
-                ):
+                async def generate_wrapper(current_token):
+                    async for output in self.inference_engine.generate(
+                        prompt=TokensPrompt(prompt_token_ids=current_token),
+                        sampling_params=self.sampling_params,
+                        request_id=request_id,
+                    ):
+                        latest_output = output
+                    return latest_output
+
+                latest_tokens = []
+                latest_logprobs = []
+                for current_token in current_tokens:
+                    output = await generate_wrapper(current_token)
+                    latest_tokens.append(list(output.outputs[0].token_ids))
+                    latest_logprobs.append(list(output.outputs[0].logprobs) if hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs is not None else None)
+
+                for response_idx, (latest_token, latest_logprob) in enumerate(zip(latest_tokens, latest_logprobs)):
                     # Check the latest tokens for tool_call
-                    latest_tokens = output.outputs[0].token_ids
-                    has_tool_call, tool_start_idx, tool_stop_idx = contains_tool_call_token(latest_tokens)
+                    has_tool_call, tool_start_idx, tool_stop_idx = contains_tool_call_token(latest_token)
                     
                     if has_tool_call:
                         # Extract tokens up to the tool_call token
-                        tool_tokens = latest_tokens[tool_start_idx:tool_stop_idx]
-                        all_generated_tokens.extend(latest_tokens)
+                        tool_tokens = latest_token[tool_start_idx:tool_stop_idx]
+                        all_generated_tokens[response_idx].extend(latest_token)
                         
                         # Extract log probs if available
-                        if hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs is not None:
-                            log_prob_list = []
-                            for log_prob in output.outputs[0].logprobs:
-                                log_prob_list.append(next(iter(log_prob.values())).logprob)
-                            all_log_probs.extend(log_prob_list)
+                        if latest_logprob is not None:
+                            all_log_probs[response_idx].extend(latest_logprob)
                         
                         # Extract and decode the tool call code
                         tool_call_text = self.tokenizer.decode(tool_tokens)
                         
                         # Call Python interpreter
-                        interpreter_result = await PythonInterpreter(tool_call_text)
+                        interpreter_result = await _apply_tool(tool_call_text)
+                        interpreter_result = "\n<tool_response>" + interpreter_result + "</tool_response>"
                         
                         # Tokenize the result and prepare for next generation
                         result_tokens = self.tokenizer.encode(interpreter_result, add_special_tokens=False)
                         
                         # Update current tokens for next generation
-                        current_tokens = current_tokens + latest_tokens + result_tokens
+                        current_tokens[response_idx] = current_tokens[response_idx] + latest_token + result_tokens
                         all_log_probs.extend([0.0] * len(result_tokens))
-                        break
                     else:
                         # If no tool call, this is the final output
-                        all_generated_tokens = latest_tokens
+                        all_generated_tokens[response_idx].extend(latest_token)
                         
                         # Extract log probs if available
-                        if hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs is not None:
-                            log_prob_list = []
-                            for log_prob in output.outputs[0].logprobs:
-                                log_prob_list.append(next(iter(log_prob.values())).logprob)
-                            all_log_probs = log_prob_list
+                        if latest_logprob is not None:
+                            all_log_probs[response_idx].extend(latest_logprob)
                         else:
-                            all_log_probs = [0.0] * len(all_generated_tokens)
+                            all_log_probs[response_idx].extend([0.0] * len(all_generated_tokens))
 
                         # Update current tokens for next generation
-                        current_tokens = current_tokens + latest_tokens
+                        current_tokens[response_idx] = current_tokens[response_idx] + latest_tokens
                 
                 # Check if we need to continue generating
-                final_check, _, _ = contains_tool_call_token(latest_tokens)
+                final_check = False
+                for latest_token in latest_tokens:
+                    single_final_check, _, _ = contains_tool_call_token(latest_token)
+                    final_check = final_check or single_final_check
                 if not final_check:
                     break
 
-                if len(current_tokens) >= max_token_limit:
-                    current_tokens = current_tokens[:max_token_limit]
-                    all_log_probs = all_log_probs[:max_token_limit]
+                # check if we have overflow
+                overflow = True
+                for response_idx in range(self.config.n):
+                    if len(current_tokens[response_idx]) >= max_token_limit:
+                        current_tokens[response_idx] = current_tokens[response_idx][:max_token_limit]
+                        all_log_probs[response_idx] = all_log_probs[response_idx][:max_token_limit]
+                    else:
+                        overflow = False
+                if overflow:
                     break
-            
-            # Create final output with the same structure as original code
-            final_output = SimpleNamespace()
-            output_sample = SimpleNamespace()
-            output_sample.token_ids = all_generated_tokens
-            output_sample.logprobs = all_log_probs if all_log_probs else None
-            final_output.outputs = [output_sample]
-            
-            # Tianjun TODO: figure out output format
+        
+            print('generation finished')
+            outputs = [
+                SimpleNamespace(token_ids=tokens[-len(probs):], logprobs=probs)
+                for tokens, probs in zip(current_tokens, all_log_probs)
+            ]
+
+            final_output = SimpleNamespace(outputs=outputs)
+
             return prompt_idx, final_output
 
         async def _async_generate():
@@ -518,7 +549,9 @@ class vLLMRollout(BaseRollout):
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
                     if hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
-                        log_prob_list = output.outputs[sample_id].logprobs
+                        log_prob_list = []
+                        for log_prob in output.outputs[sample_id].logprobs:
+                            log_prob_list.append(next(iter(log_prob.values())).logprob)
                         log_probs.append(log_prob_list)
                     else:
                         log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
