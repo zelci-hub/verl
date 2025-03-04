@@ -125,8 +125,6 @@ class RLHFDataset(Dataset):
             tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
                                                              axis=1)]
 
-        print(f'filter dataset len: {len(self.dataframe)}')
-
     def resume_dataset_state(self):
         self.serialize_dataset = False if hasattr(self, 'original_parquet_files') else True
         # resume dataframe if not it's serialized in data.pt
