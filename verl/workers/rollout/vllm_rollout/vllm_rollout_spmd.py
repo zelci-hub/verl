@@ -46,6 +46,9 @@ from vllm.distributed import parallel_state as vllm_ps
 from vllm import AsyncLLMEngine, LLM, SamplingParams, TokensPrompt
 from vllm.engine.arg_utils import AsyncEngineArgs
 from verl.third_party.vllm import vllm_version
+from rllm.environments.tools import PythonInterpreter, ToolCaller
+from rllm.environments.tools.utils import parse_tool_calls
+from types import SimpleNamespace
 
 # TODO
 # 1. support pp in vllm
@@ -190,6 +193,8 @@ class vLLMRollout(BaseRollout):
 
         self.pad_token_id = tokenizer.pad_token_id
         self.tokenizer = tokenizer
+        self.interpreter = PythonInterpreter(n_sandboxes=16)
+        self.tool_caller = ToolCaller(tools=[self.interpreter])
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -349,9 +354,6 @@ class vLLMRollout(BaseRollout):
             tuple: (prompt_idx, DataProto) containing the original prompt index and its generated sequence
         """
         assert not self.config.vllm_log_prob, "We don't support vllm probability when use tool calling"
-        from rllm.environments.tools import PythonInterpreter, ToolCaller
-        from rllm.environments.tools.utils import parse_tool_calls
-        from types import SimpleNamespace
 
         # Tianjun TODO: debugging
         tool_stop_tokens = ["</tool_call>"]
@@ -419,24 +421,24 @@ class vLLMRollout(BaseRollout):
                 # Ensure full sequence matches
                 if token_ids[end_idx:end_idx + len(tool_stop_token_ids)] != tool_stop_token_ids:
                     return False, -1, -1
-                return True, start_idx, end_idx + 1
+                return True, start_idx+1, end_idx
 
             except ValueError:
                 return False, -1, -1
 
+            
+
         async def _apply_tool(response, id=None):
-            interpreter = PythonInterpreter(n_sandboxes=16)
-            tool_caller = ToolCaller(tools=[interpreter])
             tool_calls = parse_tool_calls(response)
 
             if len(tool_calls) > 0:
                 tool_call = tool_calls[0]
                 if id is not None:
                     tool_call["parameters"]["id"] = id
-                tool_call_result = await tool_caller(tool_call["name"], tool_call["parameters"])
+                tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
                 return tool_call_result
 
-            return ""
+            return {'content': 'Tool Fails'}
 
         async def _process_single_prompt(prompt_idx, prompt_tokens):
             """Process a single prompt with potential tool calls"""
@@ -473,6 +475,14 @@ class vLLMRollout(BaseRollout):
                     latest_logprobs.append(log_prob_list)
 
                 for response_idx, (latest_token, latest_logprob) in enumerate(zip(latest_tokens, latest_logprobs)):
+
+                    # TODO: FIXME: Tianjun
+                    latest_text = self.tokenizer.decode(latest_token).replace(self.tokenizer.eos_token, "")
+                    if "```json" in latest_text and latest_text.endswith("```"):
+                        latest_text = latest_text.replace("```json", tool_start_tokens[0] + "```json") + tool_stop_tokens[0]
+                    latest_token = self.tokenizer.encode(latest_text, add_special_tokens=False)
+                    latest_tokens[response_idx] = latest_token
+                    
                     # Check the latest tokens for tool_call
                     has_tool_call, tool_start_idx, tool_stop_idx = contains_tool_call_token(latest_token)
                     
@@ -483,25 +493,26 @@ class vLLMRollout(BaseRollout):
                         # Extract log probs if available
                         all_log_probs[response_idx].extend(latest_logprob)
                         
-                        # Extract and decode the tool call code
-                        tool_call_text = self.tokenizer.decode(tool_tokens)
+                        # Extract and decode the tool call code, to make sure we have no eos_token
+                        tool_call_text = self.tokenizer.decode(tool_tokens).replace(self.tokenizer.eos_token, "")
                         
                         # Call Python interpreter
                         interpreter_result = await _apply_tool(tool_call_text)
-                        interpreter_result = "\n" + tool_response_start_tokens + interpreter_result + tool_response_stop_tokens
+                        interpreter_result_with_special_token = "\n" + tool_response_start_tokens[0] + interpreter_result['content'] + tool_response_stop_tokens[0]
                         
                         # Tokenize the result and prepare for next generation
-                        result_tokens = self.tokenizer.encode(interpreter_result, add_special_tokens=False)
+                        result_tokens = self.tokenizer.encode(interpreter_result_with_special_token, add_special_tokens=False)
                         
                         # Update current tokens for next generation
-                        current_tokens[response_idx] = current_tokens[response_idx] + latest_token + result_tokens
+                        # TODO: FIXME: Tianjun
+                        current_tokens[response_idx] = current_tokens[response_idx] + latest_token + result_tokens + [151643, 151645]
                         all_log_probs.extend([0.0] * len(result_tokens))
                     else:
                         # Extract log probs if available
                         all_log_probs[response_idx].extend(latest_logprob)
 
                         # Update current tokens for next generation
-                        current_tokens[response_idx] = current_tokens[response_idx] + latest_token
+                        current_tokens[response_idx] = current_tokens[response_idx] + latest_token + [151643]
                 
                 # Check if we need to continue generating
                 final_check = False
