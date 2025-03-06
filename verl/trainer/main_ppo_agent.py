@@ -26,14 +26,18 @@ from verl.workers.reward_manager import NaiveRewardManager
 from verl.trainer.ppo.ray_trainer_agent import RayPPOAgentTrainer
 
 from rllm.environments.browsergym import BatchBrowserGym
+from rllm.environments.frozenlake.frozenlake import BatchFrozenLakeEnv
 from rllm.models.web_agent import WebAgent
+from rllm.models.frozenlake_agent import FrozenLakeAgent
 
 ENV_CLASS_MAPPING = {
     'browsergym': BatchBrowserGym,
+    'frozenlake': BatchFrozenLakeEnv,
 }
 
 AGENT_CLASS_MAPPING = {
     'webagent': WebAgent,
+    'frozenlakeagent': FrozenLakeAgent,
 }
 
 def setup_environment(config):
@@ -45,6 +49,8 @@ def setup_environment(config):
             importlib.reload(browsergym.miniwob)
             os.environ["MINIWOB_URL"] = config.env.miniwob_url
             return
+    elif config.env.name == 'frozenlake':
+        return
 
     raise ValueError(f"Environment subtask not supported, env: {config.env.name}, subtask: {config.env.subtask == 'miniwob'}")
 

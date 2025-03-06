@@ -68,6 +68,14 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             max_trajectory_length=self.config.agent.max_trajectory_length,
         )
 
+    def init_env(self, batch):
+        """
+        Initialize environment depending on env_class with the necessary extra_info, also set uid of the batch.
+        """
+        env = self.env_class.from_extra_infos(extra_infos=batch.non_tensor_batch["extra_info"].tolist())
+        batch.non_tensor_batch["uid"] = np.array(env.env_id, dtype=object)
+
+        return env
 
     def fit_agent(self):
         """
@@ -120,13 +128,8 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 batch.meta_info = {
                     "agent_rollout": True,  # no need to generate multiple ones since environment is repeated already
                 }
-                # initialize environment
-                env_ids = [
-                    i["environment_id"] for i in batch.non_tensor_batch["extra_info"]
-                ]
-                env = self.env_class(batch_size=len(env_ids), env_id=env_ids)
 
-                batch.non_tensor_batch["uid"] = np.array(env_ids, dtype=object)
+                env = self.init_env(batch)
 
                 with _timer("step", timing_raw):
                     final_gen_batch_output = self.generate_agent_trajectory(env, timing_raw=timing_raw, meta_info=batch.meta_info)
@@ -329,11 +332,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 "agent_rollout": True
             }
 
-            env_ids = [
-                i["environment_id"] for i in test_batch.non_tensor_batch["extra_info"]
-            ]
-
-            env = self.env_class(batch_size=len(env_ids), env_id=env_ids)
+            env = self.init_env(test_batch)
 
             test_output_gen_batch = self.generate_agent_trajectory(
                 env, meta_info=test_batch.meta_info
