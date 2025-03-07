@@ -315,6 +315,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
     def _validate_agent(self):
         rewards_lst = []
+        env_rewards_lst = []
         data_source_lst = []
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -342,9 +343,11 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             test_batch = test_batch.union(test_output_gen_batch)
 
             # use environment score to report validation reward
-            reward_tensor = test_batch.batch["environment_scores"]
+            reward_tensor = test_batch.batch["token_level_scores"] 
+            env_reward_tensor = test_batch.batch["environment_scores"]
 
             rewards_lst.append(reward_tensor.sum(-1).cpu())
+            env_rewards_lst.append(env_reward_tensor.sum(-1).cpu())
             data_source_lst.append(
                 test_batch.non_tensor_batch.get(
                     "data_source", ["unknown"] * reward_tensor.shape[0]
@@ -352,18 +355,28 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             )
 
         reward_tensor = torch.cat(rewards_lst, dim=0)  # (batch_size,)
+        env_reward_tensor = torch.cat(env_rewards_lst, dim=0)  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
         # evaluate test_score based on data source
         data_source_reward = {}
+        data_source_env_reward = {}
         for i in range(reward_tensor.shape[0]):
             data_source = data_sources[i]
+
             if data_source not in data_source_reward:
                 data_source_reward[data_source] = []
             data_source_reward[data_source].append(reward_tensor[i].item())
 
+            if data_source not in data_source_env_reward:
+                data_source_env_reward[data_source] = []
+            data_source_env_reward[data_source].append(env_reward_tensor[i].item())
+
         metric_dict = {}
         for data_source, rewards in data_source_reward.items():
-            metric_dict[f"val/test_score/{data_source}"] = np.mean(rewards)
+            metric_dict[f"val/train_score/{data_source}"] = np.mean(rewards)
+
+        for data_source, env_rewards in data_source_env_reward.items():
+            metric_dict[f"val/env_score/{data_source}"] = np.mean(env_rewards)
 
         return metric_dict
 
