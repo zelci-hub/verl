@@ -142,12 +142,12 @@ def run_generation(config):
     
     output_lst =  tokenizer.batch_decode(test_batch.batch['input_ids'][:, -config.rollout.response_length:], skip_special_tokens=False)
     output_lst = np.array(output_lst).reshape(len(output_lst)//n_val, n_val).tolist()
-    # dataset['responses'] = output_lst
-    # dataset['scores'] = scores
+    dataset['responses'] = output_lst
+    dataset['scores'] = scores
     # # Write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)
-    # makedirs(output_dir, exist_ok=True)
-    # dataset.to_parquet(config.data.output_path)
+    makedirs(output_dir, exist_ok=True)
+    dataset.to_parquet(config.data.output_path)
     
     # Max across first dim average correct
     scores = np.array(scores)
