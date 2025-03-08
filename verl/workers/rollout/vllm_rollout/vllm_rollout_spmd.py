@@ -419,6 +419,7 @@ class vLLMRollout(BaseRollout):
 
 
             max_token_limit = self.config.response_length + len(prompt_tokens)
+            max_response_token_limit = self.config.response_length 
 
             kwargs["n"] = 1
             kwargs["detokenize"] = True
@@ -432,9 +433,9 @@ class vLLMRollout(BaseRollout):
             is_done = [False]
             if self.config.n > 1 and do_sample:
                 all_prompt_tokens = copy.deepcopy(all_prompt_tokens * self.config.n)
-                all_log_probs = copy.deepcopy(all_log_probs * self.config.n)
-                all_tool_call_masks = copy.deepcopy(all_tool_call_masks * self.config.n)
-                is_done = copy.deepcopy(is_done * self.config.n)
+                all_log_probs = [[] for _ in range(self.config.n)]
+                all_tool_call_masks = [[] for _ in range(self.config.n)]
+                is_done = is_done * self.config.n
 
             with self.update_sampling_params(**kwargs):
                 request_id = str(uuid.uuid4())
@@ -445,11 +446,11 @@ class vLLMRollout(BaseRollout):
                     latest_logprobs: List[List[float]] = [] # logprobs of outputs from latest generation
 
                     # make 1 step of all copies on the current prompt until it has finished or a tool call is needed
-                    for i, generation_tokens in enumerate(all_current_tokens):
-                        if is_done[i]:
-                            latest_token.append([])
-                            latest_logprobs.append([])
+                    for i, d in enumerate(is_done):
+                        # already finished
+                        if d:
                             continue
+                        generation_tokens = all_current_tokens[i]
 
                         output = await generate_wrapper(generation_tokens, request_id)
                         latest_tokens.append(list(output.outputs[0].token_ids))
@@ -461,19 +462,22 @@ class vLLMRollout(BaseRollout):
                             log_prob_list = [0.0] * len(output.outputs[0].token_ids)
                         latest_logprobs.append(log_prob_list)
 
-
-                    for response_idx, (latest_token, latest_logprob) in enumerate(zip(latest_tokens, latest_logprobs)):
+                    latest_result_idx = 0
+                    for response_idx, d in enumerate(is_done):
                         # Skip if it has already completed
-                        if is_done[response_idx]:
+                        if d:
                             continue
+                        latest_token = latest_tokens[latest_result_idx]
+                        latest_logprob = latest_logprobs[latest_result_idx]
+                        latest_result_idx += 1
 
                         latest_text = self.tokenizer.decode(latest_token)
                         tool_calls = self.tool_caller.parse_tool_calls(latest_text)
+                        has_tool_call = False
                         if len(tool_calls) > 0:
                             has_tool_call = True
                             tool_call = tool_calls[0]
-                        else:
-                            has_tool_call = False
+                            
                 
                         if has_tool_call:
                             toolcall_result = await _apply_tool(tool_call) 
@@ -493,8 +497,6 @@ class vLLMRollout(BaseRollout):
                             # Update the mask to mask out toolcall result
                             all_tool_call_masks[response_idx].extend([1] * (len(latest_token)))
                             all_tool_call_masks[response_idx].extend([0] * (len(result_tokens)))
-
-                            print(f"after toolcall_result: {latest_text + toolcall_result_with_special_token} \n\n\n")
                         else:
                             # Extract log probs if available
                             all_log_probs[response_idx].extend(latest_logprob)
@@ -508,12 +510,12 @@ class vLLMRollout(BaseRollout):
                             # Since there was no tool call, this generation has terminated
                             is_done[response_idx] = True
 
-
                     # check for overflow, and mark overflown copies as finished
                     for response_idx in range(len(all_current_tokens)):
                         if len(all_current_tokens[response_idx]) >= max_token_limit:
                             all_current_tokens[response_idx] = all_current_tokens[response_idx][:max_token_limit]
-                            all_log_probs[response_idx] = all_log_probs[response_idx][:max_token_limit]
+                            all_log_probs[response_idx] = all_log_probs[response_idx][:max_response_token_limit]
+                            all_tool_call_masks[response_idx] = all_tool_call_masks[response_idx][:max_response_token_limit]
                             is_done[response_idx] = True
 
                     # check if we need to continue generating
@@ -596,9 +598,10 @@ class vLLMRollout(BaseRollout):
                         'attention_mask': attention_mask_out,
                         'position_ids': position_ids_out,
                         'tool_call_mask': tool_call_masks,
+                        'log_probs': log_probs,
                     },
                     batch_size=response.size(0))
-                    
+
                 if self.config.vllm_log_prob:
                     batch['old_log_probs'] = log_probs
                 
