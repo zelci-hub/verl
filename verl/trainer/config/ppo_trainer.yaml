@@ -92,7 +92,7 @@ actor_rollout_ref:
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
     n_val: 8
-    enable_tools: True # whether to enable tools or not during quering. Currently only async generation support tools.
+    enable_tools: False # whether to enable tools or not during quering. Currently only async generation support tools.
 
 critic:
   strategy: fsdp

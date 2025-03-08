@@ -36,6 +36,7 @@ from torch import nn
 import numpy as np
 from copy import deepcopy
 import os
+import copy
 os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds, effectively no timeout
 
 
@@ -360,8 +361,6 @@ class vLLMRollout(BaseRollout):
         tool_start_tokens = ["```python"]
         tool_response_start_tokens = ["<tool_response>"]
         tool_response_stop_tokens = ["</tool_response>"]
-        # tool_stop_tokens = prompts.meta_info['tool_stop_tokens']
-        # tool_start_tokens = prompts.meta_info['tool_start_tokens']
 
         assert self.config.async_engine, "generate_sequences_async requires async_engine=True"
         # rebuild vllm cache engine
@@ -373,10 +372,9 @@ class vLLMRollout(BaseRollout):
         position_ids = prompts.batch['position_ids']
         eos_token_id = prompts.meta_info['eos_token_id']
 
-
         batch_size = idx.size(0)
 
-        idx_list = []
+        idx_list = [] # list of list, represents all input tokens in the batch
         # parse idx from torch.Tensor to List[List[int]]
         for i in range(batch_size):
             idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
@@ -391,6 +389,7 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+
         is_validation = False
         if prompts.meta_info.get('val_temperature', None):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
@@ -398,31 +397,7 @@ class vLLMRollout(BaseRollout):
 
         self.update_sampling_params(**kwargs)
 
-        # # officially start the task processes
-        # def contains_tool_call_token(token_ids):
-        #     tool_start_token_ids = self.tokenizer.encode(tool_start_tokens[0], add_special_tokens=False)
-        #     tool_stop_token_ids = self.tokenizer.encode(tool_stop_tokens[0], add_special_tokens=False)
-        #     # TODO: make sure to use special tokens
-        #     assert len(tool_start_token_ids) == 1
-        #     assert len(tool_stop_token_ids) == 1
-
-        #     try:
-        #         # Find first occurrence of tool_start_token_ids
-        #         start_idx = token_ids.index(tool_start_token_ids[0])
-        #         # Ensure full sequence matches
-        #         if token_ids[start_idx:start_idx + len(tool_start_token_ids)] != tool_start_token_ids:
-        #             return False, -1, -1
-        #         # Find first occurrence of tool_end_token_ids after start_idx
-        #         end_idx = token_ids.index(tool_stop_token_ids[0], start_idx + len(tool_start_token_ids))
-        #         # Ensure full sequence matches
-        #         if token_ids[end_idx:end_idx + len(tool_stop_token_ids)] != tool_stop_token_ids:
-        #             return False, -1, -1
-        #         return True, start_idx+1, end_idx
-
-        #     except ValueError:
-        #         return False, -1, -1
-
-
+        # Helper function to call tools
         async def _apply_tool(tool_call, id=None):
             if id is not None:
                 tool_call["parameters"]["id"] = id
@@ -432,7 +407,7 @@ class vLLMRollout(BaseRollout):
         # Main function to process single prompt
         async def _process_single_prompt(prompt_idx: int, prompt_tokens: List[int]):
             """Process a single prompt with potential tool calls."""
-            # Generate tokens until "<tool_call>" or completion. Takes in 1 complete prompt copy at a time
+            # Generate tokens until "<tool_call>" or completion. Takes in 1 complete prompt at a time
             async def generate_wrapper(generation_tokens, request_id):
                 async for output in self.inference_engine.generate(
                     prompt=TokensPrompt(prompt_token_ids=generation_tokens),
@@ -447,28 +422,35 @@ class vLLMRollout(BaseRollout):
 
             kwargs["n"] = 1
             kwargs["detokenize"] = True
-            # Append the stop tokens with new sampling stop tokens
+            # Append the stop tokens with new tool stop tokens
             kwargs["stop"] = self.sampling_params.stop + tool_stop_tokens + kwargs.get("stop", [])
 
             # If need to generate repeated answers, we will manually replicate the prompt_tokens and treat each response independently
             all_prompt_tokens: List[List[int]] = [prompt_tokens] 
             all_log_probs: List[List[float]] = [[]]
             all_tool_call_masks: List[List[int]] = [[]]
+            is_done = [False]
             if self.config.n > 1 and do_sample:
-                all_prompt_tokens = all_prompt_tokens * self.config.n
-                all_log_probs = all_log_probs * self.config.n
-                all_tool_call_masks = all_tool_call_masks * self.config.n
+                all_prompt_tokens = copy.deepcopy(all_prompt_tokens * self.config.n)
+                all_log_probs = copy.deepcopy(all_log_probs * self.config.n)
+                all_tool_call_masks = copy.deepcopy(all_tool_call_masks * self.config.n)
+                is_done = copy.deepcopy(is_done * self.config.n)
 
             with self.update_sampling_params(**kwargs):
                 request_id = str(uuid.uuid4())
-                all_current_tokens = all_prompt_tokens.copy()
+                all_current_tokens = copy.deepcopy(all_prompt_tokens) # the list of prompts that will generate on. Will continue growing with new generation and tool call results 
 
                 while True:
-                    latest_tokens: List[List[int]] = []
-                    latest_logprobs: List[List[float]] = []
+                    latest_tokens: List[List[int]] = [] # tokens of outputs from latest generation
+                    latest_logprobs: List[List[float]] = [] # logprobs of outputs from latest generation
 
                     # make 1 step of all copies on the current prompt until it has finished or a tool call is needed
-                    for generation_tokens in all_current_tokens:
+                    for i, generation_tokens in enumerate(all_current_tokens):
+                        if is_done[i]:
+                            latest_token.append([])
+                            latest_logprobs.append([])
+                            continue
+
                         output = await generate_wrapper(generation_tokens, request_id)
                         latest_tokens.append(list(output.outputs[0].token_ids))
                         if hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs is not None:
@@ -480,15 +462,10 @@ class vLLMRollout(BaseRollout):
                         latest_logprobs.append(log_prob_list)
 
 
-                    has_tool_calls = []
                     for response_idx, (latest_token, latest_logprob) in enumerate(zip(latest_tokens, latest_logprobs)):
-
-                        # TODO: FIXME: Tianjun
-                        # latest_text = self.tokenizer.decode(latest_token).replace(self.tokenizer.eos_token, "")
-                        # if "```python" in latest_text and latest_text.endswith("```"):
-                        #     latest_text = latest_text.replace("```json", tool_start_tokens[0] + "```json") + tool_stop_tokens[0]
-                        # latest_token = self.tokenizer.encode(latest_text, add_special_tokens=False)
-                        # latest_tokens[response_idx] = latest_token
+                        # Skip if it has already completed
+                        if is_done[response_idx]:
+                            continue
 
                         latest_text = self.tokenizer.decode(latest_token)
                         tool_calls = self.tool_caller.parse_tool_calls(latest_text)
@@ -497,22 +474,12 @@ class vLLMRollout(BaseRollout):
                             tool_call = tool_calls[0]
                         else:
                             has_tool_call = False
-                        has_tool_calls.append(has_tool_call)
-                        
-                        # Check the latest tokens for tool_call
-                        # has_tool_call, tool_start_idx, tool_stop_idx = contains_tool_call_token(latest_token)
                 
                         if has_tool_call:
-                            # # Extract tokens up to the tool_call token
-                            # tool_tokens = latest_token[tool_start_idx:tool_stop_idx]
-
                             toolcall_result = await _apply_tool(tool_call) 
                             
                             # Extract log probs if available
                             all_log_probs[response_idx].extend(latest_logprob)
-                            
-                            # # Extract and decode the tool call code, to make sure we have no eos_token
-                            # tool_call_text = self.tokenizer.decode(tool_tokens)
                             
                             # Encode the result into acceptable format
                             toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
@@ -520,7 +487,6 @@ class vLLMRollout(BaseRollout):
                             result_tokens = self.tokenizer.encode(toolcall_result_with_special_token, add_special_tokens=False)
                             
                             # Update current tokens for next generation
-                            # TODO: FIXME: Tianjun
                             all_current_tokens[response_idx] = all_current_tokens[response_idx] + latest_token + result_tokens
                             all_log_probs[response_idx].extend([0.0] * (len(result_tokens)))
                             
@@ -528,38 +494,35 @@ class vLLMRollout(BaseRollout):
                             all_tool_call_masks[response_idx].extend([1] * (len(latest_token)))
                             all_tool_call_masks[response_idx].extend([0] * (len(result_tokens)))
 
-                            # import pdb; pdb.set_trace()
-                            print(toolcall_result)
+                            print(f"after toolcall_result: {latest_text + toolcall_result_with_special_token} \n\n\n")
                         else:
                             # Extract log probs if available
                             all_log_probs[response_idx].extend(latest_logprob)
 
                             # Update current tokens for next generation.
-                            # TODO: check why here need to add end of text? 
-                            all_current_tokens[response_idx] = all_current_tokens[response_idx] + latest_token + [eos_token_id]
+                            all_current_tokens[response_idx] = all_current_tokens[response_idx] + latest_token
+
                             # Update the mask to mask out toolcall result
-                            all_tool_call_masks[response_idx].extend([1] * (len(latest_token) + 1))
+                            all_tool_call_masks[response_idx].extend([1] * (len(latest_token)))
+
+                            # Since there was no tool call, this generation has terminated
+                            is_done[response_idx] = True
 
 
-                    overflow = True
+                    # check for overflow, and mark overflown copies as finished
                     for response_idx in range(len(all_current_tokens)):
                         if len(all_current_tokens[response_idx]) >= max_token_limit:
                             all_current_tokens[response_idx] = all_current_tokens[response_idx][:max_token_limit]
                             all_log_probs[response_idx] = all_log_probs[response_idx][:max_token_limit]
-                        else:
-                            overflow = False
-                    # Stop generation if all copies have overflown
-                    if overflow:
-                        break  
-                    
-                    # Check if we need to continue generating
-                    should_continue_generating = any(has_tool_calls)
-                    if not should_continue_generating:
+                            is_done[response_idx] = True
+
+                    # check if we need to continue generating
+                    if all(is_done):
                         break
             
                 outputs = [
-                    SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs, tool_call_mask=tool_call_mask) if len(probs) > 0 else SimpleNamespace(token_ids=tokens[len(prompt):])
-                    for tokens, probs, prompt, tool_call_mask in zip(all_current_tokens, all_log_probs, prompt_tokens, all_tool_call_masks)
+                    SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs, tool_call_mask=tool_call_mask)
+                    for tokens, probs, prompt, tool_call_mask in zip(all_current_tokens, all_log_probs, all_prompt_tokens, all_tool_call_masks)
                 ]
 
                 final_output = SimpleNamespace(outputs=outputs)
@@ -635,9 +598,9 @@ class vLLMRollout(BaseRollout):
                         'tool_call_mask': tool_call_masks,
                     },
                     batch_size=response.size(0))
+                    
                 if self.config.vllm_log_prob:
                     batch['old_log_probs'] = log_probs
-                
                 
                 if self.reward_fn is not None and not is_validation:
                     init_batch = DataProto(
