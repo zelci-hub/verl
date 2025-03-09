@@ -381,22 +381,10 @@ class vLLMRollout(BaseRollout):
             idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
         do_sample = prompts.meta_info.get('do_sample', True)
-        if not do_sample:
-            kwargs = {
-                'best_of': 1,
-                'top_p': 1.0,
-                'top_k': -1,
-                'min_p': 0.0,
-                'temperature': 0,
-                'n': 1  # if greedy, only 1 response
-            }
-
+        
         is_validation = False
         if prompts.meta_info.get('val_temperature', None):
-            kwargs['temperature'] = prompts.meta_info['val_temperature']
             is_validation = True
-
-        self.update_sampling_params(**kwargs)
 
         # Helper function to call tools
         async def _apply_tool(tool_call, id=None):
@@ -407,6 +395,7 @@ class vLLMRollout(BaseRollout):
 
         # Main function to process single prompt
         async def _process_single_prompt(prompt_idx: int, prompt_tokens: List[int]):
+            nonlocal kwargs
             """Process a single prompt with potential tool calls."""
             # Generate tokens until "<tool_call>" or completion. Takes in 1 complete prompt at a time
             async def generate_wrapper(generation_tokens, request_id):
@@ -420,6 +409,19 @@ class vLLMRollout(BaseRollout):
 
             max_token_limit = self.config.response_length + len(prompt_tokens)
             max_response_token_limit = self.config.response_length 
+
+            # Setup kwargs
+            if not do_sample:
+                kwargs = {
+                    'best_of': 1,
+                    'top_p': 1.0,
+                    'top_k': -1,
+                    'min_p': 0.0,
+                    'temperature': 0,
+                    'n': 1  # if greedy, only 1 response
+                }
+            if is_validation:
+                kwargs['temperature'] = prompts.meta_info['val_temperature']
 
             kwargs["n"] = 1
             kwargs["detokenize"] = True
