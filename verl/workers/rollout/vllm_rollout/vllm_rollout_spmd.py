@@ -153,6 +153,7 @@ class vLLMRollout(BaseRollout):
                     disable_log_stats=config.disable_log_stats,
                     max_num_batched_tokens=max_num_batched_tokens,
                     enable_chunked_prefill=config.enable_chunked_prefill,
+                    enable_prefix_caching=True
                 )
             )
         else:     
@@ -417,7 +418,6 @@ class vLLMRollout(BaseRollout):
                     latest_output = output
                 return latest_output
 
-
             max_token_limit = self.config.response_length + len(prompt_tokens)
             max_response_token_limit = self.config.response_length 
 
@@ -431,11 +431,12 @@ class vLLMRollout(BaseRollout):
             all_log_probs: List[List[float]] = [[]]
             all_tool_call_masks: List[List[int]] = [[]]
             is_done = [False]
-            if self.config.n > 1 and do_sample:
-                all_prompt_tokens = copy.deepcopy(all_prompt_tokens * self.config.n)
-                all_log_probs = [[] for _ in range(self.config.n)]
-                all_tool_call_masks = [[] for _ in range(self.config.n)]
-                is_done = is_done * self.config.n
+           
+            # if self.config.n > 1 and do_sample:
+            all_prompt_tokens = copy.deepcopy(all_prompt_tokens * self.config.n)
+            all_log_probs = [[] for _ in range(self.config.n)]
+            all_tool_call_masks = [[] for _ in range(self.config.n)]
+            is_done = is_done * self.config.n
 
             with self.update_sampling_params(**kwargs):
                 request_id = str(uuid.uuid4())
@@ -476,11 +477,12 @@ class vLLMRollout(BaseRollout):
                         has_tool_call = False
                         if len(tool_calls) > 0:
                             has_tool_call = True
-                            tool_call = tool_calls[0]
-                            
+                            tool_call = tool_calls[0]                            
                 
                         if has_tool_call:
-                            toolcall_result = await _apply_tool(tool_call) 
+                            toolcall_result = await _apply_tool(tool_call)
+
+                            print("toolcall result", toolcall_result) 
                             
                             # Extract log probs if available
                             all_log_probs[response_idx].extend(latest_logprob)
@@ -569,7 +571,7 @@ class vLLMRollout(BaseRollout):
                     single_val = val[prompt_idx:prompt_idx+1]
                     non_tensor_batch[key] = single_val
                 # Handle multiple samples per prompt when n > 1 and sampling
-                if self.config.n > 1 and do_sample:
+                if self.config.n > 1:
                     single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
                     single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
                     single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)

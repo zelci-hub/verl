@@ -629,7 +629,7 @@ class RayPPOTrainer(object):
                 return {}
 
             n_val_samples = self.config.actor_rollout_ref.rollout.n_val
-            test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
+            # test_batch = test_batch.repeat(repeat_times=n_val_samples, interleave=True)
             # Store original inputs
             input_ids = test_batch.batch['input_ids']
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
@@ -649,10 +649,30 @@ class RayPPOTrainer(object):
             else:
                 test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.rollout_wg.world_size)
             test_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
+
             if self.hybrid_engine:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_batch_padded)
+                if self.config.actor_rollout_ref.rollout.async_engine:
+                    gen_seq_generator = self.actor_rollout_wg.generate_sequences_async(prompts=test_batch_padded)
+                    outputs = []
+                    for item in gen_seq_generator:
+                        if item is None:
+                            break
+                        outputs.append(item)
+                    test_output_gen_batch_padded = DataProto.concat(outputs)
+                else:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_batch_padded)
             else:
-                test_output_gen_batch_padded = self.rollout_wg.generate_sequences(test_batch_padded)
+                if self.config.actor_rollout_ref.rollout.async_engine:
+                    gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=test_batch_padded)
+                    outputs = []
+                    for item in gen_seq_generator:
+                        if item is None:
+                            break
+                        outputs.append(item)
+                    test_output_gen_batch_padded = DataProto.concat(outputs)
+                else:
+                    test_output_gen_batch_padded = self.rollout_wg.generate_sequences(test_batch_padded)
+
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')
