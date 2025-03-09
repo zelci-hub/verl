@@ -394,6 +394,7 @@ class vLLMRollout(BaseRollout):
 
         # Main function to process single prompt
         async def _process_single_prompt(prompt_idx: int, prompt_tokens: List[int]):
+            nonlocal kwargs
             """Process a single prompt with potential tool calls."""
             # Generate tokens until "<tool_call>" or completion. Takes in 1 complete prompt at a time
             async def generate_wrapper(generation_tokens, request_id):
@@ -404,7 +405,6 @@ class vLLMRollout(BaseRollout):
                 ):
                     latest_output = output
                 return latest_output
-
 
             max_token_limit = self.config.response_length + len(prompt_tokens)
             max_response_token_limit = self.config.response_length 
