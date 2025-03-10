@@ -55,15 +55,7 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
         remaining_pad = pad_size
         while remaining_pad > 0:
             take_size = min(remaining_pad, len(data))
-            # Create padding proto with None values for non-tensor batch
-            padding_proto = copy.deepcopy(data[:take_size])
-            if padding_proto.non_tensor_batch is not None:
-                for key in padding_proto.non_tensor_batch:
-                    if isinstance(padding_proto.non_tensor_batch[key], np.ndarray):
-                        # Create array of None values with same shape except first dimension
-                        none_array = np.array([None] * take_size, dtype=object)
-                        padding_proto.non_tensor_batch[key] = none_array
-            padding_protos.append(padding_proto)
+            padding_protos.append(data[:take_size])
             remaining_pad -= take_size
         data_padded = DataProto.concat([data] + padding_protos)
     else:
@@ -74,21 +66,7 @@ def pad_dataproto_to_divisor(data: 'DataProto', size_divisor: int):
 
 def unpad_dataproto(data: 'DataProto', pad_size):
     if pad_size != 0:
-        # Remove padding where non_tensor_batch values are None
-        if data.non_tensor_batch is not None:
-            valid_indices = []
-            for i in range(len(data)):
-                is_valid = True
-                for key in data.non_tensor_batch:
-                    if isinstance(data.non_tensor_batch[key], np.ndarray):
-                        if data.non_tensor_batch[key][i] is None:
-                            is_valid = False
-                            break
-                if is_valid:
-                    valid_indices.append(i)
-            data = data[valid_indices]
-        else:
-            data = data[:-pad_size]
+        data = data[:-pad_size]
     return data
 
 
@@ -106,7 +84,7 @@ def union_tensor_dict(tensor_dict1: TensorDict, tensor_dict2: TensorDict) -> Ten
     return tensor_dict1
 
 
-def union_numpy_dict(tensor_dict1: dict[np.ndarray], tensor_dict2: dict[np.ndarray]) -> dict[np.ndarray]:
+def union_numpy_dict(tensor_dict1: dict[str, np.ndarray], tensor_dict2: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     for key, val in tensor_dict2.items():
         if key in tensor_dict1:
             assert isinstance(tensor_dict2[key], np.ndarray)
@@ -470,19 +448,17 @@ class DataProto:
         return self
 
     def make_iterator(self, mini_batch_size, epochs, seed=None, dataloader_kwargs=None):
-        """Make an iterator from the DataProto. This is built upon that TensorDict can be used as a normal Pytorch
+        r"""Make an iterator from the DataProto. This is built upon that TensorDict can be used as a normal Pytorch
         dataset. See https://pytorch.org/tensordict/tutorials/data_fashion for more details.
 
+
         Args:
-            mini_batch_size (int): mini-batch size when iterating the dataset. We require that
-                ``batch.batch_size[0] % mini_batch_size == 0``
+            mini_batch_size (int): mini-batch size when iterating the dataset. We require that ``batch.batch_size[0] % mini_batch_size == 0``.
             epochs (int): number of epochs when iterating the dataset.
-            dataloader_kwargs: internally, it returns a DataLoader over the batch.
-                The dataloader_kwargs is the kwargs passed to the DataLoader
+            dataloader_kwargs (Any): internally, it returns a DataLoader over the batch. The dataloader_kwargs is the kwargs passed to the DataLoader.
 
         Returns:
-            Iterator: an iterator that yields a mini-batch data at a time. The total number of iteration steps is
-            ``self.batch.batch_size * epochs // mini_batch_size``
+            Iterator: an iterator that yields a mini-batch data at a time. The total number of iteration steps is ``self.batch.batch_size * epochs // mini_batch_size``
         """
         assert self.batch.batch_size[0] % mini_batch_size == 0, f"{self.batch.batch_size[0]} % {mini_batch_size} != 0"
         # we can directly create a dataloader from TensorDict
@@ -660,13 +636,6 @@ class DataProtoFuture:
             arg_future_lst.append(arg_future)
         return arg_future_lst
 
-    def wait(self):
-        ready_refs, remaining_refs = ray.wait(self.futures, timeout=0)  # dp_size.
-        if len(ready_refs) == len(self.futures):
-            return True
-        else:
-            return False
-
     def get(self):
         output = ray.get(self.futures)  # dp_size.
         for o in output:
@@ -675,3 +644,21 @@ class DataProtoFuture:
         if self.dispatch_fn is not None:
             output = self.dispatch_fn(output)  # split in batch dim, select using dp
         return output
+
+
+from verl.utils.torch_functional import allgather_dict_tensors
+import torch.distributed
+
+
+def all_gather_data_proto(data: DataProto, process_group):
+    # Note that this is an inplace operator just like torch.distributed.all_gather
+    group_size = torch.distributed.get_world_size(group=process_group)
+    assert isinstance(data, DataProto)
+    prev_device = data.batch.device
+    data.batch = data.batch.cuda(device=torch.cuda.current_device())
+    data.batch = allgather_dict_tensors(data.batch.contiguous(), size=group_size, group=process_group, dim=0)
+    data.batch = data.batch.to(prev_device)
+    # all gather non_tensor_batch
+    all_non_tensor_batch = [None for _ in range(group_size)]
+    torch.distributed.all_gather_object(all_non_tensor_batch, data.non_tensor_batch, group=process_group)
+    data.non_tensor_batch = {k: np.concatenate([d[k] for d in all_non_tensor_batch]) for k in data.non_tensor_batch}
