@@ -752,6 +752,11 @@ class ActorRolloutRefWorker(Worker):
         Args:
             new_actor_module_fsdp: The new FSDP-wrapped actor module (possibly on a different GPU).
         """
+        # Temp bandaid to kill zombie processes from coding.
+        try:
+            os.system('pkill -f "python3 /var/tmp/"')
+        except Exception as e:
+            pass
         new_state_dict = ray.get(new_state_dict_ref)
         # Ensure we are in a rollout role.
         if self.role not in ['rollout', 'actor_rollout', 'actor_rollout_ref']:
