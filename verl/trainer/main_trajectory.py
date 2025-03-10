@@ -60,12 +60,9 @@ def init_env(config):
             os.environ["MINIWOB_URL"] = config.env.miniwob_url
 
             dataset = pd.read_parquet(config.data.path)
-            env_ids = [d["environment_id"] for d in dataset["extra_info"].tolist()]
-            env_ids = [x for x in env_ids for _ in range(config.data.n_samples)]
-            return BatchBrowserGym(
-                env_id=env_ids,
-                batch_size=len(env_ids),
-            )
+            extra_infos = dataset["extra_info"].tolist()
+            extra_infos = [x for x in extra_infos for _ in range(config.data.n_samples)]
+            return BatchBrowserGym.from_extra_infos(extra_infos)
 
     raise ValueError(f"Environment {config.env.name} not supported")
 

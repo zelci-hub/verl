@@ -397,7 +397,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         with _timer("collect_trajectory", timing_raw):
             # Interact_environment returns list of trajectories.
             trajectories = self.agent.interact_environment(
-                timing_raw=timing_raw, return_tokens=True, meta_info=meta_info
+                timing_raw=timing_raw, mode="Token", meta_info=meta_info
             )
 
         with _timer("transform_trajectory", timing_raw):
