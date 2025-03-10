@@ -23,7 +23,7 @@ rollout:
   temperature: 0.6
   top_k: -1 # 0 for hf rollout, -1 for vllm rollout
   top_p: 0.95
-  prompt_length: 1024
+  prompt_length: 2048
   response_length: 32768
   # for vllm rollout
   dtype: bfloat16 # should align with FSDP

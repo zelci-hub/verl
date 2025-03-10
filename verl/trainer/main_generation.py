@@ -91,7 +91,15 @@ def run_generation(config):
         assert config.rollout.n_val == 1, 'When temperature=0, n_val must be 1.'
 
     # Load Dataset
-    dataset = pd.read_parquet(config.data.path)
+    try:
+        dataset = pd.read_parquet(config.data.path)
+    except Exception as e:
+        config.data.path = config.data.path.replace('.parquet', '.json')
+        print(f"Error loading dataset: {e}")
+        dataset = pd.read_json(config.data.path)
+        
+        
+
     val_dataset = RLHFDataset(parquet_files=config.data.path,
         tokenizer=tokenizer,
         prompt_key=config.data.prompt_key,
@@ -142,12 +150,12 @@ def run_generation(config):
     
     output_lst =  tokenizer.batch_decode(test_batch.batch['input_ids'][:, -config.rollout.response_length:], skip_special_tokens=False)
     output_lst = np.array(output_lst).reshape(len(output_lst)//n_val, n_val).tolist()
-    # dataset['responses'] = output_lst
-    # dataset['scores'] = scores
+    dataset['responses'] = output_lst
+    dataset['scores'] = scores
     # # Write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)
-    # makedirs(output_dir, exist_ok=True)
-    # dataset.to_parquet(config.data.output_path)
+    makedirs(output_dir, exist_ok=True)
+    dataset.to_parquet(config.data.output_path)
     
     # Max across first dim average correct
     scores = np.array(scores)
