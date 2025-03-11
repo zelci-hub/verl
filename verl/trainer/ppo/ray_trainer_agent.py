@@ -426,8 +426,12 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         traj_scores = []
         environment_scores = []
         for traj in trajectories:
-            all_initial_tokens_list.append(traj["prompt_tokens"])
-            all_response_tokens_list.append(traj["response_tokens"])
+            prompt_tokens = traj["prompt_tokens"]
+            response_tokens = traj["response_tokens"]
+            # test if trajectory is empty
+            assert prompt_tokens.numel() != 0 and response_tokens.numel() != 0, f"Both prompt {prompt_tokens.numel()} and response {response_tokens.numel()} of trajectory shouldn't be empty. Please check make sure environment is working and the config: episode_length, max_trajectory_length, etc"
+            all_initial_tokens_list.append(prompt_tokens)
+            all_response_tokens_list.append(response_tokens)
             all_masks_list.append(traj["response_masks"])
             traj_scores.append(traj["training_reward"])
             environment_scores.append(traj["environment_reward"])
