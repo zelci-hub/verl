@@ -145,12 +145,19 @@ def run_generation(config):
     # Runs reward calculation on parallel threads.
     reward_tensor = val_reward_fn(test_batch)
     
-    scores = reward_tensor.sum(-1).cpu().tolist()
-    scores = np.array(scores).reshape(len(scores)//n_val, n_val).tolist()
     
     output_lst =  tokenizer.batch_decode(test_batch.batch['input_ids'][:, -config.rollout.response_length:], skip_special_tokens=False)
     output_lst = np.array(output_lst).reshape(len(output_lst)//n_val, n_val).tolist()
     dataset['responses'] = output_lst
+ 
+    # Save the responses to a new parquet before hand.
+    output_dir = os.path.dirname(config.data.output_path)
+    makedirs(output_dir, exist_ok=True)
+    dataset.to_parquet(config.data.output_path)   
+    
+    
+    scores = reward_tensor.sum(-1).cpu().tolist()
+    scores = np.array(scores).reshape(len(scores)//n_val, n_val).tolist()
     dataset['scores'] = scores
     # # Write to a new parquet
     output_dir = os.path.dirname(config.data.output_path)
