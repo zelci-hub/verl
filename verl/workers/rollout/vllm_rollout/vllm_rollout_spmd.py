@@ -441,9 +441,9 @@ class vLLMRollout(BaseRollout):
             all_log_probs = [[] for _ in range(self.config.n)]
             all_tool_call_masks = [[] for _ in range(self.config.n)]
             is_done = is_done * self.config.n
+            request_id = [str(uuid.uuid4()) for _ in range(self.config.n)]
 
             with self.update_sampling_params(**kwargs):
-                request_id = str(uuid.uuid4())
                 all_current_tokens = copy.deepcopy(all_prompt_tokens) # the list of prompts that will generate on. Will continue growing with new generation and tool call results 
 
                 while True:
@@ -457,7 +457,7 @@ class vLLMRollout(BaseRollout):
                             continue
                         generation_tokens = all_current_tokens[i]
 
-                        output = await generate_wrapper(generation_tokens, request_id)
+                        output = await generate_wrapper(generation_tokens, request_id[i])
                         latest_tokens.append(list(output.outputs[0].token_ids))
                         if hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs is not None:
                             log_prob_list = []
