@@ -390,8 +390,10 @@ class vLLMRollout(BaseRollout):
         async def _apply_tool(tool_call, id=None):
             if id is not None:
                 tool_call["parameters"]["id"] = id
-            tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
-            return tool_call_result
+            # tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
+            from rllm.rewards.code_utils.livecodebench import run_code
+            tool_call_result = run_code(tool_call["parameters"]["code"])
+            return {"content": tool_call_result}
 
         # Main function to process single prompt
         async def _process_single_prompt(prompt_idx: int, prompt_tokens: List[int]):
@@ -484,7 +486,7 @@ class vLLMRollout(BaseRollout):
                         if has_tool_call:
                             toolcall_result = await _apply_tool(tool_call)
 
-                            print("toolcall result", toolcall_result) 
+                            # print("toolcall result", toolcall_result) 
                             
                             # Extract log probs if available
                             all_log_probs[response_idx].extend(latest_logprob)
