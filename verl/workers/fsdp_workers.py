@@ -566,6 +566,16 @@ class ActorRolloutRefWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
+
+        try:
+            os.system('pkill -f "python3 /var/tmp/"')
+        except Exception as e:
+            pass
+
+        try:
+            os.system('pkill -f "python3 /tmp/"')
+        except Exception as e:
+            pass
         prompts = prompts.to('cuda')
 
         assert self._is_rollout

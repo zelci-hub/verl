@@ -113,7 +113,7 @@ class RLHFDataset(Dataset):
                 except Exception as json_e:
                     print(f"Also failed to read JSON file {json_file}: {str(json_e)}")
                     raise e
-        dataframes.append(dataframe)
+            dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
 
         print(f'original dataset len: {len(self.dataframe)}')
