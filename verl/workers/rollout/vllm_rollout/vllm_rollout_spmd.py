@@ -378,7 +378,7 @@ class vLLMRollout(BaseRollout):
         idx_list = [] # list of list, represents all input tokens in the batch
         # parse idx from torch.Tensor to List[List[int]]
         for i in range(batch_size):
-            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+            idx_list.extend([_pre_process_inputs(self.pad_token_id, idx[i]) for _ in range(self.config.n)])
 
         do_sample = prompts.meta_info.get('do_sample', True)
         
@@ -387,7 +387,7 @@ class vLLMRollout(BaseRollout):
             is_validation = True
 
         # Helper function to call tools
-        async def _apply_tool(tool_call, id=None):
+        def _apply_tool(tool_call, id=None):
             if id is not None:
                 tool_call["parameters"]["id"] = id
             # tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
@@ -395,20 +395,21 @@ class vLLMRollout(BaseRollout):
             tool_call_result = run_code(tool_call["parameters"]["code"])
             return {"content": tool_call_result}
 
+        async def generate_wrapper(generation_tokens):
+            task = self.inference_engine.generate(
+                prompt=TokensPrompt(prompt_token_ids=generation_tokens),
+                sampling_params=self.sampling_params,
+                request_id=str(uuid.uuid4()),
+            )
+            async for output in task:
+                latest_output = output
+            return latest_output
+
         # Main function to process single prompt
         async def _process_single_prompt(prompt_idx: int, prompt_tokens: List[int]):
             nonlocal kwargs
             """Process a single prompt with potential tool calls."""
             # Generate tokens until "<tool_call>" or completion. Takes in 1 complete prompt at a time
-            async def generate_wrapper(generation_tokens, request_id):
-                async for output in self.inference_engine.generate(
-                    prompt=TokensPrompt(prompt_token_ids=generation_tokens),
-                    sampling_params=self.sampling_params,
-                    request_id=request_id,
-                ):
-                    latest_output = output
-                return latest_output
-
             max_token_limit = self.config.response_length + len(prompt_tokens)
             max_response_token_limit = self.config.response_length 
 
@@ -426,9 +427,10 @@ class vLLMRollout(BaseRollout):
                 kwargs['temperature'] = prompts.meta_info['val_temperature']
 
             kwargs["n"] = 1
-            kwargs["detokenize"] = True
+            # kwargs["detokenize"] = True
             # Append the stop tokens with new tool stop tokens
-            kwargs["stop"] = self.sampling_params.stop + tool_stop_tokens + kwargs.get("stop", [])
+            # kwargs["stop"] = self.sampling_params.stop + tool_stop_tokens + kwargs.get("stop", [])
+            kwargs["stop_token_ids"] = self.sampling_params.stop_token_ids + [151646] + kwargs.get("stop_token_ids", [])
 
             # If need to generate repeated answers, we will manually replicate the prompt_tokens and treat each response independently
             all_prompt_tokens: List[List[int]] = [prompt_tokens] 
@@ -437,35 +439,42 @@ class vLLMRollout(BaseRollout):
             is_done = [False]
            
             # if self.config.n > 1 and do_sample:
+            '''
             all_prompt_tokens = copy.deepcopy(all_prompt_tokens * self.config.n)
             all_log_probs = [[] for _ in range(self.config.n)]
             all_tool_call_masks = [[] for _ in range(self.config.n)]
             is_done = is_done * self.config.n
             request_id = [str(uuid.uuid4()) for _ in range(self.config.n)]
+            '''
 
             with self.update_sampling_params(**kwargs):
                 all_current_tokens = copy.deepcopy(all_prompt_tokens) # the list of prompts that will generate on. Will continue growing with new generation and tool call results 
+                
+                # final_output = await generate_wrapper(all_current_tokens[0])
 
+                num_tools = 0
                 while True:
                     latest_tokens: List[List[int]] = [] # tokens of outputs from latest generation
                     latest_logprobs: List[List[float]] = [] # logprobs of outputs from latest generation
 
                     # make 1 step of all copies on the current prompt until it has finished or a tool call is needed
+                    not_done_ids = [i for i, d in enumerate(is_done) if not d]
+
+                    gathered_outputs = await asyncio.gather(*[generate_wrapper(generation_tokens) for gen_idx, generation_tokens in enumerate(all_current_tokens) if not is_done[gen_idx]])
+                    gen_idx = 0
                     for i, d in enumerate(is_done):
                         # already finished
                         if d:
                             continue
-                        generation_tokens = all_current_tokens[i]
-
-                        output = await generate_wrapper(generation_tokens, request_id[i])
-                        latest_tokens.append(list(output.outputs[0].token_ids))
-                        if hasattr(output.outputs[0], 'logprobs') and output.outputs[0].logprobs is not None:
+                        latest_tokens.append(list(gathered_outputs[gen_idx].outputs[0].token_ids))
+                        if hasattr(gathered_outputs[gen_idx].outputs[0], 'logprobs') and gathered_outputs[gen_idx].outputs[0].logprobs is not None:
                             log_prob_list = []
-                            for log_prob in output.outputs[0].logprobs:
+                            for log_prob in gathered_outputs[gen_idx].outputs[0].logprobs:
                                 log_prob_list.append(next(iter(log_prob.values())).logprob)
                         else:
-                            log_prob_list = [0.0] * len(output.outputs[0].token_ids)
+                            log_prob_list = [0.0] * len(gathered_outputs[gen_idx].outputs[0].token_ids)
                         latest_logprobs.append(log_prob_list)
+                        gen_idx += 1
 
                     latest_result_idx = 0
                     for response_idx, d in enumerate(is_done):
@@ -484,7 +493,7 @@ class vLLMRollout(BaseRollout):
                             tool_call = tool_calls[0]                            
                 
                         if has_tool_call:
-                            toolcall_result = await _apply_tool(tool_call)
+                            toolcall_result = _apply_tool(tool_call)
 
                             # print("toolcall result", toolcall_result) 
                             
@@ -527,6 +536,9 @@ class vLLMRollout(BaseRollout):
                     # check if we need to continue generating
                     if all(is_done):
                         break
+
+                    num_tools += 1
+                    print(num_tools, is_done)
             
                 outputs = [
                     SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs, tool_call_mask=tool_call_mask)
@@ -537,17 +549,40 @@ class vLLMRollout(BaseRollout):
 
                 return prompt_idx, final_output
 
+        '''
+        async def generate_wrapper(prompt_idx, generation_tokens):
+            task = self.inference_engine.generate(
+                prompt=TokensPrompt(prompt_token_ids=generation_tokens),
+                sampling_params=self.sampling_params,
+                request_id=str(uuid.uuid4()),
+            )
+            async for output in task:
+                latest_output = output
+            return prompt_idx, latest_output
+        '''
+
+
         async def _async_generate():
             # Create all tasks
             tasks = [
                 _process_single_prompt(prompt_idx, prompt_tokens)
                 for prompt_idx, prompt_tokens in enumerate(idx_list)
             ]
-            
+
+            finished_dict = {}
             # Use as_completed to yield results as they finish
             for completed_task in asyncio.as_completed(tasks):
                 prompt_idx, output = await completed_task
-                
+                if int(prompt_idx//self.config.n) in finished_dict:
+                    finished_dict[int(prompt_idx//self.config.n)].append(output)
+                else:
+                    finished_dict[int(prompt_idx//self.config.n)] = [output]
+
+                if len(finished_dict[int(prompt_idx//self.config.n)]) != self.config.n:
+                    continue
+
+                assert len(finished_dict[int(prompt_idx//self.config.n)]) == self.config.n
+                output.outputs = [finished_output.outputs[0] for finished_output in finished_dict[int(prompt_idx//self.config.n)]]
                 # Process output
                 response = []
                 log_probs = []
@@ -555,6 +590,7 @@ class vLLMRollout(BaseRollout):
                
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
+                    # log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
                     log_probs.append(output.outputs[sample_id].logprobs)
                     tool_call_masks.append(output.outputs[sample_id].tool_call_mask)
 
