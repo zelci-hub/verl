@@ -582,7 +582,7 @@ class vLLMRollout(BaseRollout):
             max_response_token_limit = self.config.response_length 
        
             # Treat each generation indpendently by creating self.config.n independent generations.
-            updated_sampling_params.stop = ["```\n\n"]
+            updated_sampling_params.stop = tool_stop_tokens
             updated_sampling_params.include_stop_str_in_output = True
             updated_sampling_params.n = 1
             updated_sampling_params.detokenize = True
@@ -592,7 +592,8 @@ class vLLMRollout(BaseRollout):
             all_tokens = copy.deepcopy(all_prompt_tokens)    
             all_log_probs: List[List[float]] = [[] for _ in range(self.config.n)]
             all_tool_call_masks: List[List[int]] = [[] for _ in range(self.config.n)]
-            all_dones = [False for _ in range(self.config.n)]    
+            all_dones = [False for _ in range(self.config.n)]
+            all_tool_calls = [0 for _ in range(self.config.n)]  
 
             while True:
                 gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, generation_tokens, updated_sampling_params) for idx, generation_tokens in enumerate(all_tokens) if not all_dones[idx]])
@@ -612,6 +613,8 @@ class vLLMRollout(BaseRollout):
                     if len(tool_calls) > 0:
                         tool_call = tool_calls[-1]
                         toolcall_result = _apply_tool(tool_call)
+                        if not isinstance(toolcall_result['content'], str):
+                            toolcall_result['content'] = str(toolcall_result['content'])
                         toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
                         result_tokens = self.tokenizer.encode(toolcall_result_with_special_token, add_special_tokens=False)
                         
@@ -621,6 +624,7 @@ class vLLMRollout(BaseRollout):
                         all_log_probs[gen_idx].extend([0.0] * (len(result_tokens)))
                         all_tool_call_masks[gen_idx].extend([1] * (len(cur_token_ids)))
                         all_tool_call_masks[gen_idx].extend([0] * (len(result_tokens)))
+                        all_tool_calls[gen_idx] += 1
                     else:
                         # Update running statistics.
                         all_tokens[gen_idx].extend(cur_token_ids)
@@ -635,7 +639,8 @@ class vLLMRollout(BaseRollout):
                         all_log_probs[gen_idx] = all_log_probs[gen_idx][:max_response_token_limit]
                         all_tool_call_masks[gen_idx] = all_tool_call_masks[gen_idx][:max_response_token_limit]
                         all_dones[gen_idx] = True
-
+                    elif all_tool_calls[gen_idx] >= self.config.max_tool_calls:
+                        all_dones[gen_idx] = True
                 # Break out of the loop if all generations have terminated.
                 if all(all_dones):
                     break
