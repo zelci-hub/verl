@@ -523,7 +523,6 @@ class vLLMRollout(BaseRollout):
         Yields:
             tuple: (prompt_idx, DataProto) containing the original prompt index and its generated sequence
         """
-        assert not self.config.vllm_log_prob, "generate_sequences_async_tool does not support `vllm_log_prob=True`"
         assert self.config.async_engine, "generate_sequences_async_tool requires `async_engine=True`"
 
         tool_stop_tokens = ["```\n\n"]
