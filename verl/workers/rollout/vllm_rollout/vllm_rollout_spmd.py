@@ -24,35 +24,39 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
-import asyncio
-from typing import List
+import copy
+import os
 from contextlib import contextmanager
-from omegaconf import DictConfig
-import uuid
+from copy import deepcopy
+from types import SimpleNamespace
+from typing import AsyncGenerator, Generator, List, Tuple, TypeVar, Union
+import asyncio
+import numpy as np
 import torch
 import torch.distributed
+import uuid
+from omegaconf import DictConfig
 from tensordict import TensorDict
-from torch import nn
-import numpy as np
-from copy import deepcopy
-import os
-os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds, effectively no timeout
 
-
+from rllm.environments.tools import PythonInterpreter, ToolCaller
 from verl import DataProto
+from verl.third_party.vllm import vllm_version
 from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
-from vllm.distributed import parallel_state as vllm_ps
+from verl.workers.rollout.vllm_rollout.utils import run_async_generator
+
 from vllm import AsyncLLMEngine, LLM, SamplingParams, TokensPrompt
+from vllm.distributed import parallel_state as vllm_ps
 from vllm.engine.arg_utils import AsyncEngineArgs
-from verl.third_party.vllm import vllm_version
+from vllm.outputs import RequestOutput
+
+# Set very long timeout to effectively disable it
+os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds
 
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
 # 3. simplify init logics
-
-
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
 def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
     # remove the left padding in the prompt token_id
@@ -61,8 +65,8 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
-# Monkey patch for AsyncLLMEngine
-import time
+
+# Monkey patch for AsyncLLMEngine to support sleep and wakeup operations.
 def sleep(self, level: int = 1):
         """
         Put the engine to sleep. The engine should not process any requests.
@@ -92,7 +96,6 @@ def wake_up(self):
 
 AsyncLLMEngine.sleep = sleep
 AsyncLLMEngine.wake_up = wake_up
-
 
 
 class vLLMRollout(BaseRollout):
@@ -149,6 +152,7 @@ class vLLMRollout(BaseRollout):
                     disable_log_stats=config.disable_log_stats,
                     max_num_batched_tokens=max_num_batched_tokens,
                     enable_chunked_prefill=config.enable_chunked_prefill,
+                    enable_prefix_caching=True
                 )
             )
         else:     
@@ -189,6 +193,35 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+        self.tokenizer = tokenizer
+        self.interpreter = PythonInterpreter(n_sandboxes=16)
+        self.tool_caller = ToolCaller(tools=[self.interpreter], parser_type="python")
+
+    async def generate_sequence_task(self, idx: int, prompt_tokens: List[int], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
+        """Generate a sequence asynchronously using vLLM.
+        
+        This method creates an asynchronous task for generating text from the given prompt tokens.
+        It streams the outputs and returns the final result along with the original prompt index.
+        
+        Args:
+            idx: The index of the prompt in the original batch
+            prompt_tokens: List of token IDs representing the input prompt
+            sampling_params: Optional custom sampling parameters, defaults to self.sampling_params
+            
+        Returns:
+            tuple: (idx, last_output) where idx is the original prompt index and 
+                  last_output contains the generated sequence and related information
+        """
+        if sampling_params is None:
+            sampling_params = self.sampling_params
+        task = self.inference_engine.generate(
+                    prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
+                    sampling_params=sampling_params,
+                    request_id=str(uuid.uuid4()),
+        )
+        async for output in task:
+            last_output = output
+        return idx, last_output
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -208,7 +241,13 @@ class vLLMRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        # rebuild vllm cache engine
+        # Handle async engine case
+        if self.config.async_engine:
+            outputs = []
+            for output in self.generate_sequences_async(prompts):
+                outputs.append(output)
+            return DataProto.concat(outputs)
+        # Rebuild vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
 
@@ -245,17 +284,11 @@ class vLLMRollout(BaseRollout):
         
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            if self.config.async_engine:
-                outputs = []
-                for output in self.generate_sequences_async(prompts):
-                    outputs.append(output)
-                return DataProto.concat(outputs)
-            else:
-                outputs = self.inference_engine.generate(
-                    prompts=None,  # because we have already convert it to prompt token id
-                    sampling_params=self.sampling_params,
-                    prompt_token_ids=idx_list,
-                    use_tqdm=False)
+            outputs = self.inference_engine.generate(
+                prompts=None,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
+                prompt_token_ids=idx_list,
+                use_tqdm=False)
         
         # Extract token IDs and log probabilities
         response = []
@@ -382,30 +415,15 @@ class vLLMRollout(BaseRollout):
         updated_sampling_params = deepcopy(self.sampling_params)
         for key, value in kwargs.items():
             if hasattr(updated_sampling_params, key):
-                updated_sampling_params[key] = value
-
-        async def _create_task(prompt_idx, task):
-            """Process a single generation task and return its result with original index"""
-            async for output in task:
-                last_output = output
-            return prompt_idx, last_output
+                setattr(updated_sampling_params, key, value)
 
         async def _async_generate():
             # Create all tasks
             tasks = [
-                _create_task(
-                    prompt_idx,
-                    self.inference_engine.generate(
-                        prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
-                        sampling_params=updated_sampling_params,
-                        request_id=str(uuid.uuid4()),
-                    )
-                ) for prompt_idx, prompt_tokens in enumerate(idx_list)
+                self.generate_sequence_task(prompt_idx, prompt_tokens, updated_sampling_params) for prompt_idx, prompt_tokens in enumerate(idx_list)
             ]
-            
-            # Use as_completed to yield results as they finish
             for completed_task in asyncio.as_completed(tasks):
-                prompt_idx, output = await completed_task
+                prompt_idx, output  = await completed_task
                 
                 # Process output
                 response = []
@@ -485,35 +503,244 @@ class vLLMRollout(BaseRollout):
                 )
 
         # Create new event loop for this generator
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        for generated_seq in run_async_generator(_async_generate):
+            yield generated_seq
+
+        # free vllm cache engine
+        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+            self.inference_engine.free_cache_engine()
+        return None
+
+
+    @torch.no_grad()
+    def generate_sequences_async_tool(self, prompts: DataProto, **kwargs):
+        """Generator function that yields outputs as they complete (may be out of order).
         
-        try:
-            # Create async generator
-            async_gen = _async_generate()
-            
+        Args:
+            prompts: DataProto containing the input prompts
+            **kwargs: Additional arguments to modify sampling parameters
+        
+        Yields:
+            tuple: (prompt_idx, DataProto) containing the original prompt index and its generated sequence
+        """
+        assert self.config.async_engine, "generate_sequences_async_tool requires `async_engine=True`"
+
+        tool_stop_tokens = ["```\n\n"]
+        tool_start_tokens = ["```python"]
+
+        tool_response_start_tokens = ["<tool_response>"]
+        tool_response_stop_tokens = ["</tool_response>"]
+        # rebuild vllm cache engine
+        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+            self.inference_engine.init_cache_engine()
+
+        idx = prompts.batch['input_ids']
+        attention_mask = prompts.batch['attention_mask']
+        position_ids = prompts.batch['position_ids']
+        eos_token_id = prompts.meta_info['eos_token_id']
+
+        batch_size = idx.size(0)
+
+        idx_list = [] # list of list, represents all input tokens in the batch
+        # parse idx from torch.Tensor to List[List[int]]
+        for i in range(batch_size):
+            idx_list.extend([_pre_process_inputs(self.pad_token_id, idx[i])])
+
+        do_sample = prompts.meta_info.get('do_sample', True)
+        if not do_sample:
+            kwargs = {
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 0,
+                'n': 1  # if greedy, only 1 response
+            }
+        is_validation = False
+        if prompts.meta_info.get('val_temperature', None):
+            kwargs['temperature'] = prompts.meta_info['val_temperature']
+            is_validation = True
+
+        updated_sampling_params = deepcopy(self.sampling_params)
+        for key, value in kwargs.items():
+            if hasattr(updated_sampling_params, key):
+                setattr(updated_sampling_params, key, value)
+
+        # Helper function to call tools
+        def _apply_tool(tool_call, id=None):
+            if id is not None:
+                tool_call["parameters"]["id"] = id
+            # tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
+            from rllm.rewards.code_utils.livecodebench import run_code
+            tool_call_result = run_code(tool_call["parameters"]["code"])
+            return {"content": tool_call_result}
+
+        # Main function to process single prompt
+        async def _generate_single_prompt_vectorized(prompt_idx: int, prompt_tokens: List[int]):
+            """Process a single prompt with potential tool calls."""
+            max_token_limit = self.config.response_length + len(prompt_tokens)
+            max_response_token_limit = self.config.response_length 
+       
+            # Treat each generation indpendently by creating self.config.n independent generations.
+            updated_sampling_params.stop = tool_stop_tokens
+            updated_sampling_params.include_stop_str_in_output = True
+            updated_sampling_params.n = 1
+            updated_sampling_params.detokenize = True
+            # updated_sampling_params.stop_token_ids = [self.tokenizer.eos_token_id]
+
+            all_prompt_tokens: List[List[int]] = [copy.deepcopy(prompt_tokens) for _ in range(self.config.n)]
+            all_tokens = copy.deepcopy(all_prompt_tokens)    
+            all_log_probs: List[List[float]] = [[] for _ in range(self.config.n)]
+            all_tool_call_masks: List[List[int]] = [[] for _ in range(self.config.n)]
+            all_dones = [False for _ in range(self.config.n)]
+            all_tool_calls = [0 for _ in range(self.config.n)]  
+
             while True:
-                try:
-                    # Run until next result is ready
-                    result = loop.run_until_complete(async_gen.__anext__())
-                    yield result
-                except StopAsyncIteration:
+                gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, generation_tokens, updated_sampling_params) for idx, generation_tokens in enumerate(all_tokens) if not all_dones[idx]])
+        
+                for gen_idx, gen_output in gathered_outputs:
+                    output = gen_output.outputs[0]
+                    cur_token_ids = list(output.token_ids)
+                    if hasattr(output, 'logprobs') and output.logprobs is not None:
+                        cur_logprob = [next(iter(log_prob.values())).logprob 
+                                        for log_prob in output.logprobs]
+                    else:
+                        cur_logprob = [0.0] * len(output.token_ids)
+
+                    cur_text = self.tokenizer.decode(cur_token_ids)
+                    tool_calls = self.tool_caller.parse_tool_calls(cur_text)                    
+
+                    if len(tool_calls) > 0:
+                        tool_call = tool_calls[-1]
+                        toolcall_result = _apply_tool(tool_call)
+                        if not isinstance(toolcall_result['content'], str):
+                            toolcall_result['content'] = str(toolcall_result['content'])
+                        toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
+                        result_tokens = self.tokenizer.encode(toolcall_result_with_special_token, add_special_tokens=False)
+                        
+                        # Update running statistics.
+                        all_tokens[gen_idx].extend(cur_token_ids + result_tokens)
+                        all_log_probs[gen_idx].extend(cur_logprob)
+                        all_log_probs[gen_idx].extend([0.0] * (len(result_tokens)))
+                        all_tool_call_masks[gen_idx].extend([1] * (len(cur_token_ids)))
+                        all_tool_call_masks[gen_idx].extend([0] * (len(result_tokens)))
+                        all_tool_calls[gen_idx] += 1
+                    else:
+                        # Update running statistics.
+                        all_tokens[gen_idx].extend(cur_token_ids)
+                        all_log_probs[gen_idx].extend(cur_logprob)
+                        all_tool_call_masks[gen_idx].extend([1] * (len(cur_token_ids)))
+                        all_dones[gen_idx] = True
+
+                    # If sequences has hit the max token limit, truncate the sequence and mark as done.
+                    # @TODO(mluo): If the generation has too many tests, we should stop the generation.
+                    if len(all_tokens[gen_idx]) >= max_token_limit:
+                        all_tokens[gen_idx] = all_tokens[gen_idx][:max_token_limit]
+                        all_log_probs[gen_idx] = all_log_probs[gen_idx][:max_response_token_limit]
+                        all_tool_call_masks[gen_idx] = all_tool_call_masks[gen_idx][:max_response_token_limit]
+                        all_dones[gen_idx] = True
+                    elif all_tool_calls[gen_idx] >= self.config.max_tool_calls:
+                        all_dones[gen_idx] = True
+                # Break out of the loop if all generations have terminated.
+                if all(all_dones):
                     break
-                except Exception as e:
-                    # Ensure loop is cleaned up on error
-                    if not loop.is_closed():
-                        loop.close()
-                    raise e
-        finally:
-            # Clean up
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            
-            if not loop.is_closed():
-                # Run loop one final time to execute any remaining callbacks
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.close()
+
+            outputs = [
+                SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs, tool_call_mask=tool_call_mask)
+                for tokens, probs, prompt, tool_call_mask in zip(all_tokens, all_log_probs, all_prompt_tokens, all_tool_call_masks)
+            ]
+            final_output = SimpleNamespace(outputs=outputs)
+            return prompt_idx, final_output
+
+        async def _async_generate():
+            # Create all tasks
+            tasks = [
+                _generate_single_prompt_vectorized(prompt_idx, prompt_tokens)
+                for prompt_idx, prompt_tokens in enumerate(idx_list)
+            ]
+
+            # Use as_completed to yield results as they finish
+            for completed_task in asyncio.as_completed(tasks):
+                prompt_idx, output = await completed_task
+                # Finally, begin to post-process to return DataProto object.
+                response = []
+                log_probs = []
+                tool_call_masks = []
+               
+                for sample_id in range(len(output.outputs)):
+                    response.append(output.outputs[sample_id].token_ids)
+                    log_probs.append(output.outputs[sample_id].logprobs)
+                    tool_call_masks.append(output.outputs[sample_id].tool_call_mask)
+
+                response = pad_2d_list_to_length(response, self.pad_token_id,
+                                               max_length=self.config.response_length).to(idx.device)
+                log_probs = pad_2d_list_to_length(log_probs, 0.0,
+                                               max_length=self.config.response_length).to(idx.device)
+                tool_call_masks = pad_2d_list_to_length(tool_call_masks, 0,
+                                               max_length=self.config.response_length).to(idx.device)
+
+                # Process single sequence
+                single_idx = idx[prompt_idx:prompt_idx+1]
+                single_attention_mask = attention_mask[prompt_idx:prompt_idx+1]
+                single_position_ids = position_ids[prompt_idx:prompt_idx+1]
+                non_tensor_batch = {}
+                for key, val in prompts.non_tensor_batch.items():
+                    # Get single value and repeat n times
+                    single_val = val[prompt_idx:prompt_idx+1]
+                    non_tensor_batch[key] = single_val
+                # Handle multiple samples per prompt when n > 1 and sampling
+                if self.config.n > 1:
+                    single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
+                    single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
+                    single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)
+                    # Create interleaved non_tensor_batch for this subset
+                    for key, val in non_tensor_batch.items():
+                        # Get single value and repeat n times
+                        repeated_val = np.repeat(val, self.config.n)
+                        non_tensor_batch[key] = repeated_val
+                seq = torch.cat([single_idx, response], dim=-1)
+                
+                response_length = response.size(1)
+                delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+                delta_position_id = delta_position_id.unsqueeze(0).repeat(response.size(0), 1)
+                
+                response_position_ids = single_position_ids[:, -1:] + delta_position_id
+                position_ids_out = torch.cat([single_position_ids, response_position_ids], dim=-1)
+                response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+                attention_mask_out = torch.cat((single_attention_mask, response_attention_mask), dim=-1)
+
+                batch = TensorDict(
+                    {
+                        'prompts': single_idx,
+                        'responses': response,
+                        'input_ids': seq,
+                        'attention_mask': attention_mask_out,
+                        'position_ids': position_ids_out,
+                        'tool_call_mask': tool_call_masks,
+                    },
+                    batch_size=response.size(0))
+
+                if self.config.vllm_log_prob:
+                    batch['old_log_probs'] = log_probs
+                
+                if self.reward_fn is not None and not is_validation:
+                    init_batch = DataProto(
+                        batch=batch,
+                        non_tensor_batch=non_tensor_batch,
+                        meta_info=prompts.meta_info
+                    )
+                    reward_tensor = self.reward_fn(init_batch)
+                    batch['token_level_scores'] = reward_tensor
+                
+                yield DataProto(
+                    batch=batch,
+                    non_tensor_batch=non_tensor_batch,
+                    meta_info=prompts.meta_info
+                )
+
+        # Create new event loop for this generator
+        for generated_seq in run_async_generator(_async_generate):
+            yield generated_seq
 
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
