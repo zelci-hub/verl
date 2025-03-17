@@ -415,7 +415,7 @@ class vLLMRollout(BaseRollout):
         updated_sampling_params = deepcopy(self.sampling_params)
         for key, value in kwargs.items():
             if hasattr(updated_sampling_params, key):
-                updated_sampling_params[key] = value
+                setattr(updated_sampling_params, key, value)
 
         async def _async_generate():
             # Create all tasks
@@ -564,7 +564,7 @@ class vLLMRollout(BaseRollout):
         updated_sampling_params = deepcopy(self.sampling_params)
         for key, value in kwargs.items():
             if hasattr(updated_sampling_params, key):
-                updated_sampling_params[key] = value
+                setattr(updated_sampling_params, key, value)
 
         # Helper function to call tools
         def _apply_tool(tool_call, id=None):
