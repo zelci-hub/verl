@@ -83,7 +83,7 @@ class NaiveRewardManager:
             return i, score, valid_response_length
 
         # Process items in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=1024) as executor:
+        with ThreadPoolExecutor(max_workers=48) as executor:
             args = [(i, data[i], already_print_data_sources) for i in range(len(data))]
             results = list(executor.map(process_row, args))
 

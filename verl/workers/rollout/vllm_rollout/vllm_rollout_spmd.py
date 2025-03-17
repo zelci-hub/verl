@@ -741,7 +741,10 @@ class vLLMRollout(BaseRollout):
             kwargs['temperature'] = prompts.meta_info['val_temperature']
             is_validation = True
 
-        self.update_sampling_params(**kwargs)
+        updated_sampling_params = deepcopy(self.sampling_params)
+        for key, value in kwargs.items():
+            if hasattr(updated_sampling_params, key):
+                updated_sampling_params[key] = value
 
         async def _create_task(prompt_idx, task):
             """Process a single generation task and return its result with original index"""
@@ -756,7 +759,7 @@ class vLLMRollout(BaseRollout):
                     prompt_idx,
                     self.inference_engine.generate(
                         prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
-                        sampling_params=self.sampling_params,
+                        sampling_params=updated_sampling_params,
                         request_id=str(uuid.uuid4()),
                     )
                 ) for prompt_idx, prompt_tokens in enumerate(idx_list)

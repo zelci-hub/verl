@@ -89,15 +89,6 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         # load checkpoint before doing anything
         self._load_checkpoint()
 
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
-            val_metrics = self._validate()
-            pprint(f'Initial validation metrics: {val_metrics}')
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get('val_only', False):
-                return
-
         # we start from step 1
         self.global_steps += 1
         replay_queue = queue.Queue()
@@ -110,7 +101,15 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
         print("Done broadcasting weights from actor to rollout.")
         
-        
+        # perform validation before training
+        # currently, we only support validation using the reward_function.
+        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+            val_metrics = self._validate()
+            pprint(f'Initial validation metrics: {val_metrics}')
+            logger.log(data=val_metrics, step=self.global_steps)
+            if self.config.trainer.get('val_only', False):
+                return
+
         print('Initializing replay buffer.')
         start_time = time.perf_counter()
         train_dataloader_gen = iter(self.train_dataloader)

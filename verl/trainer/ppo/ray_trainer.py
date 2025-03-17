@@ -1012,8 +1012,11 @@ class RayPPOTrainer(object):
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+                        if not self.config.actor_rollout_ref.rollout.compute_reward:
+                            reward_tensor = self.reward_fn(batch)
+                            batch.batch['token_level_scores'] = reward_tensor
+                        else:
+                            reward_tensor = batch.batch['token_level_scores']
 
                         # Rejection sampling based on rewards
                         # Group rewards by uid

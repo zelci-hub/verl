@@ -113,7 +113,7 @@ class RLHFDataset(Dataset):
                 except Exception as json_e:
                     print(f"Also failed to read JSON file {json_file}: {str(json_e)}")
                     raise e
-        dataframes.append(dataframe)
+            dataframes.append(dataframe)
         self.dataframe = pd.concat(dataframes)
 
         print(f'original dataset len: {len(self.dataframe)}')
@@ -124,8 +124,6 @@ class RLHFDataset(Dataset):
         self.dataframe = self.dataframe[self.dataframe.apply(lambda doc: len(
             tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
                                                              axis=1)]
-
-        print(f'filter dataset len: {len(self.dataframe)}')
 
     def resume_dataset_state(self):
         self.serialize_dataset = False if hasattr(self, 'original_parquet_files') else True
