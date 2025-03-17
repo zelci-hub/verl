@@ -24,39 +24,39 @@ When working with Megatron:
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
-import asyncio
-from typing import List
+import copy
+import os
 from contextlib import contextmanager
-from omegaconf import DictConfig
-import uuid
+from copy import deepcopy
+from types import SimpleNamespace
+from typing import AsyncGenerator, Generator, List, Tuple, TypeVar, Union
+import asyncio
+import numpy as np
 import torch
 import torch.distributed
+import uuid
+from omegaconf import DictConfig
 from tensordict import TensorDict
-from torch import nn
-import numpy as np
-from copy import deepcopy
-import os
-import copy
-os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds, effectively no timeout
 
-
+from rllm.environments.tools import PythonInterpreter, ToolCaller
 from verl import DataProto
+from verl.third_party.vllm import vllm_version
 from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
-from vllm.distributed import parallel_state as vllm_ps
+from verl.workers.rollout.vllm_rollout.utils import run_async_generator
+
 from vllm import AsyncLLMEngine, LLM, SamplingParams, TokensPrompt
+from vllm.distributed import parallel_state as vllm_ps
 from vllm.engine.arg_utils import AsyncEngineArgs
-from verl.third_party.vllm import vllm_version
-from rllm.environments.tools import PythonInterpreter, ToolCaller
-# from rllm.environments.tools.utils import parse_tool_calls
-from types import SimpleNamespace
+from vllm.outputs import RequestOutput
+
+# Set very long timeout to effectively disable it
+os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds
 
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
 # 3. simplify init logics
-
-
 # NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
 def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
     # remove the left padding in the prompt token_id
@@ -65,8 +65,8 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
 
-# Monkey patch for AsyncLLMEngine
-import time
+
+# Monkey patch for AsyncLLMEngine to support sleep and wakeup operations.
 def sleep(self, level: int = 1):
         """
         Put the engine to sleep. The engine should not process any requests.
@@ -96,7 +96,6 @@ def wake_up(self):
 
 AsyncLLMEngine.sleep = sleep
 AsyncLLMEngine.wake_up = wake_up
-
 
 
 class vLLMRollout(BaseRollout):
@@ -198,6 +197,32 @@ class vLLMRollout(BaseRollout):
         self.interpreter = PythonInterpreter(n_sandboxes=16)
         self.tool_caller = ToolCaller(tools=[self.interpreter], parser_type="python")
 
+    async def generate_sequence_task(self, idx: int, prompt_tokens: List[int], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
+        """Generate a sequence asynchronously using vLLM.
+        
+        This method creates an asynchronous task for generating text from the given prompt tokens.
+        It streams the outputs and returns the final result along with the original prompt index.
+        
+        Args:
+            idx: The index of the prompt in the original batch
+            prompt_tokens: List of token IDs representing the input prompt
+            sampling_params: Optional custom sampling parameters, defaults to self.sampling_params
+            
+        Returns:
+            tuple: (idx, last_output) where idx is the original prompt index and 
+                  last_output contains the generated sequence and related information
+        """
+        if sampling_params is None:
+            sampling_params = self.sampling_params
+        task = self.inference_engine.generate(
+                    prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
+                    sampling_params=sampling_params,
+                    request_id=str(uuid.uuid4()),
+        )
+        async for output in task:
+            last_output = output
+        return idx, last_output
+
     @contextmanager
     def update_sampling_params(self, **kwargs):
         # update sampling params
@@ -216,7 +241,13 @@ class vLLMRollout(BaseRollout):
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        # rebuild vllm cache engine
+        # Handle async engine case
+        if self.config.async_engine:
+            outputs = []
+            for output in self.generate_sequences_async(prompts):
+                outputs.append(output)
+            return DataProto.concat(outputs)
+        # Rebuild vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
 
@@ -253,17 +284,11 @@ class vLLMRollout(BaseRollout):
         
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            if self.config.async_engine:
-                outputs = []
-                for output in self.generate_sequences_async(prompts):
-                    outputs.append(output)
-                return DataProto.concat(outputs)
-            else:
-                outputs = self.inference_engine.generate(
-                    prompts=None,  # because we have already convert it to prompt token id
-                    sampling_params=self.sampling_params,
-                    prompt_token_ids=idx_list,
-                    use_tqdm=False)
+            outputs = self.inference_engine.generate(
+                prompts=None,  # because we have already convert it to prompt token id
+                sampling_params=self.sampling_params,
+                prompt_token_ids=idx_list,
+                use_tqdm=False)
         
         # Extract token IDs and log probabilities
         response = []
@@ -392,28 +417,13 @@ class vLLMRollout(BaseRollout):
             if hasattr(updated_sampling_params, key):
                 updated_sampling_params[key] = value
 
-        async def _create_task(prompt_idx, task):
-            """Process a single generation task and return its result with original index"""
-            async for output in task:
-                last_output = output
-            return prompt_idx, last_output
-
         async def _async_generate():
             # Create all tasks
             tasks = [
-                _create_task(
-                    prompt_idx,
-                    self.inference_engine.generate(
-                        prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
-                        sampling_params=updated_sampling_params,
-                        request_id=str(uuid.uuid4()),
-                    )
-                ) for prompt_idx, prompt_tokens in enumerate(idx_list)
+                self.generate_sequence_task(prompt_idx, prompt_tokens, updated_sampling_params) for prompt_idx, prompt_tokens in enumerate(idx_list)
             ]
-            
-            # Use as_completed to yield results as they finish
             for completed_task in asyncio.as_completed(tasks):
-                prompt_idx, output = await completed_task
+                prompt_idx, output  = await completed_task
                 
                 # Process output
                 response = []
@@ -493,35 +503,8 @@ class vLLMRollout(BaseRollout):
                 )
 
         # Create new event loop for this generator
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            # Create async generator
-            async_gen = _async_generate()
-            
-            while True:
-                try:
-                    # Run until next result is ready
-                    result = loop.run_until_complete(async_gen.__anext__())
-                    yield result
-                except StopAsyncIteration:
-                    break
-                except Exception as e:
-                    # Ensure loop is cleaned up on error
-                    if not loop.is_closed():
-                        loop.close()
-                    raise e
-        finally:
-            # Clean up
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            
-            if not loop.is_closed():
-                # Run loop one final time to execute any remaining callbacks
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.close()
+        for generated_seq in run_async_generator(_async_generate):
+            yield generated_seq
 
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
@@ -542,7 +525,6 @@ class vLLMRollout(BaseRollout):
         """
         assert not self.config.vllm_log_prob, "generate_sequences_async_tool does not support `vllm_log_prob=True`"
         assert self.config.async_engine, "generate_sequences_async_tool requires `async_engine=True`"
-
 
         tool_stop_tokens = ["```\n\n"]
         tool_start_tokens = ["```python"]
@@ -566,10 +548,24 @@ class vLLMRollout(BaseRollout):
             idx_list.extend([_pre_process_inputs(self.pad_token_id, idx[i]) for _ in range(self.config.n)])
 
         do_sample = prompts.meta_info.get('do_sample', True)
-        
+        if not do_sample:
+            kwargs = {
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 0,
+                'n': 1  # if greedy, only 1 response
+            }
         is_validation = False
         if prompts.meta_info.get('val_temperature', None):
+            kwargs['temperature'] = prompts.meta_info['val_temperature']
             is_validation = True
+
+        updated_sampling_params = deepcopy(self.sampling_params)
+        for key, value in kwargs.items():
+            if hasattr(updated_sampling_params, key):
+                updated_sampling_params[key] = value
 
         # Helper function to call tools
         def _apply_tool(tool_call, id=None):
@@ -580,42 +576,15 @@ class vLLMRollout(BaseRollout):
             tool_call_result = run_code(tool_call["parameters"]["code"])
             return {"content": tool_call_result}
 
-        async def generate_wrapper(generation_tokens):
-            task = self.inference_engine.generate(
-                prompt=TokensPrompt(prompt_token_ids=generation_tokens),
-                sampling_params=self.sampling_params,
-                request_id=str(uuid.uuid4()),
-            )
-            async for output in task:
-                latest_output = output
-            return latest_output
-
         # Main function to process single prompt
         async def _process_single_prompt(prompt_idx: int, prompt_tokens: List[int]):
-            nonlocal kwargs
             """Process a single prompt with potential tool calls."""
             # Generate tokens until "<tool_call>" or completion. Takes in 1 complete prompt at a time
             max_token_limit = self.config.response_length + len(prompt_tokens)
             max_response_token_limit = self.config.response_length 
-
-            # Setup kwargs
-            if not do_sample:
-                kwargs = {
-                    'best_of': 1,
-                    'top_p': 1.0,
-                    'top_k': -1,
-                    'min_p': 0.0,
-                    'temperature': 0,
-                    'n': 1  # if greedy, only 1 response
-                }
-            if is_validation:
-                kwargs['temperature'] = prompts.meta_info['val_temperature']
-
-            kwargs["n"] = 1
-            # kwargs["detokenize"] = True
-            # Append the stop tokens with new tool stop tokens
-            # kwargs["stop"] = self.sampling_params.stop + tool_stop_tokens + kwargs.get("stop", [])
-            kwargs["stop_token_ids"] = self.sampling_params.stop_token_ids + [151646] + kwargs.get("stop_token_ids", [])
+            
+            updated_sampling_params.n = 1
+            updated_sampling_params.stop_token_ids = [self.tokenizer.eos_token_id] + tool_stop_tokens 
 
             # If need to generate repeated answers, we will manually replicate the prompt_tokens and treat each response independently
             all_prompt_tokens: List[List[int]] = [prompt_tokens] 
@@ -623,116 +592,102 @@ class vLLMRollout(BaseRollout):
             all_tool_call_masks: List[List[int]] = [[]]
             is_done = [False]
            
-            # if self.config.n > 1 and do_sample:
-            '''
-            all_prompt_tokens = copy.deepcopy(all_prompt_tokens * self.config.n)
-            all_log_probs = [[] for _ in range(self.config.n)]
-            all_tool_call_masks = [[] for _ in range(self.config.n)]
-            is_done = is_done * self.config.n
-            request_id = [str(uuid.uuid4()) for _ in range(self.config.n)]
-            '''
-
-            with self.update_sampling_params(**kwargs):
-                all_current_tokens = copy.deepcopy(all_prompt_tokens) # the list of prompts that will generate on. Will continue growing with new generation and tool call results 
-                
-                # final_output = await generate_wrapper(all_current_tokens[0])
-
-                num_tools = 0
-                while True:
-                    latest_tokens: List[List[int]] = [] # tokens of outputs from latest generation
-                    latest_logprobs: List[List[float]] = [] # logprobs of outputs from latest generation
-
-                    # make 1 step of all copies on the current prompt until it has finished or a tool call is needed
-                    not_done_ids = [i for i, d in enumerate(is_done) if not d]
-
-                    gathered_outputs = await asyncio.gather(*[generate_wrapper(generation_tokens) for gen_idx, generation_tokens in enumerate(all_current_tokens) if not is_done[gen_idx]])
-                    gen_idx = 0
-                    for i, d in enumerate(is_done):
-                        # already finished
-                        if d:
-                            continue
-                        latest_tokens.append(list(gathered_outputs[gen_idx].outputs[0].token_ids))
-                        if hasattr(gathered_outputs[gen_idx].outputs[0], 'logprobs') and gathered_outputs[gen_idx].outputs[0].logprobs is not None:
-                            log_prob_list = []
-                            for log_prob in gathered_outputs[gen_idx].outputs[0].logprobs:
-                                log_prob_list.append(next(iter(log_prob.values())).logprob)
-                        else:
-                            log_prob_list = [0.0] * len(gathered_outputs[gen_idx].outputs[0].token_ids)
-                        latest_logprobs.append(log_prob_list)
-                        gen_idx += 1
-
-                    latest_result_idx = 0
-                    for response_idx, d in enumerate(is_done):
-                        # Skip if it has already completed
-                        if d:
-                            continue
-                        latest_token = latest_tokens[latest_result_idx]
-                        latest_logprob = latest_logprobs[latest_result_idx]
-                        latest_result_idx += 1
-
-                        latest_text = self.tokenizer.decode(latest_token)
-                        tool_calls = self.tool_caller.parse_tool_calls(latest_text)
-                        has_tool_call = False
-                        if len(tool_calls) > 0:
-                            has_tool_call = True
-                            tool_call = tool_calls[0]                            
-                
-                        if has_tool_call:
-                            toolcall_result = _apply_tool(tool_call)
-
-                            # print("toolcall result", toolcall_result) 
-                            
-                            # Extract log probs if available
-                            all_log_probs[response_idx].extend(latest_logprob)
-                            
-                            # Encode the result into acceptable format
-                            toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
-                            # Tokenize the result and prepare for next generation
-                            result_tokens = self.tokenizer.encode(toolcall_result_with_special_token, add_special_tokens=False)
-                            
-                            # Update current tokens for next generation
-                            all_current_tokens[response_idx] = all_current_tokens[response_idx] + latest_token + result_tokens
-                            all_log_probs[response_idx].extend([0.0] * (len(result_tokens)))
-                            
-                            # Update the mask to mask out toolcall result
-                            all_tool_call_masks[response_idx].extend([1] * (len(latest_token)))
-                            all_tool_call_masks[response_idx].extend([0] * (len(result_tokens)))
-                        else:
-                            # Extract log probs if available
-                            all_log_probs[response_idx].extend(latest_logprob)
-
-                            # Update current tokens for next generation.
-                            all_current_tokens[response_idx] = all_current_tokens[response_idx] + latest_token
-
-                            # Update the mask to mask out toolcall result
-                            all_tool_call_masks[response_idx].extend([1] * (len(latest_token)))
-
-                            # Since there was no tool call, this generation has terminated
-                            is_done[response_idx] = True
-
-                    # check for overflow, and mark overflown copies as finished
-                    for response_idx in range(len(all_current_tokens)):
-                        if len(all_current_tokens[response_idx]) >= max_token_limit:
-                            all_current_tokens[response_idx] = all_current_tokens[response_idx][:max_token_limit]
-                            all_log_probs[response_idx] = all_log_probs[response_idx][:max_response_token_limit]
-                            all_tool_call_masks[response_idx] = all_tool_call_masks[response_idx][:max_response_token_limit]
-                            is_done[response_idx] = True
-
-                    # check if we need to continue generating
-                    if all(is_done):
-                        break
-
-                    num_tools += 1
-                    print(num_tools, is_done)
+            all_current_tokens = copy.deepcopy(all_prompt_tokens) # the list of prompts that will generate on. Will continue growing with new generation and tool call results 
             
-                outputs = [
-                    SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs, tool_call_mask=tool_call_mask)
-                    for tokens, probs, prompt, tool_call_mask in zip(all_current_tokens, all_log_probs, all_prompt_tokens, all_tool_call_masks)
-                ]
+            num_tools = 0
+            while True:
+                latest_tokens: List[List[int]] = [] # tokens of outputs from latest generation
+                latest_logprobs: List[List[float]] = [] # logprobs of outputs from latest generation
 
-                final_output = SimpleNamespace(outputs=outputs)
+                gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(gen_idx, generation_tokens) for gen_idx, generation_tokens in enumerate(all_current_tokens) if not is_done[gen_idx]])
+                gen_idx = 0
+                
+                for i, d in enumerate(is_done):
+                    # already finished
+                    if d:
+                        continue
+                    latest_tokens.append(list(gathered_outputs[gen_idx].outputs[0].token_ids))
+                    if hasattr(gathered_outputs[gen_idx].outputs[0], 'logprobs') and gathered_outputs[gen_idx].outputs[0].logprobs is not None:
+                        log_prob_list = []
+                        for log_prob in gathered_outputs[gen_idx].outputs[0].logprobs:
+                            log_prob_list.append(next(iter(log_prob.values())).logprob)
+                    else:
+                        log_prob_list = [0.0] * len(gathered_outputs[gen_idx].outputs[0].token_ids)
+                    latest_logprobs.append(log_prob_list)
+                    gen_idx += 1
 
-                return prompt_idx, final_output
+                latest_result_idx = 0
+                for response_idx, d in enumerate(is_done):
+                    # Skip if it has already completed
+                    if d:
+                        continue
+                    latest_token = latest_tokens[latest_result_idx]
+                    latest_logprob = latest_logprobs[latest_result_idx]
+                    latest_result_idx += 1
+
+                    latest_text = self.tokenizer.decode(latest_token)
+                    tool_calls = self.tool_caller.parse_tool_calls(latest_text)
+                    has_tool_call = False
+                    if len(tool_calls) > 0:
+                        has_tool_call = True
+                        tool_call = tool_calls[0]                            
+            
+                    if has_tool_call:
+                        toolcall_result = _apply_tool(tool_call)
+
+                        # print("toolcall result", toolcall_result) 
+                        
+                        # Extract log probs if available
+                        all_log_probs[response_idx].extend(latest_logprob)
+                        
+                        # Encode the result into acceptable format
+                        toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
+                        # Tokenize the result and prepare for next generation
+                        result_tokens = self.tokenizer.encode(toolcall_result_with_special_token, add_special_tokens=False)
+                        
+                        # Update current tokens for next generation
+                        all_current_tokens[response_idx] = all_current_tokens[response_idx] + latest_token + result_tokens
+                        all_log_probs[response_idx].extend([0.0] * (len(result_tokens)))
+                        
+                        # Update the mask to mask out toolcall result
+                        all_tool_call_masks[response_idx].extend([1] * (len(latest_token)))
+                        all_tool_call_masks[response_idx].extend([0] * (len(result_tokens)))
+                    else:
+                        # Extract log probs if available
+                        all_log_probs[response_idx].extend(latest_logprob)
+
+                        # Update current tokens for next generation.
+                        all_current_tokens[response_idx] = all_current_tokens[response_idx] + latest_token
+
+                        # Update the mask to mask out toolcall result
+                        all_tool_call_masks[response_idx].extend([1] * (len(latest_token)))
+
+                        # Since there was no tool call, this generation has terminated
+                        is_done[response_idx] = True
+
+                # check for overflow, and mark overflown copies as finished
+                for response_idx in range(len(all_current_tokens)):
+                    if len(all_current_tokens[response_idx]) >= max_token_limit:
+                        all_current_tokens[response_idx] = all_current_tokens[response_idx][:max_token_limit]
+                        all_log_probs[response_idx] = all_log_probs[response_idx][:max_response_token_limit]
+                        all_tool_call_masks[response_idx] = all_tool_call_masks[response_idx][:max_response_token_limit]
+                        is_done[response_idx] = True
+
+                # check if we need to continue generating
+                if all(is_done):
+                    break
+
+                num_tools += 1
+                print(num_tools, is_done)
+        
+            outputs = [
+                SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs, tool_call_mask=tool_call_mask)
+                for tokens, probs, prompt, tool_call_mask in zip(all_current_tokens, all_log_probs, all_prompt_tokens, all_tool_call_masks)
+            ]
+
+            final_output = SimpleNamespace(outputs=outputs)
+
+            return prompt_idx, final_output
 
         async def _async_generate():
             # Create all tasks
@@ -835,35 +790,8 @@ class vLLMRollout(BaseRollout):
                 )
 
         # Create new event loop for this generator
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        try:
-            # Create async generator
-            async_gen = _async_generate()
-            
-            while True:
-                try:
-                    # Run until next result is ready
-                    result = loop.run_until_complete(async_gen.__anext__())
-                    yield result
-                except StopAsyncIteration:
-                    break
-                except Exception as e:
-                    # Ensure loop is cleaned up on error
-                    if not loop.is_closed():
-                        loop.close()
-                    raise e
-        finally:
-            # Clean up
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            
-            if not loop.is_closed():
-                # Run loop one final time to execute any remaining callbacks
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.close()
+        for generated_seq in run_async_generator(_async_generate):
+            yield generated_seq
 
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
