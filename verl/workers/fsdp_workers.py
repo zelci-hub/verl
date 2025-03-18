@@ -661,7 +661,10 @@ class ActorRolloutRefWorker(Worker):
 
             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            self._generator = self.rollout.generate_sequences_async(prompts=prompts, **kwargs)
+            if self.config.rollout.enable_tools:
+                self._generator = self.rollout.generate_sequences_async_tool(prompts=prompts, **kwargs)
+            else:
+                self._generator = self.rollout.generate_sequences_async(prompts=prompts, **kwargs)
             return None
         try:
             output = next(self._generator)

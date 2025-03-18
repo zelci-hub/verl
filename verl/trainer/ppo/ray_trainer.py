@@ -635,7 +635,6 @@ class RayPPOTrainer(object):
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
-            #test_batch = test_batch.pop(['input_ids', 'attention_mask', 'position_ids'])
             test_batch.meta_info = {
                 'eos_token_id': self.tokenizer.eos_token_id,
                 'pad_token_id': self.tokenizer.pad_token_id,
@@ -649,10 +648,23 @@ class RayPPOTrainer(object):
             else:
                 test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.rollout_wg.world_size)
             test_batch_padded.meta_info['val_temperature'] = self.config.actor_rollout_ref.rollout.val_temperature
+
             if self.hybrid_engine:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_batch_padded)
+                validate_wg = self.actor_rollout_wg
             else:
-                test_output_gen_batch_padded = self.rollout_wg.generate_sequences(test_batch_padded)
+                validate_wg = self.rollout_wg
+            
+            if self.config.actor_rollout_ref.rollout.async_engine:
+                gen_seq_generator = validate_wg.generate_sequences_async(prompts=test_batch_padded)
+                outputs = []
+                for item in gen_seq_generator:
+                    if item is None:
+                        break
+                    outputs.append(item)
+                test_output_gen_batch_padded = DataProto.concat(outputs)
+            else:
+                test_output_gen_batch_padded = validate_wg.generate_sequences(test_batch_padded)
+
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
             print('validation generation end')

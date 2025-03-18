@@ -95,6 +95,8 @@ actor_rollout_ref:
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
     n_val: 8
+    enable_tools: False # Enable tools for rollout.
+    max_tool_calls: 10 # Maximum number of tool calls per response.
 
 critic:
   strategy: fsdp
