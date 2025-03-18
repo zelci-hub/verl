@@ -194,7 +194,7 @@ class vLLMRollout(BaseRollout):
 
         self.pad_token_id = tokenizer.pad_token_id
         self.tokenizer = tokenizer
-        self.interpreter = PythonInterpreter(n_sandboxes=16)
+        self.interpreter = PythonInterpreter(n_sandboxes=2)
         self.tool_caller = ToolCaller(tools=[self.interpreter], parser_type="python")
 
     async def generate_sequence_task(self, idx: int, prompt_tokens: List[int], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
@@ -528,8 +528,8 @@ class vLLMRollout(BaseRollout):
         tool_stop_tokens = ["```\n\n"]
         tool_start_tokens = ["```python"]
 
-        tool_response_start_tokens = ["<tool_response>"]
-        tool_response_stop_tokens = ["</tool_response>"]
+        tool_response_start_tokens = ["```output\n"]
+        tool_response_stop_tokens = ["\n```\n"]
         # rebuild vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
@@ -567,13 +567,14 @@ class vLLMRollout(BaseRollout):
                 setattr(updated_sampling_params, key, value)
 
         # Helper function to call tools
-        def _apply_tool(tool_call, id=None):
+        async def _apply_tool(tool_call, id=None):
             if id is not None:
                 tool_call["parameters"]["id"] = id
-            # tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
-            from rllm.rewards.code_utils.livecodebench import run_code
-            tool_call_result = run_code(tool_call["parameters"]["code"])
-            return {"content": tool_call_result}
+            tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
+            return tool_call_result
+            # from rllm.rewards.code_utils.livecodebench import run_code
+            # tool_call_result = run_code(tool_call["parameters"]["code"])
+            # return {"content": tool_call_result}
 
         # Main function to process single prompt
         async def _generate_single_prompt_vectorized(prompt_idx: int, prompt_tokens: List[int]):
@@ -588,14 +589,19 @@ class vLLMRollout(BaseRollout):
             updated_sampling_params.detokenize = True
             # updated_sampling_params.stop_token_ids = [self.tokenizer.eos_token_id]
 
-            all_prompt_tokens: List[List[int]] = [copy.deepcopy(prompt_tokens) for _ in range(self.config.n)]
-            all_tokens = copy.deepcopy(all_prompt_tokens)    
-            all_log_probs: List[List[float]] = [[] for _ in range(self.config.n)]
-            all_tool_call_masks: List[List[int]] = [[] for _ in range(self.config.n)]
-            all_dones = [False for _ in range(self.config.n)]
-            all_tool_calls = [0 for _ in range(self.config.n)]  
+            n_rollouts = self.config.n
+            if is_validation:
+                # validation data is already repeated in the outer loop
+                n_rollouts = 1
 
-            while True:
+            all_prompt_tokens: List[List[int]] = [copy.deepcopy(prompt_tokens) for _ in range(n_rollouts)]
+            all_tokens = copy.deepcopy(all_prompt_tokens)    
+            all_log_probs: List[List[float]] = [[] for _ in range(n_rollouts)]
+            all_tool_call_masks: List[List[int]] = [[] for _ in range(n_rollouts)]
+            all_dones = [False for _ in range(n_rollouts)]
+            all_tool_calls = [0 for _ in range(n_rollouts)]  
+
+            for _ in range(self.config.max_tool_calls):
                 gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, generation_tokens, updated_sampling_params) for idx, generation_tokens in enumerate(all_tokens) if not all_dones[idx]])
         
                 for gen_idx, gen_output in gathered_outputs:
@@ -612,7 +618,7 @@ class vLLMRollout(BaseRollout):
 
                     if len(tool_calls) > 0:
                         tool_call = tool_calls[-1]
-                        toolcall_result = _apply_tool(tool_call)
+                        toolcall_result = await _apply_tool(tool_call)
                         if not isinstance(toolcall_result['content'], str):
                             toolcall_result['content'] = str(toolcall_result['content'])
                         toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
@@ -689,7 +695,7 @@ class vLLMRollout(BaseRollout):
                     single_val = val[prompt_idx:prompt_idx+1]
                     non_tensor_batch[key] = single_val
                 # Handle multiple samples per prompt when n > 1 and sampling
-                if self.config.n > 1:
+                if self.config.n > 1 and not is_validation:
                     single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
                     single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
                     single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)
