@@ -137,7 +137,7 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     return data, metrics
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, mask_truncated_samples=False):
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == AdvantageEstimator.GAE:
@@ -163,7 +163,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         response_mask = attention_mask[:, -response_length:]
         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
-                                                                        index=index)
+                                                                        index=index,
+                                                                        mask_truncated_samples=mask_truncated_samples)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.REINFORCE_PLUS_PLUS:
@@ -521,7 +522,7 @@ class RayPPOTrainer(object):
             train_batch_size = int(train_batch_size)
 
         self.train_dataloader = StatefulDataLoader(dataset=self.train_dataset,
-                                                   batch_size=self.config.data.train_batch_size,
+                                                   batch_size=train_batch_size,
                                                    drop_last=True,
                                                    collate_fn=collate_fn,
                                                    sampler=sampler)
@@ -1032,24 +1033,20 @@ class RayPPOTrainer(object):
                         # Log to metrics
                         metrics['batch/solve_none'] = solve_none
                         metrics['batch/solve_all'] = solve_all
+                        metrics['batch/solve_partial'] = len(unique_uids) - solve_none - solve_all
 
                         if self.config.trainer.rejection_sample:
                             # If no valid samples remain, skip this batch and get a new one
                             if not valid_mask.any():
                                 continue
-
                             # Keep track of valid samples and non-valid samples
                             valid_indices = torch.where(valid_mask)[0]
                             non_valid_indices = torch.where(~valid_mask)[0]
                             
                             num_valid_samples = len(valid_indices)
-                            num_trainer_replicas = self.actor_rollout_wg.world_size if self.hybrid_engine \
-                                else self.actor_wg.world_size
-                            
                             # Calculate how many samples we need to add for a full batch
-                            remainder = num_valid_samples % num_trainer_replicas
-                            padding_needed = (num_trainer_replicas - remainder) % num_trainer_replicas
-                            
+                            total_batch_size = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                            padding_needed = total_batch_size - num_valid_samples
                             # If we need padding and have non-valid samples available, use them
                             combined_indices = valid_indices.tolist()
                             if padding_needed > 0 and len(non_valid_indices) > 0:
@@ -1066,11 +1063,6 @@ class RayPPOTrainer(object):
                             # Apply the mask to keep only selected samples
                             batch = batch[final_mask]
                             batch = dataprotoitem_to_dataproto(batch)
-                            
-                            # Log metrics about rejection sampling
-                            metrics['batch/num_valid_samples'] = num_valid_samples
-                            metrics['batch/num_padding_samples'] = padding_needed
-
                         
                         if self.config.actor_rollout_ref.rollout.vllm_log_prob:
                             # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
@@ -1096,19 +1088,6 @@ class RayPPOTrainer(object):
                                 values = self.critic_wg.compute_values(batch)
                                 batch = batch.union(values)
 
-                        # compute rewards with KL penalty if needed
-
-                        # Note: This kl penalty applied directly over the rewards is disabled for GRPO. The kl penalty is applied at dp_actor.py
-                        # where it is subtracted directly from the policy loss
-
-                        # if not self.config.actor_rollout_ref.actor.use_kl_loss:
-                        #     batch, kl_metrics = apply_kl_penalty(batch,
-                        #                                        kl_ctrl=self.kl_ctrl,
-                        #                                        kl_penalty=self.config.algorithm.kl_penalty)
-                        #     metrics.update(kl_metrics)
-                        # else:
-                        #     batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-
                         batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
                         # compute advantages, executed on the driver process
@@ -1116,7 +1095,7 @@ class RayPPOTrainer(object):
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                                                  mask_truncated_samples=self.config.algorithm.mask_truncated_samples)
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.

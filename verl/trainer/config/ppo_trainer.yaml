@@ -158,6 +158,7 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
+  mask_truncated_samples: False # Zero gradient for truncated samples (by setting advantage=0)
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
     type: fixed
