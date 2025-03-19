@@ -599,7 +599,7 @@ class vLLMRollout(BaseRollout):
             all_log_probs: List[List[float]] = [[] for _ in range(n_rollouts)]
             all_tool_call_masks: List[List[int]] = [[] for _ in range(n_rollouts)]
             all_dones = [False for _ in range(n_rollouts)]
-            all_tool_calls = [0 for _ in range(n_rollouts)]  
+            has_tool_calls = [False for _ in range(n_rollouts)]  
 
             for _ in range(self.config.max_tool_calls):
                 gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, generation_tokens, updated_sampling_params) for idx, generation_tokens in enumerate(all_tokens) if not all_dones[idx]])
@@ -630,7 +630,7 @@ class vLLMRollout(BaseRollout):
                         all_log_probs[gen_idx].extend([0.0] * (len(result_tokens)))
                         all_tool_call_masks[gen_idx].extend([1] * (len(cur_token_ids)))
                         all_tool_call_masks[gen_idx].extend([0] * (len(result_tokens)))
-                        all_tool_calls[gen_idx] += 1
+                        has_tool_calls[gen_idx] = True
                     else:
                         # Update running statistics.
                         all_tokens[gen_idx].extend(cur_token_ids)
@@ -645,15 +645,13 @@ class vLLMRollout(BaseRollout):
                         all_log_probs[gen_idx] = all_log_probs[gen_idx][:max_response_token_limit]
                         all_tool_call_masks[gen_idx] = all_tool_call_masks[gen_idx][:max_response_token_limit]
                         all_dones[gen_idx] = True
-                    elif all_tool_calls[gen_idx] >= self.config.max_tool_calls:
-                        all_dones[gen_idx] = True
                 # Break out of the loop if all generations have terminated.
                 if all(all_dones):
                     break
 
             outputs = [
-                SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs, tool_call_mask=tool_call_mask)
-                for tokens, probs, prompt, tool_call_mask in zip(all_tokens, all_log_probs, all_prompt_tokens, all_tool_call_masks)
+                SimpleNamespace(token_ids=tokens[len(prompt):], logprobs=probs, tool_call_mask=tool_call_mask, has_tool_call=has_tool_call)
+                for tokens, probs, prompt, tool_call_mask, has_tool_call in zip(all_tokens, all_log_probs, all_prompt_tokens, all_tool_call_masks, has_tool_calls)
             ]
             final_output = SimpleNamespace(outputs=outputs)
             return prompt_idx, final_output
@@ -672,11 +670,13 @@ class vLLMRollout(BaseRollout):
                 response = []
                 log_probs = []
                 tool_call_masks = []
+                has_tool_calls = []
                
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
                     log_probs.append(output.outputs[sample_id].logprobs)
                     tool_call_masks.append(output.outputs[sample_id].tool_call_mask)
+                    has_tool_calls.append(output.outputs[sample_id].has_tool_call)
 
                 response = pad_2d_list_to_length(response, self.pad_token_id,
                                                max_length=self.config.response_length).to(idx.device)
@@ -694,6 +694,7 @@ class vLLMRollout(BaseRollout):
                     # Get single value and repeat n times
                     single_val = val[prompt_idx:prompt_idx+1]
                     non_tensor_batch[key] = single_val
+
                 # Handle multiple samples per prompt when n > 1 and sampling
                 if self.config.n > 1 and not is_validation:
                     single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
@@ -704,6 +705,11 @@ class vLLMRollout(BaseRollout):
                         # Get single value and repeat n times
                         repeated_val = np.repeat(val, self.config.n)
                         non_tensor_batch[key] = repeated_val
+                
+                # adding has_toolcall to the extra_info so that reward fn can assign bonus
+                for i, info in enumerate(non_tensor_batch['extra_info']):
+                    info['has_toolcall'] = has_tool_calls[i]
+
                 seq = torch.cat([single_idx, response], dim=-1)
                 
                 response_length = response.size(1)
