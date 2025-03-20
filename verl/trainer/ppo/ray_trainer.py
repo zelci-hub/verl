@@ -547,7 +547,7 @@ class RayPPOTrainer(object):
                 'do_sample': self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 'validate': True,
             }
-            print(f'test_gen_batch meta info: {test_gen_batch.meta_info}')
+            print(f'test_batch meta info: {test_batch.meta_info}')
             # pad to be divisible by dp_size
             if self.hybrid_engine:
                 test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
