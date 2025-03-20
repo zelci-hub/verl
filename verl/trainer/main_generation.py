@@ -67,6 +67,20 @@ def select_reward_fn(data_source):
 
 @hydra.main(config_path='config', config_name='generation', version_base=None)
 def main(config):
+    run_generation(config)
+
+
+def run_generation(config) -> None:
+
+    if not ray.is_initialized():
+        # this is for local ray cluster
+        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+
+    ray.get(main_task.remote(config))
+
+
+@ray.remote(num_cpus=1)
+def main_task(config):
     from pprint import pprint
     from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
@@ -103,12 +117,16 @@ def run_generation(config):
     val_dataset = RLHFDataset(parquet_files=config.data.path,
         tokenizer=tokenizer,
         prompt_key=config.data.prompt_key,
+        image_key=config.data.get('image_key', 'images'),
         max_prompt_length=config.rollout.prompt_length,
+        filter_prompts=True,
         return_raw_chat=config.data.get('return_raw_chat', False),
-        truncation='error')
+        truncation=config.data.get('truncation', 'error'),
+        filter_overlong_prompts=config.data.filter_overlong_prompts)
     val_dataloader = StatefulDataLoader(
         dataset=val_dataset,
         batch_size=len(val_dataset),
+        num_workers=8,
         shuffle=False,
         collate_fn=collate_fn)
     

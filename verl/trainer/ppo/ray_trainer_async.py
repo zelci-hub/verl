@@ -198,19 +198,14 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                             # If no valid samples remain, skip this batch and get a new one
                             if not valid_mask.any():
                                 continue
-
                             # Keep track of valid samples and non-valid samples
                             valid_indices = torch.where(valid_mask)[0]
                             non_valid_indices = torch.where(~valid_mask)[0]
                             
                             num_valid_samples = len(valid_indices)
-                            num_trainer_replicas = self.actor_rollout_wg.world_size if self.hybrid_engine \
-                                else self.actor_wg.world_size
-                            
                             # Calculate how many samples we need to add for a full batch
-                            remainder = num_valid_samples % num_trainer_replicas
-                            padding_needed = (num_trainer_replicas - remainder) % num_trainer_replicas
-                            
+                            total_batch_size = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
+                            padding_needed = total_batch_size - num_valid_samples
                             # If we need padding and have non-valid samples available, use them
                             combined_indices = valid_indices.tolist()
                             if padding_needed > 0 and len(non_valid_indices) > 0:
@@ -227,12 +222,6 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                             # Apply the mask to keep only selected samples
                             batch = batch[final_mask]
                             batch = dataprotoitem_to_dataproto(batch)
-                            
-                            # Log metrics about rejection sampling
-                            metrics['batch/num_valid_samples'] = num_valid_samples
-                            metrics['batch/num_padding_samples'] = padding_needed
-
-
 
                         
                         if self.config.actor_rollout_ref.rollout.vllm_log_prob:
@@ -260,9 +249,14 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n)
-                        self._balance_batch(batch, metrics=metrics)
+                        # balance the number of valid tokens on each dp rank.
+                        # Note that this breaks the order of data inside the batch.
+                        # Please take care when you implement group based adv computation such as GRPO and rloo
+                        if self.config.trainer.balance_batch:
+                            self._balance_batch(batch, metrics=metrics)
                         # compute global_valid tokens
                         batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
+                        
                         # update actor
                         start_time = time.perf_counter()
                         with Timer('update_actor', timing_raw):
@@ -301,7 +295,6 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
 
 
                 if self.global_steps >= self.total_training_steps:
-
                     # perform validation after training
                     if self.val_reward_fn is not None:
                         val_metrics = self._validate()

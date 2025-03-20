@@ -31,6 +31,8 @@ def run_async_generator(async_fn: Generator[AsyncGenerator[T, None], None, None]
             except StopAsyncIteration:
                 break
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 # Ensure loop is cleaned up on error
                 if not loop.is_closed():
                     loop.close()

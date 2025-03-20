@@ -26,6 +26,8 @@ When working with Megatron:
 """
 import copy
 import os
+import numpy as np
+from typing import List
 from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
@@ -39,6 +41,8 @@ from omegaconf import DictConfig
 from tensordict import TensorDict
 
 from rllm.environments.tools import PythonInterpreter, ToolCaller
+from torch import nn
+from typing import Any, Dict, Union
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
 from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
@@ -64,6 +68,12 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[in
     non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
     token_ids = prompt_token_ids[non_pad_index:].tolist()
     return token_ids
+
+def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
+    if isinstance(value, torch.Tensor):
+        return value.repeat_interleave(repeats, dim=0)
+    else:
+        return np.repeat(value, repeats, axis=0)
 
 
 # Monkey patch for AsyncLLMEngine to support sleep and wakeup operations.
@@ -96,7 +106,6 @@ def wake_up(self):
 
 AsyncLLMEngine.sleep = sleep
 AsyncLLMEngine.wake_up = wake_up
-
 
 class vLLMRollout(BaseRollout):
 
@@ -170,13 +179,14 @@ class vLLMRollout(BaseRollout):
                 disable_log_stats=config.disable_log_stats,
                 max_num_batched_tokens=max_num_batched_tokens,
                 enable_chunked_prefill=config.enable_chunked_prefill,
+                enable_prefix_caching=True,
             )
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
 
         kwargs = dict(
             n=1,
-            logprobs=1,  # can be set to 0 and let actor to recompute
+            logprobs=0,  # can be set to 0 and let actor to recompute
             max_tokens=config.response_length,
         )
 
@@ -197,7 +207,7 @@ class vLLMRollout(BaseRollout):
         self.interpreter = PythonInterpreter(n_sandboxes=2)
         self.tool_caller = ToolCaller(tools=[self.interpreter], parser_type="python")
 
-    async def generate_sequence_task(self, idx: int, prompt_tokens: List[int], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
+    async def generate_sequence_task(self, idx: int, prompt_tokens: Dict[str, Any], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
         """Generate a sequence asynchronously using vLLM.
         
         This method creates an asynchronous task for generating text from the given prompt tokens.
@@ -215,7 +225,7 @@ class vLLMRollout(BaseRollout):
         if sampling_params is None:
             sampling_params = self.sampling_params
         task = self.inference_engine.generate(
-                    prompt=TokensPrompt(prompt_token_ids=prompt_tokens),
+                    prompt=TokensPrompt(**prompt_tokens),
                     sampling_params=sampling_params,
                     request_id=str(uuid.uuid4()),
         )
@@ -261,12 +271,26 @@ class vLLMRollout(BaseRollout):
 
         batch_size = idx.size(0)
 
-        idx_list = []
-        # parse idx from torch.Tensor to List[List[str]]
-        for i in range(batch_size):
-            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+        non_tensor_batch = prompts.non_tensor_batch
+        if 'raw_prompt_ids' not in non_tensor_batch:
+            non_tensor_batch['raw_prompt_ids'] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+
+        if batch_size != len(non_tensor_batch['raw_prompt_ids']):
+            raise RuntimeError('vllm sharding manager is not work properly.')
+
+        if 'multi_modal_data' in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
+                                                        non_tensor_batch.pop('multi_modal_data')):
+                vllm_inputs.append({'prompt_token_ids': raw_prompt_ids, 'multi_modal_data': multi_modal_data})
+        else:
+            vllm_inputs = [{
+                'prompt_token_ids': raw_prompt_ids
+            } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
 
         do_sample = prompts.meta_info.get('do_sample', True)
+        is_validate = prompts.meta_info.get('validate', False)
         if not do_sample:
             kwargs = {
                 'best_of': 1,
@@ -276,18 +300,20 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
-        
-        is_validation = False
-        if prompts.meta_info.get('val_temperature', None):
-            kwargs['temperature'] = prompts.meta_info['val_temperature']
-            is_validation = True
-        
+        elif is_validate:
+            # TODO: try **
+            kwargs = {
+                'top_k': self.config.val_kwargs.top_k,
+                'top_p': self.config.val_kwargs.top_p,
+                'temperature': self.config.val_kwargs.temperature,
+                'n': 1,  # if validate, already repeat in ray_trainer
+            }
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
-                prompts=None,  # because we have already convert it to prompt token id
+                prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
-                prompt_token_ids=idx_list,
                 use_tqdm=False)
         
         # Extract token IDs and log probabilities
@@ -296,7 +322,7 @@ class vLLMRollout(BaseRollout):
         for output in outputs:
             for sample_id in range(len(output.outputs)):
                 response.append(output.outputs[sample_id].token_ids)
-                if hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
+                if self.config.vllm_log_prob and hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
                     # Directly use the list of floats returned by vLLM
                     log_prob_list = []
                     for log_prob in output.outputs[sample_id].logprobs:
@@ -306,27 +332,29 @@ class vLLMRollout(BaseRollout):
                     log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
         response = pad_2d_list_to_length(response, self.pad_token_id,
                                          max_length=self.config.response_length).to(idx.device)
-        log_probs = pad_2d_list_to_length(log_probs, 0.0,
-                                         max_length=self.config.response_length).to(idx.device)
+        if self.config.vllm_log_prob:
+            log_probs = pad_2d_list_to_length(log_probs, 0.0,
+                                            max_length=self.config.response_length).to(idx.device)
 
         non_tensor_batch = deepcopy(prompts.non_tensor_batch)
-        if self.config.n > 1 and do_sample:
-            idx = idx.repeat_interleave(self.config.n, dim=0)
-            attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
-            position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
-            batch_size = batch_size * self.config.n
+        if self.sampling_params.n > 1 and do_sample:
+            idx = _repeat_interleave(idx, self.sampling_params.n)
+            attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
+            position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
+            batch_size = batch_size * self.sampling_params.n
             # Create interleaved non_tensor_batch
             non_tensor_batch = {}
             for key, val in prompts.non_tensor_batch.items():
                 # Repeat each element n times (interleaved)
-                repeated_val = np.repeat(val, self.config.n)
-                non_tensor_batch[key] = repeated_val
+                non_tensor_batch[key] = _repeat_interleave(val, self.sampling_params.n)
 
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).repeat(batch_size, 1)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
 
         # TODO(sgm): fix position_ids on right_pad
         # prompt: left pad + response: right pad
@@ -354,7 +382,7 @@ class vLLMRollout(BaseRollout):
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
         
-        if self.reward_fn is not None and not is_validation:
+        if self.reward_fn is not None and not is_validate:
             init_batch = DataProto(
                 batch=batch,
                 non_tensor_batch=non_tensor_batch,
@@ -391,13 +419,26 @@ class vLLMRollout(BaseRollout):
         eos_token_id = prompts.meta_info['eos_token_id']
 
         batch_size = idx.size(0)
+        non_tensor_batch = prompts.non_tensor_batch
+        if 'raw_prompt_ids' not in non_tensor_batch:
+            non_tensor_batch['raw_prompt_ids'] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
 
-        idx_list = []
-        # parse idx from torch.Tensor to List[List[str]]
-        for i in range(batch_size):
-            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+        if batch_size != len(non_tensor_batch['raw_prompt_ids']):
+            raise RuntimeError('vllm sharding manager is not work properly.')
+
+        if 'multi_modal_data' in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
+                                                        non_tensor_batch.pop('multi_modal_data')):
+                vllm_inputs.append({'prompt_token_ids': raw_prompt_ids, 'multi_modal_data': multi_modal_data})
+        else:
+            vllm_inputs = [{
+                'prompt_token_ids': raw_prompt_ids
+            } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
 
         do_sample = prompts.meta_info.get('do_sample', True)
+        is_validate = prompts.meta_info.get('validate', False)
         if not do_sample:
             kwargs = {
                 'best_of': 1,
@@ -407,10 +448,15 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
-        is_validation = False
-        if prompts.meta_info.get('val_temperature', None):
-            kwargs['temperature'] = prompts.meta_info['val_temperature']
-            is_validation = True
+        elif is_validate:
+            # TODO: try **
+            kwargs = {
+                'top_k': self.config.val_kwargs.top_k,
+                'top_p': self.config.val_kwargs.top_p,
+                'temperature': self.config.val_kwargs.temperature,
+                'n': 1,  # if validate, already repeat in ray_trainer
+            }
+
 
         updated_sampling_params = deepcopy(self.sampling_params)
         for key, value in kwargs.items():
@@ -420,17 +466,19 @@ class vLLMRollout(BaseRollout):
         async def _async_generate():
             # Create all tasks
             tasks = [
-                self.generate_sequence_task(prompt_idx, prompt_tokens, updated_sampling_params) for prompt_idx, prompt_tokens in enumerate(idx_list)
+                self.generate_sequence_task(prompt_idx, vllm_inputs[prompt_idx], updated_sampling_params) for prompt_idx in range(batch_size)
             ]
             for completed_task in asyncio.as_completed(tasks):
-                prompt_idx, output  = await completed_task
+                prompt_idx, output = await completed_task
                 
                 # Process output
                 response = []
                 log_probs = []
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
-                    if hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
+                    if self.config.vllm_log_prob and \
+                        hasattr(output.outputs[sample_id], 'logprobs') and \
+                        output.outputs[sample_id].logprobs is not None:
                         log_prob_list = []
                         for log_prob in output.outputs[sample_id].logprobs:
                             log_prob_list.append(next(iter(log_prob.values())).logprob)
@@ -454,20 +502,21 @@ class vLLMRollout(BaseRollout):
                     non_tensor_batch[key] = single_val
                 # Handle multiple samples per prompt when n > 1 and sampling
                 if self.config.n > 1 and do_sample:
-                    single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
-                    single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
-                    single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)
+                    single_idx = _repeat_interleave(single_idx, self.sampling_params.n)
+                    single_attention_mask = _repeat_interleave(single_attention_mask, self.sampling_params.n)
+                    single_position_ids = _repeat_interleave(single_position_ids, self.sampling_params.n)
                     # Create interleaved non_tensor_batch for this subset
                     for key, val in non_tensor_batch.items():
                         # Get single value and repeat n times
-                        repeated_val = np.repeat(val, self.config.n)
-                        non_tensor_batch[key] = repeated_val
+                        non_tensor_batch[key] = _repeat_interleave(val, self.sampling_params.n)
 
                 seq = torch.cat([single_idx, response], dim=-1)
                 
                 response_length = response.size(1)
                 delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
                 delta_position_id = delta_position_id.unsqueeze(0).repeat(response.size(0), 1)
+                if position_ids.dim() == 3:  # qwen2vl mrope
+                    delta_position_id = delta_position_id.view(response.size(0), 1, -1).expand(response.size(0), 3, -1)
                 
                 response_position_ids = single_position_ids[:, -1:] + delta_position_id
                 position_ids_out = torch.cat([single_position_ids, response_position_ids], dim=-1)
@@ -487,7 +536,7 @@ class vLLMRollout(BaseRollout):
                     batch['old_log_probs'] = log_probs
                 
                 
-                if self.reward_fn is not None and not is_validation:
+                if self.reward_fn is not None and not is_validate:
                     init_batch = DataProto(
                         batch=batch,
                         non_tensor_batch=non_tensor_batch,
@@ -541,12 +590,26 @@ class vLLMRollout(BaseRollout):
 
         batch_size = idx.size(0)
 
-        idx_list = [] # list of list, represents all input tokens in the batch
-        # parse idx from torch.Tensor to List[List[int]]
-        for i in range(batch_size):
-            idx_list.extend([_pre_process_inputs(self.pad_token_id, idx[i])])
+        non_tensor_batch = prompts.non_tensor_batch
+        if 'raw_prompt_ids' not in non_tensor_batch:
+            non_tensor_batch['raw_prompt_ids'] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+
+        if batch_size != len(non_tensor_batch['raw_prompt_ids']):
+            raise RuntimeError('vllm sharding manager is not work properly.')
+
+        if 'multi_modal_data' in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
+                                                        non_tensor_batch.pop('multi_modal_data')):
+                vllm_inputs.append({'prompt_token_ids': raw_prompt_ids, 'multi_modal_data': multi_modal_data})
+        else:
+            vllm_inputs = [{
+                'prompt_token_ids': raw_prompt_ids
+            } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
 
         do_sample = prompts.meta_info.get('do_sample', True)
+        is_validate = prompts.meta_info.get('validate', False)
         if not do_sample:
             kwargs = {
                 'best_of': 1,
@@ -556,10 +619,14 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
-        is_validation = False
-        if prompts.meta_info.get('val_temperature', None):
-            kwargs['temperature'] = prompts.meta_info['val_temperature']
-            is_validation = True
+        elif is_validate:
+            # TODO: try **
+            kwargs = {
+                'top_k': self.config.val_kwargs.top_k,
+                'top_p': self.config.val_kwargs.top_p,
+                'temperature': self.config.val_kwargs.temperature,
+                'n': 1,  # if validate, already repeat in ray_trainer
+            }
 
         updated_sampling_params = deepcopy(self.sampling_params)
         for key, value in kwargs.items():
@@ -577,8 +644,9 @@ class vLLMRollout(BaseRollout):
             # return {"content": tool_call_result}
 
         # Main function to process single prompt
-        async def _generate_single_prompt_vectorized(prompt_idx: int, prompt_tokens: List[int]):
+        async def _generate_single_prompt_vectorized(prompt_idx: int, vllm_inputs: List[Dict[str, Any]]):
             """Process a single prompt with potential tool calls."""
+            prompt_tokens = vllm_inputs[prompt_idx]['prompt_token_ids']
             max_token_limit = self.config.response_length + len(prompt_tokens)
             max_response_token_limit = self.config.response_length 
        
@@ -590,7 +658,7 @@ class vLLMRollout(BaseRollout):
             # updated_sampling_params.stop_token_ids = [self.tokenizer.eos_token_id]
 
             n_rollouts = self.config.n
-            if is_validation:
+            if is_validate:
                 # validation data is already repeated in the outer loop
                 n_rollouts = 1
 
@@ -599,10 +667,12 @@ class vLLMRollout(BaseRollout):
             all_log_probs: List[List[float]] = [[] for _ in range(n_rollouts)]
             all_tool_call_masks: List[List[int]] = [[] for _ in range(n_rollouts)]
             all_dones = [False for _ in range(n_rollouts)]
+            all_tool_call_counts = [0 for _ in range(n_rollouts)]
             has_tool_calls = [False for _ in range(n_rollouts)]  
 
             for _ in range(self.config.max_tool_calls):
-                gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, generation_tokens, updated_sampling_params) for idx, generation_tokens in enumerate(all_tokens) if not all_dones[idx]])
+                gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, vllm_inputs[idx], updated_sampling_params) \
+                                                          for idx in range(len(vllm_inputs)) if not all_dones[idx]])
         
                 for gen_idx, gen_output in gathered_outputs:
                     output = gen_output.outputs[0]
@@ -620,6 +690,7 @@ class vLLMRollout(BaseRollout):
                         tool_call = tool_calls[-1]
                         toolcall_result = await _apply_tool(tool_call)
                         if not isinstance(toolcall_result['content'], str):
+                            # Timeout can return a Tuple
                             toolcall_result['content'] = str(toolcall_result['content'])
                         toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
                         result_tokens = self.tokenizer.encode(toolcall_result_with_special_token, add_special_tokens=False)
@@ -630,7 +701,10 @@ class vLLMRollout(BaseRollout):
                         all_log_probs[gen_idx].extend([0.0] * (len(result_tokens)))
                         all_tool_call_masks[gen_idx].extend([1] * (len(cur_token_ids)))
                         all_tool_call_masks[gen_idx].extend([0] * (len(result_tokens)))
+                        all_tool_call_counts[gen_idx] += 1
                         has_tool_calls[gen_idx] = True
+                        if all_tool_call_counts[gen_idx] >= self.config.max_tool_calls:
+                            all_dones[gen_idx] = True
                     else:
                         # Update running statistics.
                         all_tokens[gen_idx].extend(cur_token_ids)
@@ -639,12 +713,12 @@ class vLLMRollout(BaseRollout):
                         all_dones[gen_idx] = True
 
                     # If sequences has hit the max token limit, truncate the sequence and mark as done.
-                    # @TODO(mluo): If the generation has too many tests, we should stop the generation.
                     if len(all_tokens[gen_idx]) >= max_token_limit:
                         all_tokens[gen_idx] = all_tokens[gen_idx][:max_token_limit]
                         all_log_probs[gen_idx] = all_log_probs[gen_idx][:max_response_token_limit]
                         all_tool_call_masks[gen_idx] = all_tool_call_masks[gen_idx][:max_response_token_limit]
                         all_dones[gen_idx] = True
+                print(all_tool_call_counts)
                 # Break out of the loop if all generations have terminated.
                 if all(all_dones):
                     break
@@ -659,8 +733,8 @@ class vLLMRollout(BaseRollout):
         async def _async_generate():
             # Create all tasks
             tasks = [
-                _generate_single_prompt_vectorized(prompt_idx, prompt_tokens)
-                for prompt_idx, prompt_tokens in enumerate(idx_list)
+                _generate_single_prompt_vectorized(prompt_idx, vllm_inputs)
+                for prompt_idx in range(batch_size)
             ]
 
             # Use as_completed to yield results as they finish
@@ -696,15 +770,14 @@ class vLLMRollout(BaseRollout):
                     non_tensor_batch[key] = single_val
 
                 # Handle multiple samples per prompt when n > 1 and sampling
-                if self.config.n > 1 and not is_validation:
+                if self.config.n > 1 and do_sample:
                     single_idx = single_idx.repeat_interleave(self.config.n, dim=0)
                     single_attention_mask = single_attention_mask.repeat_interleave(self.config.n, dim=0)
                     single_position_ids = single_position_ids.repeat_interleave(self.config.n, dim=0)
                     # Create interleaved non_tensor_batch for this subset
                     for key, val in non_tensor_batch.items():
                         # Get single value and repeat n times
-                        repeated_val = np.repeat(val, self.config.n)
-                        non_tensor_batch[key] = repeated_val
+                        non_tensor_batch[key] = _repeat_interleave(val, self.sampling_params.n)
                 
                 # adding has_toolcall to the extra_info so that reward fn can assign bonus
                 for i, info in enumerate(non_tensor_batch['extra_info']):
@@ -715,6 +788,8 @@ class vLLMRollout(BaseRollout):
                 response_length = response.size(1)
                 delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
                 delta_position_id = delta_position_id.unsqueeze(0).repeat(response.size(0), 1)
+                if position_ids.dim() == 3:  # qwen2vl mrope
+                    delta_position_id = delta_position_id.view(response.size(0), 1, -1).expand(response.size(0), 3, -1)
                 
                 response_position_ids = single_position_ids[:, -1:] + delta_position_id
                 position_ids_out = torch.cat([single_position_ids, response_position_ids], dim=-1)
@@ -735,7 +810,7 @@ class vLLMRollout(BaseRollout):
                 if self.config.vllm_log_prob:
                     batch['old_log_probs'] = log_probs
                 
-                if self.reward_fn is not None and not is_validation:
+                if self.reward_fn is not None and not is_validate:
                     init_batch = DataProto(
                         batch=batch,
                         non_tensor_batch=non_tensor_batch,
