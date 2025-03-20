@@ -671,8 +671,8 @@ class vLLMRollout(BaseRollout):
             has_tool_calls = [False for _ in range(n_rollouts)]  
 
             for _ in range(self.config.max_tool_calls):
-                gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, vllm_inputs[idx], updated_sampling_params) \
-                                                          for idx in range(len(vllm_inputs)) if not all_dones[idx]])
+                gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, vllm_inputs[prompt_idx], updated_sampling_params) \
+                                                          for idx in range(n_rollouts) if not all_dones[idx]])
         
                 for gen_idx, gen_output in gathered_outputs:
                     output = gen_output.outputs[0]
@@ -718,7 +718,6 @@ class vLLMRollout(BaseRollout):
                         all_log_probs[gen_idx] = all_log_probs[gen_idx][:max_response_token_limit]
                         all_tool_call_masks[gen_idx] = all_tool_call_masks[gen_idx][:max_response_token_limit]
                         all_dones[gen_idx] = True
-                print(all_tool_call_counts)
                 # Break out of the loop if all generations have terminated.
                 if all(all_dones):
                     break
