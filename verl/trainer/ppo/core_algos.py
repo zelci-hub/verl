@@ -153,6 +153,47 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
 
     return scores, scores
 
+def compute_loop_outcome_advantage(token_level_rewards: torch.Tensor,
+                                   eos_mask: torch.Tensor,
+                                   index: torch.Tensor):
+    """
+    Compute advantage for LOOP which is same as GRPO without normalization based on https://arxiv.org/pdf/2502.01600
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    response_length = token_level_rewards.shape[-1]
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2samples = defaultdict(list)
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2samples[index[i]].append((i, scores[i]))
+        for group in id2samples.values():
+            group_size = len(group)
+            total_score = sum(score for _, score in group)
+            for i, score in group: # i is original index
+                loo_baseline = 0
+                if group_size == 1:
+                    print("Cannot compute LOO advantage using 1 sample. 0 baseline is used")
+                else:
+                    loo_baseline = (total_score - score) / (group_size - 1)
+                scores[i] = score - loo_baseline
+        
+        scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
+
+    return scores, scores
+
 
 def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    eos_mask: torch.Tensor,
