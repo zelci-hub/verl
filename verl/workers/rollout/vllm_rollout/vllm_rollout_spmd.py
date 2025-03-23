@@ -635,13 +635,13 @@ class vLLMRollout(BaseRollout):
 
         # Helper function to call tools
         async def _apply_tool(tool_call, id=None):
-            if id is not None:
-                tool_call["parameters"]["id"] = id
-            tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
-            return tool_call_result
-            # from rllm.rewards.code_utils.livecodebench import run_code
-            # tool_call_result = run_code(tool_call["parameters"]["code"])
-            # return {"content": tool_call_result}
+            # if id is not None:
+            #     tool_call["parameters"]["id"] = id
+            # tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
+            # return tool_call_result
+            from rllm.rewards.code_utils.livecodebench import run_code
+            tool_call_result = run_code(tool_call["parameters"]["code"])
+            return {"content": tool_call_result}
 
         # Main function to process single prompt
         async def _generate_single_prompt_vectorized(prompt_idx: int, vllm_inputs: List[Dict[str, Any]]):
