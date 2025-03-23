@@ -207,7 +207,7 @@ class vLLMRollout(BaseRollout):
         self.interpreter = PythonInterpreter(n_sandboxes=2)
         self.tool_caller = ToolCaller(tools=[self.interpreter], parser_type="python")
 
-    async def generate_sequence_task(self, idx: int, prompt_tokens: Dict[str, Any], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
+    async def generate_sequence_task(self, idx: int, prompt_tokens: Union[Dict[str, Any], List[int]], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
         """Generate a sequence asynchronously using vLLM.
         
         This method creates an asynchronous task for generating text from the given prompt tokens.
@@ -224,6 +224,8 @@ class vLLMRollout(BaseRollout):
         """
         if sampling_params is None:
             sampling_params = self.sampling_params
+        if isinstance(prompt_tokens, list):
+            prompt_tokens = {'prompt_token_ids': prompt_tokens}
         task = self.inference_engine.generate(
                     prompt=TokensPrompt(**prompt_tokens),
                     sampling_params=sampling_params,
@@ -300,14 +302,15 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
-        elif is_validate:
+        
+        if is_validate:
             # TODO: try **
-            kwargs = {
+            kwargs.update({
                 'top_k': self.config.val_kwargs.top_k,
                 'top_p': self.config.val_kwargs.top_p,
                 'temperature': self.config.val_kwargs.temperature,
                 'n': 1,  # if validate, already repeat in ray_trainer
-            }
+            })
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -448,14 +451,15 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
-        elif is_validate:
+        
+        if is_validate:
             # TODO: try **
-            kwargs = {
+            kwargs.update({
                 'top_k': self.config.val_kwargs.top_k,
                 'top_p': self.config.val_kwargs.top_p,
                 'temperature': self.config.val_kwargs.temperature,
                 'n': 1,  # if validate, already repeat in ray_trainer
-            }
+            })
 
 
         updated_sampling_params = deepcopy(self.sampling_params)
@@ -619,20 +623,20 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
-        elif is_validate:
+        
+        if is_validate:
             # TODO: try **
-            kwargs = {
+            kwargs.update({
                 'top_k': self.config.val_kwargs.top_k,
                 'top_p': self.config.val_kwargs.top_p,
                 'temperature': self.config.val_kwargs.temperature,
                 'n': 1,  # if validate, already repeat in ray_trainer
-            }
+            })
 
         updated_sampling_params = deepcopy(self.sampling_params)
         for key, value in kwargs.items():
             if hasattr(updated_sampling_params, key):
                 setattr(updated_sampling_params, key, value)
-
         # Helper function to call tools
         async def _apply_tool(tool_call, id=None):
             # if id is not None:
@@ -646,16 +650,16 @@ class vLLMRollout(BaseRollout):
         # Main function to process single prompt
         async def _generate_single_prompt_vectorized(prompt_idx: int, vllm_inputs: List[Dict[str, Any]]):
             """Process a single prompt with potential tool calls."""
-            prompt_tokens = vllm_inputs[prompt_idx]['prompt_token_ids']
+            prompt_tokens = list(vllm_inputs[prompt_idx]['prompt_token_ids'])
             max_token_limit = self.config.response_length + len(prompt_tokens)
             max_response_token_limit = self.config.response_length 
        
             # Treat each generation indpendently by creating self.config.n independent generations.
-            updated_sampling_params.stop = tool_stop_tokens
-            updated_sampling_params.include_stop_str_in_output = True
-            updated_sampling_params.n = 1
-            updated_sampling_params.detokenize = True
-            # updated_sampling_params.stop_token_ids = [self.tokenizer.eos_token_id]
+            updated_local_sampling_params = deepcopy(updated_sampling_params)
+            updated_local_sampling_params.stop = tool_stop_tokens
+            updated_local_sampling_params.include_stop_str_in_output = True
+            updated_local_sampling_params.n = 1
+            updated_local_sampling_params.detokenize = True
 
             n_rollouts = self.config.n
             if is_validate:
@@ -671,7 +675,9 @@ class vLLMRollout(BaseRollout):
             has_tool_calls = [False for _ in range(n_rollouts)]  
 
             for _ in range(self.config.max_tool_calls):
-                gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, vllm_inputs[prompt_idx], updated_sampling_params) \
+                updated_local_sampling_params.max_tokens = max_token_limit - min([len(t) for idx,t in enumerate(all_tokens) if not all_dones[idx]])
+                print(updated_local_sampling_params.max_tokens)
+                gathered_outputs = await asyncio.gather(*[self.generate_sequence_task(idx, all_tokens[idx], updated_local_sampling_params) \
                                                           for idx in range(n_rollouts) if not all_dones[idx]])
         
                 for gen_idx, gen_output in gathered_outputs:
@@ -694,6 +700,7 @@ class vLLMRollout(BaseRollout):
                             toolcall_result['content'] = str(toolcall_result['content'])
                         toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
                         result_tokens = self.tokenizer.encode(toolcall_result_with_special_token, add_special_tokens=False)
+                        result_tokens = list(result_tokens)
                         
                         # Update running statistics.
                         all_tokens[gen_idx].extend(cur_token_ids + result_tokens)
@@ -777,10 +784,11 @@ class vLLMRollout(BaseRollout):
                     for key, val in non_tensor_batch.items():
                         # Get single value and repeat n times
                         non_tensor_batch[key] = _repeat_interleave(val, self.sampling_params.n)
-                
+
                 # adding has_toolcall to the extra_info so that reward fn can assign bonus
                 for i, info in enumerate(non_tensor_batch['extra_info']):
                     info['has_toolcall'] = has_tool_calls[i]
+
 
                 seq = torch.cat([single_idx, response], dim=-1)
                 

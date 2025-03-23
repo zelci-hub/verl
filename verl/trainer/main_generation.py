@@ -148,7 +148,6 @@ def run_generation(config):
             'recompute_log_prob': False,
             'do_sample': False,
             'validate': True,
-            'val_temperature': config.rollout.temperature,
         }
         test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, rollout_wg.world_size)
         test_output_gen_batch_padded = rollout_wg.generate_sequences(test_batch_padded)

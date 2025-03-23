@@ -525,10 +525,6 @@ class RayPPOTrainer(object):
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
-            # repeat test batch
-            test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n,
-                                           interleave=True)
-
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch['reward_model']['style'] == 'model':
                 return {}
@@ -548,16 +544,14 @@ class RayPPOTrainer(object):
                 'validate': True,
             }
             print(f'test_batch meta info: {test_batch.meta_info}')
-            # pad to be divisible by dp_size
-            if self.hybrid_engine:
-                test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.actor_rollout_wg.world_size)
-            else:
-                test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, self.rollout_wg.world_size)
 
             if self.hybrid_engine:
                 validate_wg = self.actor_rollout_wg
             else:
                 validate_wg = self.rollout_wg
+            
+            # pad to be divisible by dp_size
+            test_batch_padded, pad_size = pad_dataproto_to_divisor(test_batch, validate_wg.world_size)
             
             if self.config.actor_rollout_ref.rollout.async_engine:
                 gen_seq_generator = validate_wg.generate_sequences_async(prompts=test_batch_padded)
@@ -585,7 +579,7 @@ class RayPPOTrainer(object):
             reward_tensor = self.val_reward_fn(test_batch)
 
             # Store scores
-            scores = reward_tensor.sum(-1).cpu().tolist()
+            scores = torch.clamp(reward_tensor.sum(-1), min=0.0,max=1.0).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_tensor_lst.append(reward_tensor)
@@ -593,7 +587,7 @@ class RayPPOTrainer(object):
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        reward_tensor = torch.clamp(torch.cat(reward_tensor_lst, dim=0).sum(-1), min=0.0, max=1.0).cpu()  # (batch_size,)
         data_sources = np.concatenate(data_source_lst, axis=0)
 
         # evaluate test_score based on data source
@@ -910,7 +904,6 @@ class RayPPOTrainer(object):
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
-
                         if not self.config.actor_rollout_ref.rollout.compute_reward:
                             reward_tensor = self.reward_fn(batch)
                             batch.batch['token_level_scores'] = reward_tensor
