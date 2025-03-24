@@ -274,7 +274,7 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
 
         non_tensor_batch = prompts.non_tensor_batch
-        if 'raw_prompt_ids' not in non_tensor_batch:
+        if 'raw_prompt_ids' not in non_tensor_batch or True:
             non_tensor_batch['raw_prompt_ids'] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
 
@@ -285,11 +285,13 @@ class vLLMRollout(BaseRollout):
             vllm_inputs = []
             for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
                                                         non_tensor_batch.pop('multi_modal_data')):
-                vllm_inputs.append({'prompt_token_ids': raw_prompt_ids, 'multi_modal_data': multi_modal_data})
+                vllm_inputs.append({'prompt_token_ids': raw_prompt_ids if raw_prompt_ids is not None else [], 'multi_modal_data': multi_modal_data})
         else:
             vllm_inputs = [{
-                'prompt_token_ids': raw_prompt_ids
+                'prompt_token_ids': raw_prompt_ids if raw_prompt_ids is not None else []
             } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
+        
+        vllm_inputs = [TokensPrompt(**vllm_input) for vllm_input in vllm_inputs]
 
         do_sample = prompts.meta_info.get('do_sample', True)
         is_validate = prompts.meta_info.get('validate', False)
@@ -423,7 +425,7 @@ class vLLMRollout(BaseRollout):
 
         batch_size = idx.size(0)
         non_tensor_batch = prompts.non_tensor_batch
-        if 'raw_prompt_ids' not in non_tensor_batch:
+        if 'raw_prompt_ids' not in non_tensor_batch or True:
             non_tensor_batch['raw_prompt_ids'] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
 
@@ -595,7 +597,7 @@ class vLLMRollout(BaseRollout):
         batch_size = idx.size(0)
 
         non_tensor_batch = prompts.non_tensor_batch
-        if 'raw_prompt_ids' not in non_tensor_batch:
+        if 'raw_prompt_ids' not in non_tensor_batch or True:
             non_tensor_batch['raw_prompt_ids'] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
 
