@@ -304,7 +304,10 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
-        
+
+        if prompts.meta_info.get('agent_rollout', False):
+            kwargs['n'] = 1
+
         if is_validate:
             # TODO: try **
             kwargs.update({
@@ -342,7 +345,7 @@ class vLLMRollout(BaseRollout):
                                             max_length=self.config.response_length).to(idx.device)
 
         non_tensor_batch = deepcopy(prompts.non_tensor_batch)
-        if self.sampling_params.n > 1 and do_sample:
+        if self.sampling_params.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
             idx = _repeat_interleave(idx, self.sampling_params.n)
             attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
             position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
@@ -453,6 +456,9 @@ class vLLMRollout(BaseRollout):
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
             }
+            
+        if prompts.meta_info.get('agent_rollout', False):
+            kwargs['n'] = 1
         
         if is_validate:
             # TODO: try **
@@ -507,7 +513,7 @@ class vLLMRollout(BaseRollout):
                     single_val = val[prompt_idx:prompt_idx+1]
                     non_tensor_batch[key] = single_val
                 # Handle multiple samples per prompt when n > 1 and sampling
-                if self.config.n > 1 and do_sample:
+                if self.config.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
                     single_idx = _repeat_interleave(single_idx, self.sampling_params.n)
                     single_attention_mask = _repeat_interleave(single_attention_mask, self.sampling_params.n)
                     single_position_ids = _repeat_interleave(single_position_ids, self.sampling_params.n)

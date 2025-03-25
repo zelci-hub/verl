@@ -71,7 +71,7 @@ actor_rollout_ref:
     name: vllm
     compute_reward: False # Samplers trajectories and compute rewards on rollout worker (not main).
     vllm_log_prob: True # Append log_prob from vllm rollout, disables FSDP log_prob.
-    async_engine: True # Enable async engine for vllm rollout.
+    async_engine: True # Enable async engine for vllm rollout. Must be False for non-pipelined agent training.
     enable_tools: False # Enable tools for rollout.
     max_tool_calls: 10 # Maximum number of tool calls per response.
     temperature: 1.0
@@ -202,3 +202,13 @@ trainer:
   remove_previous_ckpt_in_save: False
   del_local_ckpt_after_load: False
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+
+env:
+  name: browsergym
+  subtask: miniwob
+  miniwob_url: "file://<PATH_TO_MINIWOB_CLONED_REPO>/miniwob/html/miniwob/" 
+
+agent:
+  name: webagent
+  trajectory_episode_len: 20
+  max_trajectory_length: 8000

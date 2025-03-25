@@ -235,6 +235,8 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        if 'traj_mask' in data.batch:
+            select_keys.append('traj_mask')
         if 'tool_call_mask' in data.batch:
             select_keys.append('tool_call_mask')
         batch = data.select(batch_keys=select_keys).batch
@@ -278,6 +280,8 @@ class DataParallelPPOActor(BasePPOActor):
                     response_length = responses.size(1)
                     attention_mask = data['attention_mask']
                     response_mask = attention_mask[:, -response_length:]
+                    if "traj_mask" in data:
+                        response_mask = data['traj_mask']
                     if "tool_call_mask" in data:
                         response_mask = data['tool_call_mask']
                     old_log_prob = data['old_log_probs']
@@ -345,6 +349,8 @@ class DataParallelPPOActor(BasePPOActor):
         select_keys = ['responses', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        if 'traj_mask' in data.batch:
+            select_keys.append('traj_mask')
         if 'tool_call_mask' in data.batch:
             select_keys.append('tool_call_mask')
         mini_batch = data.select(batch_keys=select_keys).batch
@@ -367,6 +373,8 @@ class DataParallelPPOActor(BasePPOActor):
             response_length = responses.size(1)
             attention_mask = data['attention_mask']
             response_mask = attention_mask[:, -response_length:]
+            if "traj_mask" in data:
+                response_mask = data['traj_mask']
             if "tool_call_mask" in data:
                 response_mask = data['tool_call_mask']
             old_log_prob = data['old_log_probs']
