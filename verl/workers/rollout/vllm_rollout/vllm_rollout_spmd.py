@@ -40,7 +40,9 @@ import uuid
 from omegaconf import DictConfig
 from tensordict import TensorDict
 
-from rllm.environments.tools import PythonInterpreter, ToolCaller
+from rllm.tools.multi_tool import MultiTool
+from rllm.parser import get_tool_parser
+from rllm.tools.tool_base import ToolOutputs
 from torch import nn
 from typing import Any, Dict, Union
 from verl import DataProto
@@ -204,8 +206,11 @@ class vLLMRollout(BaseRollout):
 
         self.pad_token_id = tokenizer.pad_token_id
         self.tokenizer = tokenizer
-        self.interpreter = PythonInterpreter(n_sandboxes=2)
-        self.tool_caller = ToolCaller(tools=[self.interpreter], parser_type="python")
+        
+        if self.config.tools:
+            self.tool_caller = MultiTool(tools=self.config.tools)
+            parser_class = get_tool_parser(self.config.tool_parser)
+            self.tool_parser = parser_class(tokenizer=self.tokenizer)
 
     async def generate_sequence_task(self, idx: int, prompt_tokens: Union[Dict[str, Any], List[int]], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
         """Generate a sequence asynchronously using vLLM.
@@ -587,10 +592,7 @@ class vLLMRollout(BaseRollout):
         assert self.config.async_engine, "generate_sequences_async_tool requires `async_engine=True`"
 
         tool_stop_tokens = ["```\n\n"]
-        tool_start_tokens = ["```python"]
 
-        tool_response_start_tokens = ["```output\n"]
-        tool_response_stop_tokens = ["\n```\n"]
         # rebuild vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.init_cache_engine()
@@ -645,15 +647,6 @@ class vLLMRollout(BaseRollout):
         for key, value in kwargs.items():
             if hasattr(updated_sampling_params, key):
                 setattr(updated_sampling_params, key, value)
-        # Helper function to call tools
-        async def _apply_tool(tool_call, id=None):
-            # if id is not None:
-            #     tool_call["parameters"]["id"] = id
-            # tool_call_result = await self.tool_caller(tool_call["name"], tool_call["parameters"])
-            # return tool_call_result
-            from rllm.rewards.code_utils.livecodebench import run_code
-            tool_call_result = run_code(tool_call["parameters"]["code"])
-            return {"content": tool_call_result}
 
         # Main function to process single prompt
         async def _generate_single_prompt_vectorized(prompt_idx: int, vllm_inputs: List[Dict[str, Any]]):
@@ -698,16 +691,15 @@ class vLLMRollout(BaseRollout):
                         cur_logprob = [0.0] * len(output.token_ids)
 
                     cur_text = self.tokenizer.decode(cur_token_ids)
-                    tool_calls = self.tool_caller.parse_tool_calls(cur_text)                    
+                    
+                    tool_calls =  self.tool_parser.parse_input(cur_text)                
 
-                    if len(tool_calls) > 0:
-                        tool_call = tool_calls[-1]
-                        toolcall_result = await _apply_tool(tool_call)
-                        if not isinstance(toolcall_result['content'], str):
-                            # Timeout can return a Tuple
-                            toolcall_result['content'] = str(toolcall_result['content'])
-                        toolcall_result_with_special_token = "\n" + tool_response_start_tokens[0] + toolcall_result['content'] + tool_response_stop_tokens[0]
-                        result_tokens = self.tokenizer.encode(toolcall_result_with_special_token, add_special_tokens=False)
+                    if tool_calls.inputs:
+                        tool_outputs = [self.tool_caller(**tool_call.parameters, tool_name=tool_call.name) for tool_call in tool_calls.inputs]
+                        tool_outputs = ToolOutputs(outputs=tool_outputs)
+                        tool_outputs_str = self.tool_parser.parse_output(tool_outputs)
+                        
+                        result_tokens = self.tokenizer.encode(tool_outputs_str, add_special_tokens=False)
                         result_tokens = list(result_tokens)
                         
                         # Update running statistics.
