@@ -27,17 +27,21 @@ from verl.trainer.ppo.ray_trainer_agent import RayPPOAgentTrainer
 
 from rllm.environments.browsergym import BatchBrowserGym
 from rllm.environments.frozenlake.frozenlake import BatchFrozenLakeEnv
+from rllm.environments.swe.swe import BatchSWEEnv
 from rllm.models.web_agent import WebAgent
 from rllm.models.frozenlake_agent import FrozenLakeAgent
+from rllm.models.swe_agent import SWEAgent
 
 ENV_CLASS_MAPPING = {
     'browsergym': BatchBrowserGym,
     'frozenlake': BatchFrozenLakeEnv,
+    'sweenv': BatchSWEEnv,
 }
 
 AGENT_CLASS_MAPPING = {
     'webagent': WebAgent,
     'frozenlakeagent': FrozenLakeAgent,
+    'sweagent': SWEAgent,
 }
 
 def setup_environment(config):
@@ -50,6 +54,8 @@ def setup_environment(config):
             os.environ["MINIWOB_URL"] = config.env.miniwob_url
             return
     elif config.env.name == 'frozenlake':
+        return
+    elif config.env.name == "sweenv":
         return
 
     raise ValueError(f"Environment subtask not supported, env: {config.env.name}, subtask: {config.env.subtask == 'miniwob'}")
