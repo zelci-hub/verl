@@ -194,8 +194,8 @@ class RayPPOPipelineTrainer(RayPPOTrainer):
                             mini_batch = compute_advantage(mini_batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  num_repeat=self.config.actor_rollout_ref.rollout.n)
+                                                  lam=self.config.algorithm.lam,)
+                                                  #num_repeat=self.config.actor_rollout_ref.rollout.n)
 
                         self._balance_batch(mini_batch, metrics=mini_batch_metrics)
                         # compute global_valid tokens
