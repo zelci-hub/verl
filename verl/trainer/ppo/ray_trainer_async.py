@@ -224,7 +224,7 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                             batch = dataprotoitem_to_dataproto(batch)
 
                         
-                        if self.config.actor_rollout_ref.rollout.vllm_log_prob:
+                        if self.config.actor_rollout_ref.rollout.enable_log_prob:
                             # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
                             batch.meta_info['micro_batch_size'] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
                             batch.meta_info['max_token_len'] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu

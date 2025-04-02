@@ -70,7 +70,7 @@ actor_rollout_ref:
   rollout:
     name: vllm
     compute_reward: False # Samplers trajectories and compute rewards on rollout worker (not main).
-    vllm_log_prob: True # Append log_prob from vllm rollout, disables FSDP log_prob.
+    enable_log_prob: True # Append log_prob from vllm rollout, disables FSDP log_prob.
     async_engine: True # Enable async engine for vllm rollout. Must be False for non-pipelined agent training.
     # Tool Config for vLLM Rollout!
     #==============================================

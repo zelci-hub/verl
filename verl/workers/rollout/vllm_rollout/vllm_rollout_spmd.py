@@ -335,7 +335,7 @@ class vLLMRollout(BaseRollout):
         for output in outputs:
             for sample_id in range(len(output.outputs)):
                 response.append(output.outputs[sample_id].token_ids)
-                if self.config.vllm_log_prob and hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
+                if self.config.enable_log_prob and hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
                     # Directly use the list of floats returned by vLLM
                     log_prob_list = []
                     for log_prob in output.outputs[sample_id].logprobs:
@@ -343,9 +343,10 @@ class vLLMRollout(BaseRollout):
                     log_probs.append(log_prob_list)
                 else:
                     log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
+        
         response = pad_2d_list_to_length(response, self.pad_token_id,
                                          max_length=self.config.response_length).to(idx.device)
-        if self.config.vllm_log_prob:
+        if self.config.enable_log_prob:
             log_probs = pad_2d_list_to_length(log_probs, 0.0,
                                             max_length=self.config.response_length).to(idx.device)
 
@@ -388,7 +389,7 @@ class vLLMRollout(BaseRollout):
                 'position_ids': position_ids
             },
             batch_size=batch_size)
-        if self.config.vllm_log_prob:
+        if self.config.enable_log_prob:
             batch['old_log_probs'] = log_probs
         
         # free vllm cache engine
@@ -493,7 +494,7 @@ class vLLMRollout(BaseRollout):
                 log_probs = []
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
-                    if self.config.vllm_log_prob and \
+                    if self.config.enable_log_prob and \
                         hasattr(output.outputs[sample_id], 'logprobs') and \
                         output.outputs[sample_id].logprobs is not None:
                         log_prob_list = []
@@ -549,7 +550,7 @@ class vLLMRollout(BaseRollout):
                         'position_ids': position_ids_out
                     },
                     batch_size=response.size(0))
-                if self.config.vllm_log_prob:
+                if self.config.enable_log_prob:
                     batch['old_log_probs'] = log_probs
                 
                 
@@ -814,7 +815,7 @@ class vLLMRollout(BaseRollout):
                     },
                     batch_size=response.size(0))
 
-                if self.config.vllm_log_prob:
+                if self.config.enable_log_prob:
                     batch['old_log_probs'] = log_probs
                 
                 if self.reward_fn is not None and not is_validate:

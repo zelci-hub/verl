@@ -371,7 +371,9 @@ class ActorRolloutRefWorker(Worker):
             rollout = SGLangRollout(actor_module=self.config.model.path,
                                     config=self.config.rollout,
                                     tokenizer=self.tokenizer,
-                                    model_hf_config=self.actor_model_config)
+                                    model_hf_config=self.actor_model_config,
+                                    reward_fn=self.reward_fn,
+                                    val_reward_fn=self.val_reward_fn)
             log_gpu_memory_usage(f'After building {rollout_name} rollout', logger=None)
 
             if torch.distributed.get_world_size() == 1:

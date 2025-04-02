@@ -26,7 +26,10 @@
 # limitations under the License.
 
 from __future__ import annotations
+from copy import deepcopy
 import os
+from typing import Any, List, Union
+import numpy as np
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 from omegaconf import DictConfig
@@ -80,6 +83,12 @@ def _post_process_outputs(tokenizer, output):
         batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=pad_token_id)
     return batched_output_token_ids, batched_logprobs
 
+def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
+    if isinstance(value, torch.Tensor):
+        return value.repeat_interleave(repeats, dim=0)
+    else:
+        return np.repeat(value, repeats, axis=0)
+
 
 class SGLangRollout(BaseRollout):
 
@@ -89,6 +98,8 @@ class SGLangRollout(BaseRollout):
         config: DictConfig,
         tokenizer,
         model_hf_config,
+        reward_fn,
+        val_reward_fn,
         **kwargs,
     ):
         """A SGLang rollout. It requires the module is supported by the SGLang.
@@ -102,6 +113,8 @@ class SGLangRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
 
         # TODO(linjunrong.ocss884): this substitution is left for resolving SGLang conflict with ray devices
         # isolation, will solve in the future
@@ -146,6 +159,17 @@ class SGLangRollout(BaseRollout):
         tp_size = device_mesh_cpu["tp"].mesh.size()[0]
         src_rank = global_rank // tp_size * tp_size
 
+        max_num_batched_tokens = int(self.config.get('max_num_batched_tokens', 8192))
+        max_model_len = self.config.max_model_len if self.config.max_model_len \
+                        else config.prompt_length + config.response_length
+        max_model_len = int(max_model_len)
+
+        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+            raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+                             please increase max_num_batched_tokens or disable chunked prefill')
+
+
+
         self.inference_engine = VerlEngine(
             model_path=actor_module,
             dtype=config.dtype,
@@ -153,6 +177,9 @@ class SGLangRollout(BaseRollout):
             device_mesh_cpu=device_mesh_cpu["tp"],
             base_gpu_id=src_rank,
             gpu_id_step=1,
+            context_length=config.prompt_length + config.response_length,
+            chunked_prefill_size=max_num_batched_tokens,
+            enable_mixed_chunk=self.config.enable_chunked_prefill,
             # NOTE(Chenyang): if you want to debug the sglang engine
             # please set the following parameters
             # Otherwise, it will make the engine run too slow
@@ -215,14 +242,8 @@ class SGLangRollout(BaseRollout):
             idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
 
         do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get('validate', False)
         if not do_sample:
-            # kwargs = {
-            #     'top_p': 1.0,
-            #     'top_k': -1,
-            #     'min_p': 0.0,
-            #     'temperature': 0,
-            #     'n': 1  # if greedy, only 1 response
-            # }
             kwargs = dict(
                 n=1,
                 presence_penalty=0.0,
@@ -233,9 +254,17 @@ class SGLangRollout(BaseRollout):
                 top_k=-1,
                 ignore_eos=False,
                 min_new_tokens=0,
-                max_new_tokens=4096,
+                max_new_tokens=self.config.response_length,
                 skip_special_tokens=True,
                 spaces_between_special_tokens=True,
+            )
+        elif  is_validate:
+            # TODO: try **
+            kwargs = dict(
+                top_k=self.config.val_kwargs.top_k,
+                top_p=self.config.val_kwargs.top_p,
+                temperature=self.config.val_kwargs.temperature,
+                n=1,
             )
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -255,11 +284,19 @@ class SGLangRollout(BaseRollout):
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
             log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
+        
+        non_tensor_batch = deepcopy(prompts.non_tensor_batch)
         if self.config.n > 1 and do_sample:
             idx = idx.repeat_interleave(self.config.n, dim=0)
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
             batch_size = batch_size * self.config.n
+
+            non_tensor_batch = {}
+            for key, val in prompts.non_tensor_batch.items():
+                # Repeat each element n times (interleaved)
+                non_tensor_batch[key] = _repeat_interleave(val, self.config.n)
+        
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
@@ -281,15 +318,27 @@ class SGLangRollout(BaseRollout):
                 "prompts": idx,
                 "responses": response,
                 "input_ids": seq,  # here input_ids become the whole sentences
-                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
             },
             batch_size=batch_size,
         )
-
+        if self.config.enable_log_prob:
+            batch['old_log_probs'] = log_probs
+        
         # free cache engine
         if self.config.free_cache_engine and self.inference_engine._engine is not None:
             self.inference_engine._engine.tokenizer_manager.flush_cache()
 
-        return DataProto(batch=batch)
+        if self.reward_fn is not None and not is_validate:
+            init_batch = DataProto(
+                batch=batch,
+                non_tensor_batch=non_tensor_batch,
+                meta_info=prompts.meta_info
+            )
+            reward_tensor = self.reward_fn(init_batch)
+            batch['token_level_scores'] = reward_tensor
+
+        return DataProto(batch=batch,
+                         non_tensor_batch=non_tensor_batch,
+                         meta_info=prompts.meta_info)
