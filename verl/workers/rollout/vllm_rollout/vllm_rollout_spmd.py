@@ -207,10 +207,10 @@ class vLLMRollout(BaseRollout):
         self.pad_token_id = tokenizer.pad_token_id
         self.tokenizer = tokenizer
         
-        if self.config.tools:
-            self.tool_caller = MultiTool(tools=self.config.tools)
-            parser_class = get_tool_parser(self.config.tool_parser)
-            self.tool_parser = parser_class(tokenizer=self.tokenizer)
+        # if self.config.tools:
+        #     self.tool_caller = MultiTool(tools=self.config.tools)
+        #     parser_class = get_tool_parser(self.config.tool_parser)
+        #     self.tool_parser = parser_class(tokenizer=self.tokenizer)
 
     async def generate_sequence_task(self, idx: int, prompt_tokens: Union[Dict[str, Any], List[int]], sampling_params: SamplingParams = None) -> Tuple[int, RequestOutput]:
         """Generate a sequence asynchronously using vLLM.
@@ -255,6 +255,161 @@ class vLLMRollout(BaseRollout):
         # if len(old_sampling_params_args):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
+
+
+    @torch.no_grad()
+    async def generate(self, prompts: DataProto, **kwargs) -> DataProto:
+        idx = prompts.batch['input_ids']
+        attention_mask = prompts.batch['attention_mask']
+        position_ids = prompts.batch['position_ids']
+        eos_token_id = prompts.meta_info['eos_token_id']
+
+        batch_size = idx.size(0)
+        non_tensor_batch = prompts.non_tensor_batch
+        if 'raw_prompt_ids' not in non_tensor_batch or True:
+            non_tensor_batch['raw_prompt_ids'] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+
+        if batch_size != len(non_tensor_batch['raw_prompt_ids']):
+            raise RuntimeError('vllm sharding manager is not work properly.')
+
+        # Prepare vLLM inputs
+        if 'multi_modal_data' in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
+                                                        non_tensor_batch.pop('multi_modal_data')):
+                vllm_inputs.append({'prompt_token_ids': raw_prompt_ids if raw_prompt_ids is not None else [], 
+                                   'multi_modal_data': multi_modal_data})
+        else:
+            vllm_inputs = [{
+                'prompt_token_ids': raw_prompt_ids if raw_prompt_ids is not None else []
+            } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
+        
+        # Handle sampling parameters
+        do_sample = prompts.meta_info.get('do_sample', True)
+        is_validate = prompts.meta_info.get('validate', False)
+        
+        custom_kwargs = {}
+        if not do_sample:
+            custom_kwargs = {
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 0,
+                'n': 1  # if greedy, only 1 response
+            }
+
+        if prompts.meta_info.get('agent_rollout', False):
+            custom_kwargs['n'] = 1
+
+        if is_validate:
+            custom_kwargs.update({
+                'top_k': self.config.val_kwargs.top_k,
+                'top_p': self.config.val_kwargs.top_p,
+                'temperature': self.config.val_kwargs.temperature,
+                'n': 1,  # if validate, already repeat in ray_trainer
+            })
+            
+        # Update with any additional kwargs passed to this method
+        custom_kwargs.update(kwargs)
+        
+        # Create custom sampling params for this run
+        custom_sampling_params = deepcopy(self.sampling_params)
+        for key, value in custom_kwargs.items():
+            if hasattr(custom_sampling_params, key):
+                setattr(custom_sampling_params, key, value)
+        
+        # Process all prompts in parallel
+        tasks = [
+            self.generate_sequence_task(i, vllm_inputs[i], custom_sampling_params)
+            for i in range(batch_size)
+        ]
+        results = await asyncio.gather(*tasks)
+        
+        # Sort results by original index
+        results.sort(key=lambda x: x[0])
+        
+        # Extract token IDs and log probabilities
+        response = []
+        log_probs = []
+        for _, output in results:
+            for sample_id in range(len(output.outputs)):
+                response.append(output.outputs[sample_id].token_ids)
+                if self.config.vllm_log_prob and hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
+                    # Directly use the list of floats returned by vLLM
+                    log_prob_list = []
+                    for log_prob in output.outputs[sample_id].logprobs:
+                        log_prob_list.append(next(iter(log_prob.values())).logprob)
+                    log_probs.append(log_prob_list)
+                else:
+                    log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
+        
+        # Pad responses to uniform length
+        response = pad_2d_list_to_length(response, self.pad_token_id,
+                                        max_length=self.config.response_length).to(idx.device)
+        if self.config.vllm_log_prob:
+            log_probs = pad_2d_list_to_length(log_probs, 0.0,
+                                            max_length=self.config.response_length).to(idx.device)
+
+        # Handle multiple samples per prompt if needed
+        non_tensor_batch = deepcopy(prompts.non_tensor_batch)
+        if custom_sampling_params.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
+            idx = _repeat_interleave(idx, custom_sampling_params.n)
+            attention_mask = _repeat_interleave(attention_mask, custom_sampling_params.n)
+            position_ids = _repeat_interleave(position_ids, custom_sampling_params.n)
+            batch_size = batch_size * custom_sampling_params.n
+            
+            # Create interleaved non_tensor_batch
+            non_tensor_batch = {}
+            for key, val in prompts.non_tensor_batch.items():
+                # Repeat each element n times (interleaved)
+                non_tensor_batch[key] = _repeat_interleave(val, custom_sampling_params.n)
+
+        # Combine prompt and response
+        seq = torch.cat([idx, response], dim=-1)
+
+        # Update position IDs and attention mask
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
+        if position_ids.dim() == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
+
+        response_position_ids = position_ids[:, -1:] + delta_position_id
+        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
+
+        # Create output batch
+        batch = TensorDict(
+            {
+                'prompts': idx,
+                'responses': response,
+                'input_ids': seq,
+                'attention_mask': attention_mask,
+                'position_ids': position_ids
+            },
+            batch_size=batch_size)
+            
+        if self.config.vllm_log_prob:
+            batch['old_log_probs'] = log_probs
+        
+        # Apply reward function if needed
+        if self.reward_fn is not None and not is_validate:
+            init_batch = DataProto(
+                batch=batch,
+                non_tensor_batch=non_tensor_batch,
+                meta_info=prompts.meta_info
+            )
+            reward_tensor = self.reward_fn(init_batch)
+            batch['token_level_scores'] = reward_tensor
+        
+        return DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info=prompts.meta_info
+        )
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:

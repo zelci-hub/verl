@@ -14,6 +14,7 @@
 
 import time
 from typing import Dict, List, Any, Tuple
+import asyncio
 
 import ray
 from ray.util import list_named_actors
@@ -369,6 +370,25 @@ class RayWorkerGroup(WorkerGroup):
                 return result
 
         return [getattr(worker, method_name).remote(*args, **kwargs) for worker in self._workers]
+    
+    def execute_worker_async(self, worker_idx: int, method_name: str, *args, **kwargs):
+        """
+        Execute a method on a specific worker asynchronously.
+        
+        Args:
+            worker_idx: Index of the worker to execute the method on
+            method_name: Name of the method to call
+            *args: Positional arguments to pass to the method
+            **kwargs: Keyword arguments to pass to the method
+            
+        Returns:
+            Ray object reference to the result
+        """
+        if worker_idx < 0 or worker_idx >= len(self._workers):
+            raise IndexError(f"Worker index {worker_idx} out of range (0-{len(self._workers)-1})")
+            
+        remote_call = getattr(self._workers[worker_idx], method_name)
+        return remote_call.remote(*args, **kwargs)
 
     @property
     def master_address(self):
@@ -410,23 +430,31 @@ def _bind_workers_method_to_parent(cls, key, user_defined_cls):
             # if it is a property, it will fail because Class doesn't have instance property
             continue
 
-        if hasattr(method, MAGIC_ATTR):
+        # Check if the method should be exposed (either has MAGIC_ATTR or is a specific method we want to expose)
+        should_expose = hasattr(method, MAGIC_ATTR) or method_name in ['generate']
 
+        if should_expose:
             def generate_function(name):
-
-                def func(self, *args, **kwargs):
-                    # dispatch to the actual worker
-                    return getattr(self.worker_dict[key], name)(*args, **kwargs)
-
-                return func
+                method = getattr(user_defined_cls, name)
+                if asyncio.iscoroutinefunction(method):
+                    async def async_func(self, *args, **kwargs):
+                        return await getattr(self.worker_dict[key], name)(*args, **kwargs)
+                    return async_func
+                else:
+                    def func(self, *args, **kwargs):
+                        return getattr(self.worker_dict[key], name)(*args, **kwargs)
+                    return func
 
             func = generate_function(method_name)
-            # pass MAGIC_ATTR for outer worker group
-            setattr(func, MAGIC_ATTR, getattr(method, MAGIC_ATTR))
+            
+            # If the method has MAGIC_ATTR, pass it to the outer worker group
+            if hasattr(method, MAGIC_ATTR):
+                setattr(func, MAGIC_ATTR, getattr(method, MAGIC_ATTR))
+                
             try:
                 method_name_with_prefix = key + '_' + method_name
                 setattr(cls, method_name_with_prefix, func)
-                # print(f'Binding {method_name_with_prefix}')
+                print(f'Binding {method_name_with_prefix}')
             except Exception as e:
                 raise ValueError(f'Fail to set method_name {method_name}')
 
