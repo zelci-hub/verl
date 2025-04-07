@@ -28,7 +28,7 @@ from verl.single_controller.ray import (
 
 from rllm.environments.browsergym.browsergym import BrowserGym
 from rllm.models.web_agent import WebAgent
-from rllm.rllm.models.agent_execution_engine import AgentExecutionEngine
+from rllm.models.agent_execution_engine import AgentExecutionEngine
 
 AGENT_CLASS_MAPPING = {
     'webagent': WebAgent,

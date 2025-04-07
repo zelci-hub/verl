@@ -27,7 +27,7 @@ from verl.trainer.ppo.ray_trainer_agent import RayPPOAgentTrainer
 
 from rllm.environments.browsergym.browsergym import BatchBrowserGym, BrowserGym
 from rllm.environments.frozenlake.frozenlake import BatchFrozenLakeEnv, FrozenLakeEnv
-from rllm.environments.swe.swe import BatchSWEEnv, SWEEnv
+# from rllm.environments.swe.swe import BatchSWEEnv, SWEEnv
 from rllm.models.web_agent import WebAgent
 from rllm.models.frozenlake_agent import FrozenLakeAgent
 from rllm.models.swe_agent import SWEAgent
@@ -35,7 +35,7 @@ from rllm.models.swe_agent import SWEAgent
 ENV_CLASS_MAPPING = {
     'browsergym': BrowserGym,
     'frozenlake': FrozenLakeEnv,
-    'sweenv': SWEEnv,
+    # 'sweenv': SWEEnv,
 }
 
 AGENT_CLASS_MAPPING = {
