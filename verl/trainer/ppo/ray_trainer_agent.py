@@ -24,7 +24,7 @@ from verl.trainer.ppo.ray_trainer import (
     _timer,
 )
 
-from rllm.models.batch_agent import BatchAgent
+from rllm.rllm.models.agent_execution_engine import AgentExecutionEngine
 
 class RayPPOAgentTrainer(RayPPOTrainer):
 
@@ -58,24 +58,25 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         else:
             agent_rollout_wg = self.rollout_wg
         
-        self.agent = BatchAgent(
+        self.agent_execution_engine = AgentExecutionEngine(
             rollout_engine=agent_rollout_wg,
             engine_name="verl",
             tokenizer=self.tokenizer,
-            agent_class=self.agent_class,
             model_path=self.config.actor_rollout_ref.model.path,
             episode_len=self.config.agent.trajectory_episode_len,
             max_trajectory_length=self.config.agent.max_trajectory_length,
+            max_prompt_length=self.config.data.max_prompt_length,
         )
 
-    def init_env(self, batch):
+    def init_envs(self, batch):
         """
         Initialize environment depending on env_class with the necessary extra_info, also set uid of the batch.
         """
-        env = self.env_class.from_extra_infos(extra_infos=batch.non_tensor_batch["extra_info"].tolist())
-        batch.non_tensor_batch["uid"] = np.array(env.env_id, dtype=object)
+        env_args = batch.non_tensor_batch["extra_info"].tolist()
+        envs = [self.env_class.from_extra_info(env_args[i]) for i in range(len(env_args))]
+        batch.non_tensor_batch["uid"] = np.array([env.env_id for env in envs], dtype=object)
 
-        return env
+        return envs
 
     def fit_agent(self):
         """
@@ -129,11 +130,11 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                     "agent_rollout": True,  # no need to generate multiple ones since environment is repeated already
                 }
 
-                env = self.init_env(batch)
+                envs = self.init_envs(batch)
+                agents = [self.agent_class() for _ in range(len(envs))]
 
                 with _timer("step", timing_raw):
-                    final_gen_batch_output = self.generate_agent_trajectory(env, timing_raw=timing_raw, meta_info=batch.meta_info)
-                    env.close()
+                    final_gen_batch_output = self.generate_agent_trajectory(envs, agents, timing_raw=timing_raw, meta_info=batch.meta_info)
 
                     batch = batch.union(final_gen_batch_output)
                     ####################
@@ -380,12 +381,13 @@ class RayPPOAgentTrainer(RayPPOTrainer):
 
         return metric_dict
 
-    def generate_agent_trajectory(self, env, timing_raw={}, meta_info=None):
+    def generate_agent_trajectory(self, envs, agents, timing_raw={}, meta_info=None):
         """
         Generates agent trajectories by interacting with the environment. Does not close or reset the environment afterwards
 
         Args:
-            env: The environment in which the agent interacts.
+            envs: The environments in which the agent interacts.
+            agents: The agents to use for interation.
             timing_raw: Dictionary to store timing information for profiling.
             meta_info (optional): Metadata for veRL generation.
 
@@ -393,10 +395,10 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             DataProto: Representation of the agent's trajectories.
         """
         # Reset the agent.
-        self.agent.update_env(env)
+        self.agent_execution_engine.update_envs_and_agents(envs, agents)
         with _timer("collect_trajectory", timing_raw):
             # Interact_environment returns list of trajectories.
-            trajectories = self.agent.interact_environment(
+            trajectories = self.agent_execution_engine.interact_environment(
                 timing_raw=timing_raw, mode="Token", meta_info=meta_info
             )
 

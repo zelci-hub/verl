@@ -39,6 +39,8 @@ import torch.distributed
 import uuid
 from omegaconf import DictConfig
 from tensordict import TensorDict
+from concurrent.futures import Future
+import threading
 
 from rllm.tools.multi_tool import MultiTool
 from rllm.parser import get_tool_parser
@@ -166,6 +168,14 @@ class vLLMRollout(BaseRollout):
                     enable_prefix_caching=True
                 )
             )
+
+            # in case of async_engine for agent, we also initialize a status flag, a task queue, and a result future list.
+            # to make generate async multithread safe
+            # TODO: see if this is needed
+            self._loop = None
+            self._loop_thread = None
+            self._active_tasks = 0
+            self._active_tasks_lock = threading.Lock()
         else:     
             self.inference_engine = LLM(
                 model=model_path,
@@ -995,3 +1005,196 @@ class vLLMRollout(BaseRollout):
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
         return None
+
+
+
+    def _start_event_loop(self, batch_size):
+        def run_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_forever()
+
+        with self._active_tasks_lock:
+            original_active_tasks = self._active_tasks
+            self._active_tasks += batch_size
+            if original_active_tasks == 0: # newly initialized
+                if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+                    self.inference_engine.init_cache_engine()
+                self._loop_thread = threading.Thread(target=run_loop, daemon=True)
+                self._loop_thread.start()
+            else:
+                return
+        
+
+    @torch.no_grad()
+    async def generate_async(self, prompts: DataProto, **kwargs):
+        """
+        Submit a DataProto batch to the async engine. Each item in the batch becomes a separate Future.
+        """
+        assert self.config.async_engine, "generate_sequences_async_tool requires `async_engine=True`"
+        
+        batch_size = len(prompts)
+        # start event loop if it wasn't already started
+        self._start_event_loop(batch_size)
+
+        futures = [None for _ in range(batch_size)]
+        # process prompts so that each request in queue is self contained
+        idx = prompts.batch['input_ids']
+        attention_mask = prompts.batch['attention_mask']
+        position_ids = prompts.batch['position_ids']
+
+        batch_size = idx.size(0)
+        non_tensor_batch = prompts.non_tensor_batch
+        if 'raw_prompt_ids' not in non_tensor_batch or True:
+            non_tensor_batch['raw_prompt_ids'] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+
+        if batch_size != len(non_tensor_batch['raw_prompt_ids']):
+            raise RuntimeError('vllm sharding manager is not work properly.')
+
+        if 'multi_modal_data' in non_tensor_batch:
+            vllm_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
+                                                        non_tensor_batch.pop('multi_modal_data')):
+                vllm_inputs.append({'prompt_token_ids': raw_prompt_ids, 'multi_modal_data': multi_modal_data})
+        else:
+            vllm_inputs = [{
+                'prompt_token_ids': raw_prompt_ids
+            } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
+
+        do_sample = prompts.meta_info.get('do_sample', True)
+        is_validate = prompts.meta_info.get('validate', False)
+        if not do_sample:
+            kwargs = {
+                'best_of': 1,
+                'top_p': 1.0,
+                'top_k': -1,
+                'min_p': 0.0,
+                'temperature': 0,
+                'n': 1  # if greedy, only 1 response
+            }
+            
+        if prompts.meta_info.get('agent_rollout', False):
+            kwargs['n'] = 1
+        
+        if is_validate:
+            # TODO: try **
+            kwargs.update({
+                'top_k': self.config.val_kwargs.top_k,
+                'top_p': self.config.val_kwargs.top_p,
+                'temperature': self.config.val_kwargs.temperature,
+                'n': 1,  # if validate, already repeat in ray_trainer
+            })
+
+        updated_sampling_params = deepcopy(self.sampling_params)
+        for key, value in kwargs.items():
+            if hasattr(updated_sampling_params, key):
+                setattr(updated_sampling_params, key, value)
+
+        # placing requests into queue
+        for i in range(batch_size):
+            # pocess single sample
+            single_sample_non_tensor_batch = {}
+            for key, val in prompts.non_tensor_batch.items():
+                # Get single value and repeat n times
+                single_val = val[i:i+1]
+                single_sample_non_tensor_batch[key] = single_val
+
+            # collect all data needed to compose result
+            input_state = (idx[i:i+1], attention_mask[i:i+1], position_ids[i:i+1], vllm_inputs[i], updated_sampling_params, prompts.meta_info, is_validate, single_sample_non_tensor_batch, do_sample, idx.device, position_ids.device, position_ids.dim(), attention_mask.dtype)
+            assert self._loop, f"self._loop cannot be none, but got {self._loop}"
+            futures[i] = asyncio.run_coroutine_threadsafe(self._handle_request(input_state), self._loop)
+            futures[i].add_done_callback(self._on_done)
+
+        results = await asyncio.to_thread(lambda: [f.result() for f in futures.values()])
+        return results
+
+    def _on_done(self, fut):
+        print(f"on done is started")
+        with self._active_tasks_lock:
+            self._active_tasks -= 1
+            if self._active_tasks == 0:
+                if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+                    self.inference_engine.free_cache_engine()
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                print(f"loop should be done")
+
+        print(f"on done is done")
+
+    @torch.no_grad()
+    async def _handle_request(self, input_state):
+        # instead of using prompt_idx, future_id is used as position to get context for postprocessing
+        single_idx, single_attention_mask, single_position_ids, vllm_input, updated_sampling_param, meta_info, is_validate, non_tensor_batch, do_sample, idx_device, position_ids_device, position_ids_dim, attention_mask_dtype = input_state
+        _, output = await self.generate_sequence_task(0, vllm_input, updated_sampling_param)
+        # Process output
+        response = []
+        log_probs = []
+        for sample_id in range(len(output.outputs)):
+            response.append(output.outputs[sample_id].token_ids)
+            if self.config.vllm_log_prob and \
+                hasattr(output.outputs[sample_id], 'logprobs') and \
+                output.outputs[sample_id].logprobs is not None:
+                log_prob_list = []
+                for log_prob in output.outputs[sample_id].logprobs:
+                    log_prob_list.append(next(iter(log_prob.values())).logprob)
+                log_probs.append(log_prob_list)
+            else:
+                log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
+
+        response = pad_2d_list_to_length(response, self.pad_token_id,
+                                        max_length=self.config.response_length).to(idx_device)
+        log_probs = pad_2d_list_to_length(log_probs, 0.0,
+                                        max_length=self.config.response_length).to(idx_device)
+        
+        # Handle multiple samples per prompt when n > 1 and sampling
+        if self.config.n > 1 and do_sample and not meta_info.get('agent_rollout', False):
+            single_idx = _repeat_interleave(single_idx, self.sampling_params.n)
+            single_attention_mask = _repeat_interleave(single_attention_mask, self.sampling_params.n)
+            single_position_ids = _repeat_interleave(single_position_ids, self.sampling_params.n)
+            # Create interleaved non_tensor_batch for this subset
+            for key, val in non_tensor_batch.items():
+                # Get single value and repeat n times
+                non_tensor_batch[key] = _repeat_interleave(val, self.sampling_params.n)
+
+        seq = torch.cat([single_idx, response], dim=-1)
+        
+        response_length = response.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=position_ids_device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(response.size(0), 1)
+        if position_ids_dim == 3:  # qwen2vl mrope
+            delta_position_id = delta_position_id.view(response.size(0), 1, -1).expand(response.size(0), 3, -1)
+        
+        response_position_ids = single_position_ids[:, -1:] + delta_position_id
+        position_ids_out = torch.cat([single_position_ids, response_position_ids], dim=-1)
+        response_attention_mask = get_eos_mask(response_id=response, eos_token=meta_info['eos_token_id'], dtype=attention_mask_dtype)
+        attention_mask_out = torch.cat((single_attention_mask, response_attention_mask), dim=-1)
+
+        batch = TensorDict(
+            {
+                'prompts': single_idx,
+                'responses': response,
+                'input_ids': seq,
+                'attention_mask': attention_mask_out,
+                'position_ids': position_ids_out
+            },
+            batch_size=response.size(0))
+        if self.config.vllm_log_prob:
+            batch['old_log_probs'] = log_probs
+        
+        
+        if self.reward_fn is not None and not is_validate:
+            init_batch = DataProto(
+                batch=batch,
+                non_tensor_batch=non_tensor_batch,
+                meta_info=meta_info
+            )
+            reward_tensor = self.reward_fn(init_batch)
+            batch['token_level_scores'] = reward_tensor
+        
+        result = DataProto(
+            batch=batch,
+            non_tensor_batch=non_tensor_batch,
+            meta_info=meta_info
+        )
+        
+        return result

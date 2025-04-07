@@ -25,17 +25,17 @@ from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
 from verl.workers.reward_manager import NaiveRewardManager
 from verl.trainer.ppo.ray_trainer_agent import RayPPOAgentTrainer
 
-from rllm.environments.browsergym import BatchBrowserGym
-from rllm.environments.frozenlake.frozenlake import BatchFrozenLakeEnv
-from rllm.environments.swe.swe import BatchSWEEnv
+from rllm.environments.browsergym.browsergym import BatchBrowserGym, BrowserGym
+from rllm.environments.frozenlake.frozenlake import BatchFrozenLakeEnv, FrozenLakeEnv
+from rllm.environments.swe.swe import BatchSWEEnv, SWEEnv
 from rllm.models.web_agent import WebAgent
 from rllm.models.frozenlake_agent import FrozenLakeAgent
 from rllm.models.swe_agent import SWEAgent
 
 ENV_CLASS_MAPPING = {
-    'browsergym': BatchBrowserGym,
-    'frozenlake': BatchFrozenLakeEnv,
-    'sweenv': BatchSWEEnv,
+    'browsergym': BrowserGym,
+    'frozenlake': FrozenLakeEnv,
+    'sweenv': SWEEnv,
 }
 
 AGENT_CLASS_MAPPING = {
