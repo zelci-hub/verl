@@ -330,7 +330,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
                 "recompute_log_prob": False,
                 "do_sample": False,
                 "validate": True,
-                "val_temperature": self.config.actor_rollout_ref.rollout.val_temperature,
+                "val_temperature": self.config.actor_rollout_ref.rollout.val_kwargs.temperature,
                 "agent_rollout": True
             }
 

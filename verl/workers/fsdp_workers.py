@@ -802,11 +802,19 @@ class ActorRolloutRefWorker(Worker):
         prompts.meta_info.update(meta_info)
         prompts = self.rollout_sharding_manager.preprocess_data(prompts)
 
-        output = await self.rollout.submit_request(prompts=prompts, **kwargs)
-        output = self.rollout_sharding_manager.postprocess_data(output)
+        output = await self.rollout.generate_async(prompts=prompts, **kwargs) # gives a list of DataProto as result
+        output = [self.rollout_sharding_manager.postprocess_data(o) for o in output]
 
-        output = output.to('cpu')
+        output = [o.to('cpu') for o in output]
         log_gpu_memory_usage('After generation', logger=logger)
+
+        with self._generation_async_engine_lock:
+            self._generation_async_engine_status -= 1
+            if self._generation_async_engine_status == 0:
+                self.rollout_sharding_manager.__exit__(None, None, None)
+                torch.cuda.empty_cache()
+                log_gpu_memory_usage('After generate sequences', logger=logger)
+                
         return output
         
 

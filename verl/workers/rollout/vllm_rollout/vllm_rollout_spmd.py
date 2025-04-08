@@ -176,6 +176,8 @@ class vLLMRollout(BaseRollout):
             self._loop_thread = None
             self._active_tasks = 0
             self._active_tasks_lock = threading.Lock()
+            self._queue = None
+            self._started_process = False
         else:     
             self.inference_engine = LLM(
                 model=model_path,
@@ -1012,19 +1014,37 @@ class vLLMRollout(BaseRollout):
         def run_loop():
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
+            self._queue = asyncio.Queue()
+            self._loop.create_task(self._process_queue())
             self._loop.run_forever()
 
+
         with self._active_tasks_lock:
+            if not self._started_process:
+                self._loop_thread = threading.Thread(target=run_loop, daemon=True)
+                self._loop_thread.start()
+                self._started_process = True
+                
             original_active_tasks = self._active_tasks
             self._active_tasks += batch_size
             if original_active_tasks == 0: # newly initialized
                 if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
                     self.inference_engine.init_cache_engine()
-                self._loop_thread = threading.Thread(target=run_loop, daemon=True)
-                self._loop_thread.start()
             else:
                 return
         
+    async def _process_queue(self):
+        while True:
+            input_state, future = await self._queue.get()
+            asyncio.create_task(self._process_one(input_state, future))
+
+    async def _process_one(self, input_state, future):
+        try:
+            result = await self._handle_request(input_state)
+            future.set_result(result)
+        except Exception as e:
+            future.set_exception(e)
+
 
     @torch.no_grad()
     async def generate_async(self, prompts: DataProto, **kwargs):
@@ -1037,7 +1057,7 @@ class vLLMRollout(BaseRollout):
         # start event loop if it wasn't already started
         self._start_event_loop(batch_size)
 
-        futures = [None for _ in range(batch_size)]
+        futures = [Future() for _ in range(batch_size)]
         # process prompts so that each request in queue is self contained
         idx = prompts.batch['input_ids']
         attention_mask = prompts.batch['attention_mask']
@@ -1092,6 +1112,10 @@ class vLLMRollout(BaseRollout):
                 setattr(updated_sampling_params, key, value)
 
         # placing requests into queue
+        
+        while not self._started_process:
+            await asyncio.sleep(1)
+
         for i in range(batch_size):
             # pocess single sample
             single_sample_non_tensor_batch = {}
@@ -1103,23 +1127,23 @@ class vLLMRollout(BaseRollout):
             # collect all data needed to compose result
             input_state = (idx[i:i+1], attention_mask[i:i+1], position_ids[i:i+1], vllm_inputs[i], updated_sampling_params, prompts.meta_info, is_validate, single_sample_non_tensor_batch, do_sample, idx.device, position_ids.device, position_ids.dim(), attention_mask.dtype)
             assert self._loop, f"self._loop cannot be none, but got {self._loop}"
-            futures[i] = asyncio.run_coroutine_threadsafe(self._handle_request(input_state), self._loop)
-            futures[i].add_done_callback(self._on_done)
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, (input_state, futures[i]))
+            
+        results = await asyncio.to_thread(lambda: [f.result() for f in futures])
 
-        results = await asyncio.to_thread(lambda: [f.result() for f in futures.values()])
-        return results
-
-    def _on_done(self, fut):
-        print(f"on done is started")
         with self._active_tasks_lock:
-            self._active_tasks -= 1
+            self._active_tasks -= batch_size
             if self._active_tasks == 0:
                 if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
                     self.inference_engine.free_cache_engine()
-                self._loop.call_soon_threadsafe(self._loop.stop)
-                print(f"loop should be done")
+                # self._loop.call_soon_threadsafe(self._loop.stop)
+                # self._loop_thread.join()
+                # self._loop = None
+                # self._loop_thread = None
+                # self._queue = None
+                # self._started_process = False
 
-        print(f"on done is done")
+        return results
 
     @torch.no_grad()
     async def _handle_request(self, input_state):
