@@ -177,14 +177,6 @@ class ActorRolloutRefWorker(Worker):
 
         self.generation_config = get_generation_config(local_path, trust_remote_code=trust_remote_code)
 
-        if use_remove_padding:
-            from verl.models.registry import check_model_support_rmpad
-            check_model_support_rmpad(actor_model_config.model_type)
-
-        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
-            from verl.models.transformers.monkey_patch import apply_monkey_patch
-            apply_monkey_patch(actor_model_config, verbose=True)
-
         override_config_kwargs = {
             'bos_token_id': self.tokenizer.bos_token_id,
             'eos_token_id': self.tokenizer.eos_token_id,
@@ -211,6 +203,11 @@ class ActorRolloutRefWorker(Worker):
                                                               config=actor_model_config,
                                                               attn_implementation='flash_attention_2',
                                                               trust_remote_code=trust_remote_code)
+
+            if use_remove_padding or self.ulysses_sequence_parallel_size > 1:
+                from verl.models.transformers.monkey_patch import apply_monkey_patch
+                apply_monkey_patch(model=actor_module, ulysses_sp_size=self.ulysses_sequence_parallel_size)
+
             # Apply Liger kernel to the model if use_liger is set to True
             if use_liger:
                 from liger_kernel.transformers.monkey_patch import _apply_liger_kernel_to_instance
@@ -273,7 +270,7 @@ class ActorRolloutRefWorker(Worker):
 
         # TODO: add more optimizer args into config
         if role == 'actor' and optim_config is not None:
-            from verl.utils.torch_functional import get_constant_schedule_with_warmup
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
             actor_optimizer = optim.AdamW(actor_module_fsdp.parameters(),
                                           lr=optim_config.lr,
                                           betas=optim_config.get('betas', (0.9, 0.999)),
@@ -281,14 +278,22 @@ class ActorRolloutRefWorker(Worker):
 
             total_steps = optim_config.get('total_training_steps', 0)
             num_warmup_steps = int(optim_config.get('lr_warmup_steps', -1))
+            warmup_style = optim_config.get('warmup_style', 'constant')
             if num_warmup_steps < 0:
                 num_warmup_steps_ratio = optim_config.get('lr_warmup_steps_ratio', 0.)
                 num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
 
             print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
 
-            actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer,
-                                                                   num_warmup_steps=num_warmup_steps)
+            if warmup_style == 'constant':
+                actor_lr_scheduler = get_constant_schedule_with_warmup(optimizer=actor_optimizer,
+                                                                       num_warmup_steps=num_warmup_steps)
+            elif warmup_style == 'cosine':
+                actor_lr_scheduler = get_cosine_schedule_with_warmup(optimizer=actor_optimizer,
+                                                                     num_warmup_steps=num_warmup_steps,
+                                                                     num_training_steps=total_steps)
+            else:
+                raise NotImplementedError(f'Warmup style {warmup_style} is not supported')
         else:
             actor_optimizer = None
             actor_lr_scheduler = None
@@ -297,7 +302,7 @@ class ActorRolloutRefWorker(Worker):
 
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
 
-    def _build_rollout(self):
+    def _build_rollout(self, trust_remote_code=False):
         from torch.distributed.device_mesh import init_device_mesh
         # TODO(sgm): support FSDP hybrid shard for larger model
         infer_tp = self.config.rollout.tensor_model_parallel_size
@@ -346,7 +351,8 @@ class ActorRolloutRefWorker(Worker):
                                       model_hf_config=self.actor_model_config,
                                       reward_fn=self.reward_fn,
                                       val_reward_fn=self.val_reward_fn,
-                                      device_mesh=rollout_device_mesh)
+                                      device_mesh=rollout_device_mesh,
+                                      trust_remote_code=trust_remote_code)
             else:
                 raise NotImplementedError("vllm_mode must be 'customized' or 'spmd'")
             log_gpu_memory_usage(f'After building {rollout_name} rollout', logger=None)
@@ -435,7 +441,8 @@ class ActorRolloutRefWorker(Worker):
                                               actor_optimizer=self.actor_optimizer)
 
         if self._is_rollout:
-            self.rollout, self.rollout_sharding_manager = self._build_rollout()
+            self.rollout, self.rollout_sharding_manager = self._build_rollout(
+                trust_remote_code=self.config.model.get('trust_remote_code', False))
 
         if self._is_ref:
             self.ref_module_fsdp = self._build_model_optimizer(model_path=self.config.model.path,
@@ -458,7 +465,8 @@ class ActorRolloutRefWorker(Worker):
                 model=self.actor_module_fsdp,
                 optimizer=self.actor.actor_optimizer,
                 lr_scheduler=self.actor_lr_scheduler,
-                processing_class=self.processor if self.processor is not None else self.tokenizer)
+                processing_class=self.processor if self.processor is not None else self.tokenizer,
+                checkpoint_contents=self.config.actor.checkpoint.contents)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):
@@ -632,7 +640,7 @@ class ActorRolloutRefWorker(Worker):
         output = output.to('cpu')
 
         # clear kv cache
-        log_gpu_memory_usage('After recompute log prob', logger=logger)
+        log_gpu_memory_usage('After generate_sequences', logger=logger)
         return output
 
     @register(dispatch_mode=Dispatch.GENERATOR, execute_mode=Execute.ALL, blocking=True)
@@ -838,7 +846,7 @@ class ActorRolloutRefWorker(Worker):
 
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, remove_previous_ckpt=False):
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         # only support save and load ckpt for actor
         assert self._is_actor
         import torch
@@ -848,38 +856,34 @@ class ActorRolloutRefWorker(Worker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path,
                                                 hdfs_path=hdfs_path,
                                                 global_step=global_step,
-                                                remove_previous_ckpt=remove_previous_ckpt)
+                                                max_ckpt_to_keep=max_ckpt_to_keep)
         
         torch.distributed.barrier()
 
-        # TODO: support DCP and save sharded checkpoints
-        import torch.distributed
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
-            state_dict = self.actor.actor_module.state_dict()
         if self.rank == 0:
+            import torch.distributed
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
+                state_dict = self.actor.actor_module.state_dict()
             full_checkpoint_local_path=f'{local_path}/checkpoint'
             print(f'Saving actor checkpoint to {full_checkpoint_local_path}')
             os.makedirs(full_checkpoint_local_path, exist_ok=True)
             self.actor_module.save_pretrained(full_checkpoint_local_path, state_dict=state_dict)
             self.tokenizer.save_pretrained(full_checkpoint_local_path)
-            if hdfs_path is not None:
-                print(f'Uploading actor checkpoint to {hdfs_path}')
-                hdfs_io.makedirs(hdfs_path, exist_ok=True)
-                hdfs_io.copy(src=full_checkpoint_local_path, dst=hdfs_path)
-
 
         torch.distributed.barrier()
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_checkpoint(self, path, del_local_after_load=False):
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        self.checkpoint_manager.load_checkpoint(path=path, del_local_after_load=del_local_after_load)
+        self.checkpoint_manager.load_checkpoint(local_path=local_path,
+                                                hdfs_path=hdfs_path,
+                                                del_local_after_load=del_local_after_load)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
@@ -919,6 +923,7 @@ class CriticWorker(Worker):
         self._is_offload_optimizer = self.config.model.fsdp_config.optimizer_offload
 
         # normalize config
+        self.config.ppo_mini_batch_size *= self.config.rollout_n
         self.config.ppo_mini_batch_size //= (torch.distributed.get_world_size() // self.ulysses_sequence_parallel_size)
         if self.config.ppo_micro_batch_size is not None:
             self.config.ppo_micro_batch_size //= (torch.distributed.get_world_size() //
@@ -968,15 +973,6 @@ class CriticWorker(Worker):
         critic_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         critic_model_config.num_labels = 1
 
-        use_remove_padding = config.model.get('use_remove_padding', False)
-        if use_remove_padding:
-            from verl.models.registry import check_model_support_rmpad
-            check_model_support_rmpad(critic_model_config.model_type)
-
-        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
-            from verl.models.transformers.monkey_patch import apply_monkey_patch
-            apply_monkey_patch(critic_model_config, verbose=True)
-
         init_context = get_init_weight_context_manager(use_meta_tensor=not critic_model_config.tie_word_embeddings,
                                                        mesh=self.device_mesh)
 
@@ -989,6 +985,11 @@ class CriticWorker(Worker):
                                                                             config=critic_model_config,
                                                                             attn_implementation='flash_attention_2',
                                                                             trust_remote_code=trust_remote_code)
+
+            use_remove_padding = config.model.get('use_remove_padding', False)
+            if use_remove_padding or self.ulysses_sequence_parallel_size > 1:
+                from verl.models.transformers.monkey_patch import apply_monkey_patch
+                apply_monkey_patch(model=critic_module, ulysses_sp_size=self.ulysses_sequence_parallel_size)
 
             # some parameters may not in torch_dtype
             critic_module.to(torch_dtype)
@@ -1042,15 +1043,23 @@ class CriticWorker(Worker):
 
         total_steps = config.optim.get('total_training_steps', 0)
         num_warmup_steps = int(config.optim.get('lr_warmup_steps', -1))
+        warmup_style = config.optim.get('warmup_style', 'constant')
         if num_warmup_steps < 0:
             num_warmup_steps_ratio = config.optim.get('lr_warmup_steps_ratio', 0.)
             num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
 
         print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
 
-        from verl.utils.torch_functional import get_constant_schedule_with_warmup
-        critic_lr_scheduler = get_constant_schedule_with_warmup(optimizer=critic_optimizer,
-                                                                num_warmup_steps=num_warmup_steps)
+        from verl.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
+        if warmup_style == 'constant':
+            critic_lr_scheduler = get_constant_schedule_with_warmup(optimizer=critic_optimizer,
+                                                                    num_warmup_steps=num_warmup_steps)
+        elif warmup_style == 'cosine':
+            critic_lr_scheduler = get_cosine_schedule_with_warmup(optimizer=critic_optimizer,
+                                                                  num_warmup_steps=num_warmup_steps,
+                                                                  num_training_steps=total_steps)
+        else:
+            raise NotImplementedError(f'Warmup style {warmup_style} is not supported')
 
         return critic_module, critic_optimizer, critic_lr_scheduler
 
@@ -1077,7 +1086,8 @@ class CriticWorker(Worker):
             model=self.critic_module,
             optimizer=self.critic_optimizer,
             lr_scheduler=self.critic_lr_scheduler,
-            processing_class=self.processor if self.processor is not None else self.tokenizer)
+            processing_class=self.processor if self.processor is not None else self.tokenizer,
+            checkpoint_contents=self.config.checkpoint.contents)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_values(self, data: DataProto):
@@ -1140,7 +1150,7 @@ class CriticWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, remove_previous_ckpt=False):
+    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
         import torch
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
@@ -1148,7 +1158,7 @@ class CriticWorker(Worker):
         self.checkpoint_manager.save_checkpoint(local_path=local_path,
                                                 hdfs_path=hdfs_path,
                                                 global_step=global_step,
-                                                remove_previous_ckpt=remove_previous_ckpt)
+                                                max_ckpt_to_keep=max_ckpt_to_keep)
 
         torch.distributed.barrier()
 
@@ -1156,12 +1166,14 @@ class CriticWorker(Worker):
             offload_fsdp_model_to_cpu(self.critic_module)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def load_checkpoint(self, path, del_local_after_load=True):
+    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=True):
         import torch
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.critic_module)
 
-        self.checkpoint_manager.load_checkpoint(path=path, del_local_after_load=del_local_after_load)
+        self.checkpoint_manager.load_checkpoint(local_path=local_path,
+                                                hdfs_path=hdfs_path,
+                                                del_local_after_load=del_local_after_load)
 
         torch.distributed.barrier()
         if self._is_offload_param:
@@ -1229,15 +1241,6 @@ class RewardModelWorker(Worker):
         model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
         model_config.num_labels = 1
 
-        use_remove_padding = config.model.get('use_remove_padding', False)
-        if use_remove_padding:
-            from verl.models.registry import check_model_support_rmpad
-            check_model_support_rmpad(model_config.model_type)
-
-        if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
-            from verl.models.transformers.monkey_patch import apply_monkey_patch
-            apply_monkey_patch(model_config, verbose=True)
-
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         init_context = get_init_weight_context_manager(use_meta_tensor=not model_config.tie_word_embeddings,
                                                        mesh=self.device_mesh)
@@ -1250,7 +1253,13 @@ class RewardModelWorker(Worker):
                                                                             torch_dtype=torch.bfloat16,
                                                                             attn_implementation='flash_attention_2',
                                                                             trust_remote_code=trust_remote_code)
+
+            if config.model.get('use_remove_padding', False) or self.ulysses_sequence_parallel_size > 1:
+                from verl.models.transformers.monkey_patch import apply_monkey_patch
+                apply_monkey_patch(model=reward_module, ulysses_sp_size=self.ulysses_sequence_parallel_size)
+
             reward_module.to(torch.bfloat16)
+
         auto_wrap_policy = get_fsdp_wrap_policy(module=reward_module, config=self.config.model.fsdp_config)
 
         fsdp_mesh = self.device_mesh
@@ -1321,7 +1330,8 @@ class RewardModelWorker(Worker):
             else:
                 output = self.reward_module(input_ids=input_ids,
                                             attention_mask=attention_mask,
-                                            position_ids=position_ids)
+                                            position_ids=position_ids,
+                                            use_cache=False)
                 rm_score = output.logits  # (batch_size, seq_len, 1)
                 rm_score = rm_score.squeeze(-1)
 
@@ -1356,7 +1366,10 @@ class RewardModelWorker(Worker):
 
         for i in range(data.batch.batch_size[0]):
             # extract raw prompt
-            chat: list = data.non_tensor_batch['raw_prompt'][i].tolist()
+            if isinstance(data.non_tensor_batch['raw_prompt'][i], list):
+                chat: list = data.non_tensor_batch['raw_prompt'][i]
+            else:
+                chat: list = data.non_tensor_batch['raw_prompt'][i].tolist()
 
             # extract response
             response_ids = data.batch['responses'][i]
@@ -1410,6 +1423,16 @@ class RewardModelWorker(Worker):
         data = data.to(torch.cuda.current_device())
         if self._do_switch_chat_template:
             rm_data = self._switch_chat_template(data)
+        else:
+            rm_input_ids = data.batch['input_ids']
+            rm_attention_mask = data.batch['attention_mask']
+            rm_position_ids = data.batch['position_ids']
+            rm_inputs = {
+                'input_ids': rm_input_ids,
+                'attention_mask': rm_attention_mask,
+                'position_ids': rm_position_ids
+            }
+            rm_data = DataProto.from_dict(rm_inputs)
 
         # Support all hardwares
         rm_data.batch = rm_data.batch.to(torch.cuda.current_device())

@@ -23,7 +23,7 @@ from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl import DataProto
-from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.core_algos import compute_policy_loss, kl_penalty, agg_loss
 from verl.workers.actor import BasePPOActor
 from verl.utils.py_functional import append_to_dict
 from verl.utils.torch_functional import logprobs_from_logits, masked_mean
@@ -165,7 +165,13 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = self.actor_module.clip_grad_norm_(max_norm=self.config.grad_clip)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
-        self.actor_optimizer.step()
+
+        # if grad_norm is not finite, skip the update
+        if not torch.isfinite(grad_norm):
+            print(f"WARN: grad_norm is not finite: {grad_norm}")
+            self.actor_optimizer.zero_grad()
+        else:
+            self.actor_optimizer.step()
         return grad_norm
 
     def compute_log_prob(self, data: DataProto) -> torch.Tensor:
@@ -288,21 +294,27 @@ class DataParallelPPOActor(BasePPOActor):
                     advantages = data['advantages']
 
                     clip_ratio = self.config.clip_ratio
+                    clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+                    clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+                    clip_ratio_c = self.config.get('clip_ratio_c', 3.0)
                     entropy_coeff = self.config.entropy_coeff
+                    loss_agg_mode = self.config.loss_agg_mode
 
                     # all return: (bsz, response_length)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
-                    pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                                  log_prob=log_prob,
-                                                                                  advantages=advantages,
-                                                                                  eos_mask=response_mask,
-                                                                                  cliprange=clip_ratio,
-                                                                                  cliprange_low=self.config.clip_ratio_low,
-                                                                                  cliprange_high=self.config.clip_ratio_high,
-                                                                                  use_token_level_loss=self.config.use_token_level_loss)
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        cliprange=clip_ratio,
+                        cliprange_low=clip_ratio_low,
+                        cliprange_high=clip_ratio_high,
+                        clip_ratio_c=clip_ratio_c,
+                        loss_agg_mode=loss_agg_mode)
                     # compute entropy loss from entropy
-                    entropy_loss = verl_F.masked_mean(entropy, response_mask)
+                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                     # compute policy loss
                     policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -310,10 +322,12 @@ class DataParallelPPOActor(BasePPOActor):
                     if self.config.use_kl_loss:
                         ref_log_prob = data['ref_log_prob']
                         # compute kl loss
-                        kld = core_algos.kl_penalty(logprob=log_prob,
-                                                    ref_logprob=ref_log_prob,
-                                                    kl_penalty=self.config.kl_loss_type)
-                        kl_loss = masked_mean(kld, response_mask)
+                        kld = kl_penalty(logprob=log_prob,
+                                         ref_logprob=ref_log_prob,
+                                         kl_penalty=self.config.kl_loss_type)
+                        kl_loss = agg_loss(loss_mat=kld,
+                                           loss_mask=response_mask,
+                                           loss_agg_mode=self.config.loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
@@ -327,10 +341,11 @@ class DataParallelPPOActor(BasePPOActor):
                     loss.backward()
 
                     data = {
-                        'actor/entropy_loss': entropy_loss.detach().item(),
+                        'actor/entropy': entropy_loss.detach().item(),
                         'actor/pg_loss': pg_loss.detach().item(),
                         'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                         'actor/ppo_kl': ppo_kl.detach().item(),
+                        'actor/pg_clipfrac_lower': pg_clipfrac_lower.detach().item(),
                     }
                     append_to_dict(metrics, data)
 
@@ -354,10 +369,16 @@ class DataParallelPPOActor(BasePPOActor):
         if 'tool_call_mask' in data.batch:
             select_keys.append('tool_call_mask')
         mini_batch = data.select(batch_keys=select_keys).batch
+        has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
         
         metrics = {}
 
-        if self.config.use_dynamic_bsz:
+        if has_multi_modal_inputs:
+            non_tensor_select_keys = ['multi_modal_inputs']
+            self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+            num_micro_batches = mini_batch.batch.batch_size[0] // self.config.ppo_micro_batch_size_per_gpu
+            micro_batches = mini_batch.select(select_keys, non_tensor_select_keys).chunk(num_micro_batches)
+        elif self.config.use_dynamic_bsz:
             max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
             micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
         else:
@@ -381,18 +402,27 @@ class DataParallelPPOActor(BasePPOActor):
             advantages = data['advantages']
 
             clip_ratio = self.config.clip_ratio
+            clip_ratio_low = self.config.clip_ratio_low if self.config.clip_ratio_low is not None else clip_ratio
+            clip_ratio_high = self.config.clip_ratio_high if self.config.clip_ratio_high is not None else clip_ratio
+            clip_ratio_c = self.config.get('clip_ratio_c', 3.0)
             entropy_coeff = self.config.entropy_coeff
+            loss_agg_mode = self.config.loss_agg_mode
 
             # all return: (bsz, response_length)
             entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
 
-            pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(old_log_prob=old_log_prob,
-                                                                            log_prob=log_prob,
-                                                                            advantages=advantages,
-                                                                            eos_mask=response_mask,
-                                                                            cliprange=clip_ratio)
+            pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                        old_log_prob=old_log_prob,
+                        log_prob=log_prob,
+                        advantages=advantages,
+                        response_mask=response_mask,
+                        cliprange=clip_ratio,
+                        cliprange_low=clip_ratio_low,
+                        cliprange_high=clip_ratio_high,
+                        clip_ratio_c=clip_ratio_c,
+                        loss_agg_mode=loss_agg_mode)
             # compute entropy loss from entropy
-            entropy_loss = verl_F.masked_mean(entropy, response_mask)
+            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
             # compute policy loss
             policy_loss = pg_loss - entropy_loss * entropy_coeff
@@ -400,10 +430,12 @@ class DataParallelPPOActor(BasePPOActor):
             if self.config.use_kl_loss:
                 ref_log_prob = data['ref_log_prob']
                 # compute kl loss
-                kld = core_algos.kl_penalty(logprob=log_prob,
-                                            ref_logprob=ref_log_prob,
-                                            kl_penalty=self.config.kl_loss_type)
-                kl_loss = masked_mean(kld, response_mask)
+                kld = kl_penalty(logprob=log_prob,
+                                    ref_logprob=ref_log_prob,
+                                    kl_penalty=self.config.kl_loss_type)
+                kl_loss = agg_loss(loss_mat=kld,
+                                    loss_mask=response_mask,
+                                    loss_agg_mode=self.config.loss_agg_mode)
 
                 policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                 metrics['actor/kl_loss'] = kl_loss.detach().item()
