@@ -62,7 +62,7 @@ def init_env(config):
             dataset = pd.read_parquet(config.data.path)
             extra_infos = dataset["extra_info"].tolist()
             extra_infos = [x for x in extra_infos for _ in range(config.data.n_samples)]
-            return BatchBrowserGym.from_extra_infos(extra_infos)
+            return BatchBrowserGym.from_json(extra_infos)
 
     raise ValueError(f"Environment {config.env.name} not supported")
 
