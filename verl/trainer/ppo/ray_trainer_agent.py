@@ -63,7 +63,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             engine_name="verl",
             tokenizer=self.tokenizer,
             model_path=self.config.actor_rollout_ref.model.path,
-            episode_len=self.config.agent.trajectory_episode_len,
+            episode_len=self.config.agent.max_episodes,
             max_trajectory_length=self.config.agent.max_trajectory_length,
             max_prompt_length=self.config.data.max_prompt_length,
         )

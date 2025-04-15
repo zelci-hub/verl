@@ -97,7 +97,7 @@ def main(config):
         rollout_engine=rollout_engine,
         engine_name="verl",
         tokenizer=tokenizer,
-        episode_len=config.agent.trajectory_episode_len,
+        episode_len=config.agent.max_episodes,
         agents=agents,
         envs=envs
     )
