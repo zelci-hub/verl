@@ -176,7 +176,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         return data.chunk(chunks=self.tp_size)[self.tp_rank]
 
     def update_params(self, updated_params):
-        model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        try:
+            model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        except:
+            model = self.inference_engine.engine.model_executor.driver_worker.worker.model_runner.model
         world_size = torch.distributed.get_world_size()
         if model.config.architectures[0] in ['DeepseekV2ForCausalLM', 'DeepseekV3ForCausalLM']:
             loaded_params = patched_ds_v3_load_weights(
