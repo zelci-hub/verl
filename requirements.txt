@@ -18,5 +18,5 @@ ray[default]
 tensordict<=0.6.2
 torchdata
 transformers
-vllm @ https://wheels.vllm.ai/54ed913f3437f9107791e8ea410170b86c968d52/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
+# vllm==0.6.3.post1
 wandb

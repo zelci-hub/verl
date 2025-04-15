@@ -127,18 +127,18 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         else:
             # Load the sharded model state
             print(f'[rank-{self.rank}]: Loading sharded model state from {local_model_path}')
-            model_state_dict = torch.load(local_model_path)
+            model_state_dict = torch.load(local_model_path, weights_only=False)
             state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
             optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
             with FSDP.state_dict_type(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_config=state_dict_cfg, optim_state_dict_config=optim_cfg):
                 self.model.load_state_dict(model_state_dict)
                 if self.optimizer is not None:
-                    optimizer_state_dict = torch.load(local_optim_path)
+                    optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
                     self.optimizer.load_state_dict(optimizer_state_dict)
         
         extra_state_dict = None
         if self.lr_scheduler is not None:
-            extra_state_dict = torch.load(local_extra_state_path)
+            extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
 
         lr_scheduler_state_dict = None
         if self.lr_scheduler is not None:

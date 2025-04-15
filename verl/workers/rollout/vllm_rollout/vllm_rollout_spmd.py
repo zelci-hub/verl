@@ -49,6 +49,7 @@ from verl import DataProto
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.utils import run_async_generator
+from verl.third_party.vllm import vllm_version
 
 from vllm import AsyncLLMEngine, LLM, SamplingParams, TokensPrompt
 from vllm.distributed import parallel_state as vllm_ps
@@ -176,7 +177,7 @@ class vLLMRollout(BaseRollout):
                     disable_log_stats=config.disable_log_stats,
                     max_num_batched_tokens=max_num_batched_tokens,
                     enable_chunked_prefill=config.enable_chunked_prefill,
-                    enable_prefix_caching=False,
+                    enable_prefix_caching=True,
                     trust_remote_code=trust_remote_code,
                     seed=int(os.getenv("RANK", "0")) // tensor_parallel_size,
                 )
@@ -198,7 +199,7 @@ class vLLMRollout(BaseRollout):
                 disable_log_stats=config.disable_log_stats,
                 max_num_batched_tokens=max_num_batched_tokens,
                 enable_chunked_prefill=config.enable_chunked_prefill,
-                enable_prefix_caching=False,
+                enable_prefix_caching=True,
                 trust_remote_code=trust_remote_code,
                 seed=int(os.getenv("RANK", "0")) // tensor_parallel_size,
             )

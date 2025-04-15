@@ -860,12 +860,12 @@ class ActorRolloutRefWorker(Worker):
         
         torch.distributed.barrier()
 
+        import torch.distributed
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
+            state_dict = self.actor.actor_module.state_dict()
         if self.rank == 0:
-            import torch.distributed
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
-            cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-            with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
-                state_dict = self.actor.actor_module.state_dict()
             full_checkpoint_local_path=f'{local_path}/checkpoint'
             print(f'Saving actor checkpoint to {full_checkpoint_local_path}')
             os.makedirs(full_checkpoint_local_path, exist_ok=True)

@@ -48,12 +48,10 @@ class NaiveRewardManager:
 
         # Thread-safe dict for tracking printed data sources
         print_lock = threading.Lock()
-
         def process_row(args):
             i, data_item, already_print_data_sources = args
-
+            reward_extra_info = defaultdict(list)
             prompt_ids = data_item.batch['prompts']
-
             prompt_length = prompt_ids.shape[-1]
             
             valid_prompt_length = data_item.batch['attention_mask'][:prompt_length].sum()
@@ -101,7 +99,7 @@ class NaiveRewardManager:
                             print(f"[{key}]", value)
                     else:
                         print(f"[score]", score)  
-            return i, score, valid_response_length
+            return i, score, valid_response_length, reward_extra_info
 
         # Process items in parallel using ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -109,8 +107,14 @@ class NaiveRewardManager:
             results = list(executor.map(process_row, args))
 
         # Fill reward tensor with results
-        for i, score, valid_response_length in results:
+        reward_extra_info = {}
+        for i, score, valid_response_length, sample_reward_extra_info in results:
             reward_tensor[i, valid_response_length - 1] = score
+            # Update extra info at the list index
+            for key, value in sample_reward_extra_info.items():
+                if key not in reward_extra_info:
+                    reward_extra_info[key] = [None] * len(data)
+                reward_extra_info[key][i] = value
         
         if return_dict:
             return {

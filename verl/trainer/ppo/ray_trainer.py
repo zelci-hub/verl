@@ -183,7 +183,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, mask_truncated_samples=True):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch['response_mask'] = compute_response_mask(data)
@@ -203,7 +203,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=data.batch['token_level_rewards'],
             response_mask=data.batch['response_mask'],
-            index=data.non_tensor_batch['uid'])
+            index=data.non_tensor_batch['uid'],
+            mask_truncated_samples=mask_truncated_samples)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE:
@@ -237,15 +238,9 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.LOOP:
         # same as grpo but without normalization
-        token_level_rewards = data.batch['token_level_rewards']
-        index = data.non_tensor_batch['uid']
-        responses = data.batch['responses']
-        response_length = responses.size(-1)
-        attention_mask = data.batch['attention_mask']
-        response_mask = attention_mask[:, -response_length:]
-        advantages, returns = core_algos.compute_loop_outcome_advantage(token_level_rewards=token_level_rewards,
-                                                                        eos_mask=response_mask,
-                                                                        index=index)
+        advantages, returns = core_algos.compute_loop_outcome_advantage(token_level_rewards=data.batch['token_level_rewards'],
+                                                                        eos_mask=data.batch['response_mask'],
+                                                                        index=data.non_tensor_batch['uid'])
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
@@ -743,15 +738,8 @@ class RayPPOTrainer(object):
         actor_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(
             self.config.trainer.default_hdfs_dir, f'global_step_{self.global_steps}', 'actor')
 
-        remove_previous_ckpt_in_save = self.config.trainer.get('remove_previous_ckpt_in_save', False)
-        if remove_previous_ckpt_in_save:
-            print(
-                'Warning: remove_previous_ckpt_in_save is deprecated, set max_actor_ckpt_to_keep=1 and max_critic_ckpt_to_keep=1 instead'
-            )
-        max_actor_ckpt_to_keep = self.config.trainer.get('max_actor_ckpt_to_keep',
-                                                         None) if not remove_previous_ckpt_in_save else 1
-        max_critic_ckpt_to_keep = self.config.trainer.get('max_critic_ckpt_to_keep',
-                                                          None) if not remove_previous_ckpt_in_save else 1
+        max_actor_ckpt_to_keep = self.config.trainer.get('max_actor_ckpt_to_keep', None)
+        max_critic_ckpt_to_keep = self.config.trainer.get('max_critic_ckpt_to_keep', None)
 
         if self.hybrid_engine:
             save_actor_cls = self.actor_rollout_wg
@@ -833,10 +821,7 @@ class RayPPOTrainer(object):
             if isinstance(updated_actor_module_fsdp_ref, list):
                 updated_actor_module_fsdp_ref = updated_actor_module_fsdp_ref[0]
             self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
-        # if not self.hybrid_engine:
-        #     self.rollout_wg.load_checkpoint(actor_path,
-        #                                           del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
-        
+
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(critic_path,
@@ -910,7 +895,6 @@ class RayPPOTrainer(object):
             for batch_dict in self.train_dataloader:
                 metrics = {}
                 timing_raw = {}
-
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
                 is_last_step = self.global_steps >= self.total_training_steps
