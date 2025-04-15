@@ -800,10 +800,13 @@ class ActorRolloutRefWorker(Worker):
                 if self.generation_config is not None else self.tokenizer.pad_token_id,
         }
         prompts.meta_info.update(meta_info)
-        prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+
+        # rollout sharding manager is not used for async generation because router handles requests dispatching
+        # prompts = self.rollout_sharding_manager.preprocess_data(prompts)
 
         output = await self.rollout.generate_async(prompts=prompts, **kwargs) # gives a list of DataProto as result
-        output = [self.rollout_sharding_manager.postprocess_data(o) for o in output]
+
+        # output = [self.rollout_sharding_manager.postprocess_data(o) for o in output]
 
         output = [o.to('cpu') for o in output]
         log_gpu_memory_usage('After generation', logger=logger)

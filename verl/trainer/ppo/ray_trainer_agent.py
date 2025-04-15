@@ -24,7 +24,7 @@ from verl.trainer.ppo.ray_trainer import (
     _timer,
 )
 
-from rllm.models.agent_execution_engine import AgentExecutionEngine
+from rllm.engine.agent_execution_engine import AgentExecutionEngine
 
 class RayPPOAgentTrainer(RayPPOTrainer):
 
