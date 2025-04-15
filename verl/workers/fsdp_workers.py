@@ -307,7 +307,7 @@ class ActorRolloutRefWorker(Worker):
 
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
     
-    
+
     def _build_rollout(self):
         from torch.distributed.device_mesh import init_device_mesh
         # TODO(sgm): support FSDP hybrid shard for larger model
@@ -767,7 +767,7 @@ class ActorRolloutRefWorker(Worker):
                 log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
 
             self._generation_async_engine_status += 1
-
+        print("entered a request")
         # add requests to generation
         prompts = prompts.to(torch.cuda.current_device())
         meta_info = {
@@ -796,7 +796,7 @@ class ActorRolloutRefWorker(Worker):
                 self.rollout_sharding_manager.__exit__(None, None, None)
                 torch.cuda.empty_cache()
                 log_gpu_memory_usage('After generate sequences', logger=logger)
-                
+        print("exited a request")
         return output
         
 
