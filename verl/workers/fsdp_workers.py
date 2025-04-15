@@ -145,11 +145,6 @@ class ActorRolloutRefWorker(Worker):
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
-        # TODO: see if its needed
-        # For async generation:
-        self._generation_async_engine_status = 0
-        self._generation_async_engine_lock = threading.Lock()
-
     def _build_model_optimizer(self,
                                model_path,
                                fsdp_config,
@@ -745,29 +740,39 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, execute_mode=Execute.ALL, blocking=True)
+    def generate_async_sharding_manager_enter(self):
+        """
+        Setup the rollout engine for async generation
+        """
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        self.rollout_sharding_manager.__enter__()
+
+        # after parameters sync with rollout, offload actor model to CPU
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+        log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, execute_mode=Execute.ALL, blocking=True)
+    def generate_async_sharding_manager_exit(self):
+        """
+        Sleeps the rollout engine for async generation
+        """
+        self.rollout_sharding_manager.__exit__(None, None, None)
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage('After generate sequences', logger=logger)
+
     async def generate_async(self, prompts: DataProto = None, **kwargs):
         assert self._is_rollout, "generate_sequences_async requires rollout capability"
         assert hasattr(self.rollout, 'generate_sequences_async'), "Rollout engine must support generate_sequences_async"
 
         if prompts is None:
             return None
-
-        with self._generation_async_engine_lock:
-            if self._generation_async_engine_status == 0: # need to initialize
-                if self._is_offload_param:
-                    load_fsdp_model_to_gpu(self.actor_module_fsdp)
-                self.rollout_sharding_manager.__enter__()
-    
-                # after parameters sync with rollout, offload actor model to CPU
-                if self._is_offload_param:
-                    offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-                if self._is_offload_optimizer:
-                    offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-
-                log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
-
-            self._generation_async_engine_status += 1
-        print("entered a request")
+      
         # add requests to generation
         prompts = prompts.to(torch.cuda.current_device())
         meta_info = {
@@ -780,23 +785,14 @@ class ActorRolloutRefWorker(Worker):
         }
         prompts.meta_info.update(meta_info)
 
-        # rollout sharding manager is not used for async generation because router handles requests dispatching
-        # prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-
+        # Note: rollout sharding manager is not used for async generation because router handles requests dispatching
+        # prompts = self.rollout_sharding_manager.preprocess_data(prompts
         output = await self.rollout.generate_async(prompts=prompts, **kwargs) # gives a list of DataProto as result
-
         # output = [self.rollout_sharding_manager.postprocess_data(o) for o in output]
 
         output = [o.to('cpu') for o in output]
         log_gpu_memory_usage('After generation', logger=logger)
-
-        with self._generation_async_engine_lock:
-            self._generation_async_engine_status -= 1
-            if self._generation_async_engine_status == 0:
-                self.rollout_sharding_manager.__exit__(None, None, None)
-                torch.cuda.empty_cache()
-                log_gpu_memory_usage('After generate sequences', logger=logger)
-        print("exited a request")
+        
         return output
         
 

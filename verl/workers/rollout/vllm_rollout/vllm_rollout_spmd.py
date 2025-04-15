@@ -897,7 +897,7 @@ class vLLMRollout(BaseRollout):
         Submit a DataProto batch to the async engine. Each item in the batch becomes a separate Future.
         """
         assert self.config.async_engine, "generate_sequences_async_tool requires `async_engine=True`"
-        print("submitted a request")
+
         batch_size = len(prompts)
         # start event loop if it wasn't already started
         self._start_event_loop(batch_size)
@@ -987,7 +987,7 @@ class vLLMRollout(BaseRollout):
                 # self._loop_thread = None
                 # self._queue = None
                 # self._started_process = False
-        print("finished a request")
+
         return results
 
     @torch.no_grad()
