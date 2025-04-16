@@ -95,7 +95,7 @@ def main(config):
 
 def run_generation(config):
     assert config.rollout.compute_reward is False, 'compute_reward must be False for generation'
-    assert config.rollout.vllm_log_prob is False, 'vllm_log_prob must be False for generation'
+    assert config.rollout.enable_log_prob is False, 'enable_log_prob must be False for generation'
     assert config.rollout.async_engine is False, 'async_engine must be False for generation'
 
     dataset_name = os.path.basename(config.data.path)

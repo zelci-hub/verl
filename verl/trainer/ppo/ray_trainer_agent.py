@@ -73,7 +73,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         Initialize environment depending on env_class with the necessary extra_info, also set uid of the batch.
         """
         env_args = batch.non_tensor_batch["extra_info"].tolist()
-        envs = [self.env_class.from_extra_info(env_args[i]) for i in range(len(env_args))]
+        envs = [self.env_class.from_json(env_args[i]) for i in range(len(env_args))]
         batch.non_tensor_batch["uid"] = np.array([env.env_id for env in envs], dtype=object)
 
         return envs

@@ -19,10 +19,10 @@ import tempfile
 from typing import Union
 import torch
 import torch.distributed
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType
 from transformers import PreTrainedTokenizer, ProcessorMixin
 import numpy as np
 import random
+import re
 
 
 class BaseCheckpointManager:
@@ -40,48 +40,48 @@ class BaseCheckpointManager:
     - huggingface tokenizer and config for ckpt merge
     """
 
-    def __init__(self, model: FSDP, optimizer: torch.optim.Optimizer,
-                 lr_scheduler: torch.optim.lr_scheduler.LRScheduler, processing_class: Union[PreTrainedTokenizer,
-                                                                                             ProcessorMixin]):
+    def __init__(self,
+                 model,
+                 optimizer: torch.optim.Optimizer,
+                 lr_scheduler: torch.optim.lr_scheduler.LRScheduler = None,
+                 processing_class: Union[PreTrainedTokenizer, ProcessorMixin] = None,
+                 checkpoint_contents: list = ['model', 'optimizer', 'extra']):
         self.previous_global_step = None
-        self.previous_save_local_path = None
+        self.previous_saved_paths = []
 
         self.model = model
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.processing_class = processing_class
+        self.checkpoint_contents = checkpoint_contents
 
-        assert isinstance(self.model, FSDP)
         self.rank = torch.distributed.get_rank()
         self.world_size = torch.distributed.get_world_size()
 
-    def load_checkpoint(self, *args, **kwargs):
+    def load_checkpoint(self, local_path: str, hdfs_path: str = None, del_local_after_load: bool = False):
         raise NotImplementedError
 
-    def save_checkpoint(self, *args, **kwargs):
+    def save_checkpoint(self,
+                        local_path: str,
+                        hdfs_path: str = None,
+                        global_step: int = 0,
+                        max_ckpt_to_keep: int = None):
         raise NotImplementedError
 
-    def remove_previous_save_local_path(self):
-        if not self.previous_save_local_path:
-            return
+    @staticmethod
+    def checkpath(local_path: str, hdfs_path: str):
+        assert local_path is not None or hdfs_path is not None, "local_path and hdfs_path cannot be both None"
+        return True if local_path is not None else False, local_path if local_path is not None else hdfs_path
 
-        abs_path = os.path.abspath(self.previous_save_local_path)
-        print(f'Checkpoint manager remove previous save local path: {abs_path}')
-        if not os.path.exists(abs_path):
-            return
-        for entry in os.scandir(abs_path):
-            if entry.name == 'checkpoint':
+    def remove_previous_save_local_path(self, path):
+        if isinstance(path, str):
+            path = [path]
+        for p in path:
+            abs_path = os.path.abspath(p)
+            print(f'Checkpoint manager remove previous save local path: {abs_path}')
+            if not os.path.exists(abs_path):
                 continue
-
-            if entry.is_dir():
-                # ignore_errors=True will skip errors like "directory not found"
-                shutil.rmtree(entry.path, ignore_errors=True)
-            else:
-                # Gracefully handle already-missing files
-                try:
-                    os.remove(entry.path)
-                except FileNotFoundError:
-                    pass
+            shutil.rmtree(abs_path, ignore_errors=True)
 
     @staticmethod
     def local_mkdir(path):
@@ -122,25 +122,6 @@ class BaseCheckpointManager:
         random.setstate(rng_state['random'])
 
 
-# def find_latest_ckpt_path(path, directory_format="global_step_{}"):
-#     if path is None:
-#         return None
-
-#     tracker_file = get_checkpoint_tracker_filename(path)
-#     if not os.path.exists(tracker_file):
-#         print("Checkpoint tracker file does not exist: %s", tracker_file)
-#         return None
-
-#     with open(tracker_file, "rb") as f:
-#         iteration = int(f.read().decode())
-#     ckpt_path = os.path.join(path, directory_format.format(iteration))
-#     if not os.path.exists(ckpt_path):
-#         print("Checkpoint does not exist: %s", ckpt_path)
-#         return None
-
-#     print("Found checkpoint: %s", ckpt_path)
-#     return ckpt_path
-
 def is_valid_checkpoint(ckpt_path):
     """
     Returns True if the checkpoint directory has all required files/folders.
@@ -169,10 +150,10 @@ def is_valid_checkpoint(ckpt_path):
         print(f"Checkpoint {ckpt_path} is missing the 'checkpoint' directory inside 'actor'.")
         return False
 
-    hf_dir = os.path.join(actor_dir, "huggingface")
-    if not os.path.isdir(hf_dir):
-        print(f"Checkpoint {ckpt_path} is missing the 'huggingface' directory inside 'actor'.")
-        return False
+    # hf_dir = os.path.join(actor_dir, "huggingface")
+    # if not os.path.isdir(hf_dir):
+    #     print(f"Checkpoint {ckpt_path} is missing the 'huggingface' directory inside 'actor'.")
+    #     return False
 
     # 4) Check for .pt files in 'actor' that start with specific prefixes
     required_prefixes = [

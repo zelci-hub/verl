@@ -48,10 +48,10 @@ from rllm.tools.tool_base import ToolOutputs
 from torch import nn
 from typing import Any, Dict, Union
 from verl import DataProto
-from verl.third_party.vllm import vllm_version
-from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
+from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.utils import run_async_generator
+from verl.third_party.vllm import vllm_version
 
 from vllm import AsyncLLMEngine, LLM, SamplingParams, TokensPrompt
 from vllm.distributed import parallel_state as vllm_ps
@@ -149,6 +149,18 @@ class vLLMRollout(BaseRollout):
         assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
             "model context length should be greater than total sequence length"
 
+
+        max_model_len = self.config.max_model_len if self.config.max_model_len \
+                        else config.prompt_length + config.response_length
+        max_model_len = int(max_model_len)
+
+        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+            raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+                             please increase max_num_batched_tokens or disable chunked prefill')
+
+        trust_remote_code = kwargs.get('trust_remote_code', False)
+        load_format = 'dummy' if config.load_format.startswith('dummy') else config.load_format
+
         if config.async_engine:
             self.inference_engine = AsyncLLMEngine.from_engine_args(
                 AsyncEngineArgs(
@@ -160,12 +172,16 @@ class vLLMRollout(BaseRollout):
                     enforce_eager=config.enforce_eager,
                     gpu_memory_utilization=config.gpu_memory_utilization,
                     disable_custom_all_reduce=True,
+                    disable_mm_preprocessor_cache=True,
                     skip_tokenizer_init=False,
-                    max_model_len=config.prompt_length + config.response_length,
+                    max_model_len=max_model_len,
+                    load_format=load_format,
                     disable_log_stats=config.disable_log_stats,
                     max_num_batched_tokens=max_num_batched_tokens,
                     enable_chunked_prefill=config.enable_chunked_prefill,
-                    enable_prefix_caching=True
+                    enable_prefix_caching=True,
+                    trust_remote_code=trust_remote_code,
+                    seed=int(os.getenv("RANK", "0")) // tensor_parallel_size,
                 )
             )
 
@@ -188,12 +204,16 @@ class vLLMRollout(BaseRollout):
                 enforce_eager=config.enforce_eager,
                 gpu_memory_utilization=config.gpu_memory_utilization,
                 disable_custom_all_reduce=True,
+                disable_mm_preprocessor_cache=True,
                 skip_tokenizer_init=False,
-                max_model_len=config.prompt_length + config.response_length,
+                max_model_len=max_model_len,
+                load_format=load_format,
                 disable_log_stats=config.disable_log_stats,
                 max_num_batched_tokens=max_num_batched_tokens,
                 enable_chunked_prefill=config.enable_chunked_prefill,
                 enable_prefix_caching=True,
+                trust_remote_code=trust_remote_code,
+                seed=int(os.getenv("RANK", "0")) // tensor_parallel_size,
             )
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
@@ -310,6 +330,15 @@ class vLLMRollout(BaseRollout):
         
         vllm_inputs = [TokensPrompt(**vllm_input) for vllm_input in vllm_inputs]
 
+        # ensure the type of `prompt_token_ids` passed to vllm is list[int]
+        # https://github.com/volcengine/verl/pull/772
+        for input_data in vllm_inputs:
+            if isinstance(input_data['prompt_token_ids'], np.ndarray):
+                input_data['prompt_token_ids'] = input_data['prompt_token_ids'].tolist()
+            elif not isinstance(input_data['prompt_token_ids'], list):
+                raise TypeError(
+                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+
         do_sample = prompts.meta_info.get('do_sample', True)
         is_validate = prompts.meta_info.get('validate', False)
         if not do_sample:
@@ -347,7 +376,7 @@ class vLLMRollout(BaseRollout):
         for output in outputs:
             for sample_id in range(len(output.outputs)):
                 response.append(output.outputs[sample_id].token_ids)
-                if self.config.vllm_log_prob and hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
+                if self.config.enable_log_prob and hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
                     # Directly use the list of floats returned by vLLM
                     log_prob_list = []
                     for log_prob in output.outputs[sample_id].logprobs:
@@ -355,9 +384,10 @@ class vLLMRollout(BaseRollout):
                     log_probs.append(log_prob_list)
                 else:
                     log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
+        
         response = pad_2d_list_to_length(response, self.pad_token_id,
                                          max_length=self.config.response_length).to(idx.device)
-        if self.config.vllm_log_prob:
+        if self.config.enable_log_prob:
             log_probs = pad_2d_list_to_length(log_probs, 0.0,
                                             max_length=self.config.response_length).to(idx.device)
 
@@ -387,7 +417,9 @@ class vLLMRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = get_response_mask(response_id=response,
+                                                    eos_token=eos_token_id,
+                                                    dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
@@ -400,7 +432,7 @@ class vLLMRollout(BaseRollout):
                 'position_ids': position_ids
             },
             batch_size=batch_size)
-        if self.config.vllm_log_prob:
+        if self.config.enable_log_prob:
             batch['old_log_probs'] = log_probs
         
         # free vllm cache engine
@@ -505,7 +537,7 @@ class vLLMRollout(BaseRollout):
                 log_probs = []
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
-                    if self.config.vllm_log_prob and \
+                    if self.config.enable_log_prob and \
                         hasattr(output.outputs[sample_id], 'logprobs') and \
                         output.outputs[sample_id].logprobs is not None:
                         log_prob_list = []
@@ -549,7 +581,7 @@ class vLLMRollout(BaseRollout):
                 
                 response_position_ids = single_position_ids[:, -1:] + delta_position_id
                 position_ids_out = torch.cat([single_position_ids, response_position_ids], dim=-1)
-                response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+                response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
                 attention_mask_out = torch.cat((single_attention_mask, response_attention_mask), dim=-1)
 
                 batch = TensorDict(
@@ -561,7 +593,7 @@ class vLLMRollout(BaseRollout):
                         'position_ids': position_ids_out
                     },
                     batch_size=response.size(0))
-                if self.config.vllm_log_prob:
+                if self.config.enable_log_prob:
                     batch['old_log_probs'] = log_probs
                 
                 
@@ -812,7 +844,7 @@ class vLLMRollout(BaseRollout):
                 
                 response_position_ids = single_position_ids[:, -1:] + delta_position_id
                 position_ids_out = torch.cat([single_position_ids, response_position_ids], dim=-1)
-                response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+                response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
                 attention_mask_out = torch.cat((single_attention_mask, response_attention_mask), dim=-1)
 
                 batch = TensorDict(
@@ -826,7 +858,7 @@ class vLLMRollout(BaseRollout):
                     },
                     batch_size=response.size(0))
 
-                if self.config.vllm_log_prob:
+                if self.config.enable_log_prob:
                     batch['old_log_probs'] = log_probs
                 
                 if self.reward_fn is not None and not is_validate:

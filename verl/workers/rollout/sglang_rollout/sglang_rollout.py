@@ -26,20 +26,25 @@
 # limitations under the License.
 
 from __future__ import annotations
+from copy import deepcopy
 import os
+from typing import Any, List, Union
+import numpy as np
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, List
 from omegaconf import DictConfig
 from tensordict import TensorDict
 from verl import DataProto
 from verl.workers.rollout.base import BaseRollout
-from verl.utils.torch_functional import get_eos_mask, pad_sequence_to_length, pad_2d_list_to_length
+from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length, pad_2d_list_to_length
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from torch.distributed.device_mesh import init_device_mesh
 from sglang.srt.sampling.sampling_params import SamplingParams
 from verl.third_party.sglang import parallel_state as sglang_ps
 import torch.distributed
 from torch.nn.utils.rnn import pad_sequence
+from sglang.srt.utils import broadcast_pyobj, get_ip
+from sglang.srt.server_args import PortArgs, ServerArgs
 
 if TYPE_CHECKING:
     from torch import nn
@@ -80,6 +85,12 @@ def _post_process_outputs(tokenizer, output):
         batched_logprobs = pad_sequence(batched_logprobs, batch_first=True, padding_value=pad_token_id)
     return batched_output_token_ids, batched_logprobs
 
+def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
+    if isinstance(value, torch.Tensor):
+        return value.repeat_interleave(repeats, dim=0)
+    else:
+        return np.repeat(value, repeats, axis=0)
+
 
 class SGLangRollout(BaseRollout):
 
@@ -89,6 +100,8 @@ class SGLangRollout(BaseRollout):
         config: DictConfig,
         tokenizer,
         model_hf_config,
+        reward_fn,
+        val_reward_fn,
         **kwargs,
     ):
         """A SGLang rollout. It requires the module is supported by the SGLang.
@@ -102,12 +115,8 @@ class SGLangRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
-
-        # TODO(linjunrong.ocss884): this substitution is left for resolving SGLang conflict with ray devices
-        # isolation, will solve in the future
-        del os.environ["CUDA_VISIBLE_DEVICES"]
-        if os.environ["ENSURE_CUDA_VISIBLE_DEVICES"]:
-            os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["ENSURE_CUDA_VISIBLE_DEVICES"]
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
 
         assert not (not config.enforce_eager and
                     config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
@@ -142,17 +151,46 @@ class SGLangRollout(BaseRollout):
         # device_mesh_device = init_device_mesh("cuda", **device_mesh_kwargs)
 
         # get tp_rank of this process in this tp group
-        global_rank = device_mesh_cpu.get_rank()
-        tp_size = device_mesh_cpu["tp"].mesh.size()[0]
-        src_rank = global_rank // tp_size * tp_size
+        tp_rank = device_mesh_cpu["tp"].get_local_rank()
+        visible_devices = [None] * device_mesh_cpu.size(1)
+        torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"],
+                                            device_mesh_cpu.get_group("tp"))
+        visible_devices_set = set(visible_devices)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(visible_devices_set)))
+
+        nnodes = -(-tp_size // len(visible_devices_set))
+        server_args = ServerArgs(model_path=actor_module, nnodes=nnodes)
+        ip, port_args = get_ip(), PortArgs.init_new(server_args)
+        [ip, port_args] = broadcast_pyobj([ip, port_args],
+                                          rank=tp_rank,
+                                          dist_group=device_mesh_cpu.get_group("tp"),
+                                          src=device_mesh_cpu["tp"].mesh[0].item())
+        dist_init_addr = f"{ip}:{port_args.nccl_port}"
+
+        max_num_batched_tokens = int(self.config.get('max_num_batched_tokens', 8192))
+        max_model_len = self.config.max_model_len if self.config.max_model_len \
+                        else config.prompt_length + config.response_length
+        max_model_len = int(max_model_len)
+
+        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+            raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+                             please increase max_num_batched_tokens or disable chunked prefill')
+
+
 
         self.inference_engine = VerlEngine(
             model_path=actor_module,
             dtype=config.dtype,
             mem_fraction_static=config.gpu_memory_utilization,
             device_mesh_cpu=device_mesh_cpu["tp"],
-            base_gpu_id=src_rank,
+            enable_memory_saver=True,
+            base_gpu_id=0,
             gpu_id_step=1,
+            context_length=config.prompt_length + config.response_length,
+            chunked_prefill_size=max_num_batched_tokens,
+            enable_mixed_chunk=self.config.enable_chunked_prefill,
+            dist_init_addr=dist_init_addr,
+            nnodes=nnodes
             # NOTE(Chenyang): if you want to debug the sglang engine
             # please set the following parameters
             # Otherwise, it will make the engine run too slow
@@ -209,20 +247,42 @@ class SGLangRollout(BaseRollout):
         eos_token_id = prompts.meta_info["eos_token_id"]
 
         batch_size = idx.size(0)
-        idx_list = []
-        # parse idx from torch.Tensor to List[List[str]]
-        for i in range(batch_size):
-            idx_list.append(_pre_process_inputs(self.pad_token_id, idx[i]))
+
+        # Extract non-tensor data
+        non_tensor_batch = prompts.non_tensor_batch
+        if 'raw_prompt_ids' not in non_tensor_batch:
+            non_tensor_batch['raw_prompt_ids'] = np.array(
+                [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
+
+        if 'multi_modal_data' in non_tensor_batch:
+            sglang_inputs = []
+            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
+                                                        non_tensor_batch.pop('multi_modal_data')):
+                sglang_inputs.append({
+                    'prompt_token_ids': raw_prompt_ids,
+                    'multi_modal_data': multi_modal_data,
+                    'image_data': multi_modal_data.get('image', None) if isinstance(multi_modal_data, dict) else None
+                })
+        else:
+            sglang_inputs = [{
+                'prompt_token_ids': raw_prompt_ids
+            } for raw_prompt_ids in non_tensor_batch.pop('raw_prompt_ids')]
+
+        # Ensure token IDs are lists
+        for input_data in sglang_inputs:
+            if isinstance(input_data['prompt_token_ids'], np.ndarray):
+                input_data['prompt_token_ids'] = input_data['prompt_token_ids'].tolist()
+            elif not isinstance(input_data['prompt_token_ids'], list):
+                raise TypeError(
+                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+
+        # Extract token IDs and image data for SGLang Engine
+        idx_list = [input_data['prompt_token_ids'] for input_data in sglang_inputs]
+        image_list = [input_data.get('image_data', None) for input_data in sglang_inputs]
 
         do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get('validate', False)
         if not do_sample:
-            # kwargs = {
-            #     'top_p': 1.0,
-            #     'top_k': -1,
-            #     'min_p': 0.0,
-            #     'temperature': 0,
-            #     'n': 1  # if greedy, only 1 response
-            # }
             kwargs = dict(
                 n=1,
                 presence_penalty=0.0,
@@ -233,9 +293,17 @@ class SGLangRollout(BaseRollout):
                 top_k=-1,
                 ignore_eos=False,
                 min_new_tokens=0,
-                max_new_tokens=4096,
+                max_new_tokens=self.config.response_length,
                 skip_special_tokens=True,
                 spaces_between_special_tokens=True,
+            )
+        elif  is_validate:
+            # TODO: try **
+            kwargs = dict(
+                top_k=self.config.val_kwargs.top_k,
+                top_p=self.config.val_kwargs.top_p,
+                temperature=self.config.val_kwargs.temperature,
+                n=1,
             )
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -245,21 +313,29 @@ class SGLangRollout(BaseRollout):
                 sampling_params=self.sampling_params,
                 return_logprob=True,
                 input_ids=idx_list,
-            )
+                image_data=image_list)
 
         out = _post_process_outputs(self.tokenizer, output)
 
         response = out[0].to(idx.device)
-        log_probs = out[1].to(idx.device)
+        # log_probs = out[1].to(idx.device)
 
         if response.shape[1] < self.config.response_length:
             response = pad_sequence_to_length(response, self.config.response_length, self.pad_token_id)
             log_probs = pad_sequence_to_length(log_probs, self.config.response_length, self.pad_token_id)
+        
+        non_tensor_batch = deepcopy(prompts.non_tensor_batch)
         if self.config.n > 1 and do_sample:
             idx = idx.repeat_interleave(self.config.n, dim=0)
             attention_mask = attention_mask.repeat_interleave(self.config.n, dim=0)
             position_ids = position_ids.repeat_interleave(self.config.n, dim=0)
             batch_size = batch_size * self.config.n
+
+            non_tensor_batch = {}
+            for key, val in prompts.non_tensor_batch.items():
+                # Repeat each element n times (interleaved)
+                non_tensor_batch[key] = _repeat_interleave(val, self.config.n)
+        
         seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
@@ -272,7 +348,9 @@ class SGLangRollout(BaseRollout):
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
         response_position_ids = position_ids[:, -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
+        response_attention_mask = get_response_mask(response_id=response,
+                                                    eos_token=eos_token_id,
+                                                    dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
@@ -281,15 +359,28 @@ class SGLangRollout(BaseRollout):
                 "prompts": idx,
                 "responses": response,
                 "input_ids": seq,  # here input_ids become the whole sentences
-                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
             },
             batch_size=batch_size,
         )
-
+        if self.config.enable_log_prob:
+            batch['old_log_probs'] = log_probs
+        
         # free cache engine
-        if self.config.free_cache_engine and self.inference_engine._engine is not None:
+        if (self.config.free_cache_engine and self.inference_engine._engine is not None and
+                self.inference_engine._engine.tokenizer_manager is not None):
             self.inference_engine._engine.tokenizer_manager.flush_cache()
 
-        return DataProto(batch=batch)
+        if self.reward_fn is not None and not is_validate:
+            init_batch = DataProto(
+                batch=batch,
+                non_tensor_batch=non_tensor_batch,
+                meta_info=prompts.meta_info
+            )
+            reward_tensor = self.reward_fn(init_batch)
+            batch['token_level_scores'] = reward_tensor
+
+        return DataProto(batch=batch,
+                         non_tensor_batch=non_tensor_batch,
+                         meta_info=prompts.meta_info)
