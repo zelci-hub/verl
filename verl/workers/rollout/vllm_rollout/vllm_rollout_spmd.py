@@ -1067,7 +1067,7 @@ class vLLMRollout(BaseRollout):
         
         response_position_ids = single_position_ids[:, -1:] + delta_position_id
         position_ids_out = torch.cat([single_position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_eos_mask(response_id=response, eos_token=meta_info['eos_token_id'], dtype=attention_mask_dtype)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=meta_info['eos_token_id'], dtype=attention_mask_dtype)
         attention_mask_out = torch.cat((single_attention_mask, response_attention_mask), dim=-1)
 
         batch = TensorDict(
