@@ -241,4 +241,3 @@ env:
 agent:
   name: webagent
   max_episodes: 20
-  max_trajectory_length: 8000

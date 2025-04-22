@@ -64,7 +64,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             tokenizer=self.tokenizer,
             model_path=self.config.actor_rollout_ref.model.path,
             episode_len=self.config.agent.max_episodes,
-            max_trajectory_length=self.config.agent.max_trajectory_length,
+            max_trajectory_length=self.config.data.max_response_length,
             max_prompt_length=self.config.data.max_prompt_length,
         )
 
@@ -431,7 +431,7 @@ class RayPPOAgentTrainer(RayPPOTrainer):
             prompt_tokens = traj["prompt_tokens"]
             response_tokens = traj["response_tokens"]
             # test if trajectory is empty
-            assert prompt_tokens.numel() != 0 and response_tokens.numel() != 0, f"Both prompt {prompt_tokens.numel()} and response {response_tokens.numel()} of trajectory shouldn't be empty. Please check make sure environment is working and the config: episode_length, max_trajectory_length, etc"
+            assert prompt_tokens.numel() != 0 and response_tokens.numel() != 0, f"Both prompt {prompt_tokens.numel()} and response {response_tokens.numel()} of trajectory shouldn't be empty. Please check make sure environment is working and the config"
             all_initial_tokens_list.append(prompt_tokens)
             all_response_tokens_list.append(response_tokens)
             all_masks_list.append(traj["response_masks"])
