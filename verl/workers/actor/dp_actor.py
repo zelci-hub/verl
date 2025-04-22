@@ -243,8 +243,6 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
-        if 'tool_call_mask' in data.batch:
-            select_keys.append('tool_call_mask')
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
@@ -288,8 +286,6 @@ class DataParallelPPOActor(BasePPOActor):
                     response_mask = attention_mask[:, -response_length:]
                     if "traj_mask" in data:
                         response_mask = data['traj_mask']
-                    if "tool_call_mask" in data:
-                        response_mask = data['tool_call_mask']
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
 
@@ -366,8 +362,6 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
-        if 'tool_call_mask' in data.batch:
-            select_keys.append('tool_call_mask')
         mini_batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
         
@@ -396,8 +390,6 @@ class DataParallelPPOActor(BasePPOActor):
             response_mask = attention_mask[:, -response_length:]
             if "traj_mask" in data:
                 response_mask = data['traj_mask']
-            if "tool_call_mask" in data:
-                response_mask = data['tool_call_mask']
             old_log_prob = data['old_log_probs']
             advantages = data['advantages']
 

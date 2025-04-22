@@ -1032,7 +1032,7 @@ class vLLMRollout(BaseRollout):
         log_probs = []
         for sample_id in range(len(output.outputs)):
             response.append(output.outputs[sample_id].token_ids)
-            if self.config.vllm_log_prob and \
+            if self.config.enable_log_prob and \
                 hasattr(output.outputs[sample_id], 'logprobs') and \
                 output.outputs[sample_id].logprobs is not None:
                 log_prob_list = []
@@ -1079,7 +1079,7 @@ class vLLMRollout(BaseRollout):
                 'position_ids': position_ids_out
             },
             batch_size=response.size(0))
-        if self.config.vllm_log_prob:
+        if self.config.enable_log_prob:
             batch['old_log_probs'] = log_probs
         
         
