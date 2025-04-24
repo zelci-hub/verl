@@ -28,10 +28,12 @@ from verl.single_controller.ray import (
 
 from rllm.environments.browsergym.browsergym import BrowserGym
 from rllm.models.web_agent import WebAgent
+from rllm.models.swe_agent import SweAgent
 from rllm.models.agent_execution_engine import AgentExecutionEngine
 
 AGENT_CLASS_MAPPING = {
     'webagent': WebAgent,
+    'swe': SweAgent,
 }
 
 def init_rollout_engine(config):
@@ -63,6 +65,8 @@ def init_env(config):
             extra_infos = dataset["extra_info"].tolist()
             extra_infos = [x for x in extra_infos for _ in range(config.data.n_samples)]
             return [BrowserGym.from_extra_info(i) for i in extra_infos]
+    elif config.env.name == 'swe':
+        pass
 
     raise ValueError(f"Environment {config.env.name} not supported")
 
@@ -97,7 +101,7 @@ def main(config):
         rollout_engine=rollout_engine,
         engine_name="verl",
         tokenizer=tokenizer,
-        episode_len=config.agent.max_episodes,
+        episode_len=config.agent.max_steps,
         agents=agents,
         envs=envs
     )

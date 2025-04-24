@@ -80,37 +80,6 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return np.repeat(value, repeats, axis=0)
 
 
-# Monkey patch for AsyncLLMEngine to support sleep and wakeup operations.
-def sleep(self, level: int = 1):
-        """
-        Put the engine to sleep. The engine should not process any requests.
-        The caller should guarantee that no requests are being processed
-        during the sleep period, before `wake_up` is called.
-
-        :param level: The sleep level. Level 1 sleep will offload the model 
-            weights and discard the kv cache. The content of kv cache is 
-            forgotten. Level 1 sleep is good for sleeping and waking up the 
-            engine to run the same model again. The model weights are backed 
-            up in CPU memory. Please make sure there's enough CPU memory to 
-            store the model weights. Level 2 sleep will discard both the model 
-            weights and the kv cache. The content of both the model weights 
-            and kv cache is forgotten. Level 2 sleep is good for sleeping and 
-            waking up the engine to run a different model or update the model, 
-            where previous model weights are not needed. It reduces CPU memory 
-            pressure.
-        """
-        self.engine.reset_prefix_cache()
-        self.engine.sleep(level=level)
-
-def wake_up(self):
-    """
-    Wake up the engine from sleep mode. See the :meth:`sleep` method
-    for more details."""
-    self.engine.wake_up()
-
-AsyncLLMEngine.sleep = sleep
-AsyncLLMEngine.wake_up = wake_up
-
 class vLLMRollout(BaseRollout):
 
     def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, reward_fn, val_reward_fn, **kwargs):
@@ -132,7 +101,7 @@ class vLLMRollout(BaseRollout):
         tensor_parallel_size = self.config.get('tensor_model_parallel_size', 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), \
             "tensor parallel size should be less than or equal to the world size"
-        max_num_batched_tokens = self.config.get('max_num_batched_tokens', 8192)
+        max_num_batched_tokens = self.config.get('max_num_batched_tokens', 32768)
         
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
@@ -154,9 +123,9 @@ class vLLMRollout(BaseRollout):
                         else config.prompt_length + config.response_length
         max_model_len = int(max_model_len)
 
-        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
-            raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
-                             please increase max_num_batched_tokens or disable chunked prefill')
+        # if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
+        #     raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
+        #                      please increase max_num_batched_tokens or disable chunked prefill')
 
         trust_remote_code = kwargs.get('trust_remote_code', False)
         load_format = 'dummy' if config.load_format.startswith('dummy') else config.load_format
