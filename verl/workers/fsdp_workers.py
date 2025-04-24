@@ -858,11 +858,6 @@ class ActorRolloutRefWorker(Worker):
         Args:
             new_actor_module_fsdp: The new FSDP-wrapped actor module (possibly on a different GPU).
         """
-        # Temp bandaid to kill zombie processes from coding.
-        try:
-            os.system('pkill -f "python3 /var/tmp/"')
-        except Exception as e:
-            pass
         new_state_dict = ray.get(new_state_dict_ref)
         # Ensure we are in a rollout role.
         if self.role not in ['rollout', 'actor_rollout', 'actor_rollout_ref']:
@@ -881,16 +876,16 @@ class ActorRolloutRefWorker(Worker):
             for k, v in new_state_dict.items()
         }
 
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        # if self._is_offload_param:
+        #     load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         # Load the new state dict into our local actor_module_fsdp.
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
         with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
             self.actor_module_fsdp.load_state_dict(new_state_dict)
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        # if self._is_offload_param:
+        #     offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
         # Update our reference to the underlying (unwrapped) module.
         self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
