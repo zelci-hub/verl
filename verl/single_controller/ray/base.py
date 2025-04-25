@@ -451,7 +451,7 @@ def _bind_workers_method_to_parent(cls, key, user_defined_cls):
             continue
 
         # Check if the method should be exposed (either has MAGIC_ATTR or is a specific method we want to expose)
-        should_expose = hasattr(method, MAGIC_ATTR) or method_name in ['generate']
+        should_expose = hasattr(method, MAGIC_ATTR) or method_name in ['generate', 'generate_async']
 
         if should_expose:
             def generate_function(name):
@@ -473,6 +473,8 @@ def _bind_workers_method_to_parent(cls, key, user_defined_cls):
                 
             try:
                 method_name_with_prefix = key + '_' + method_name
+                if method_name == 'generate_async' and 'rollout' in key:
+                    method_name_with_prefix = 'generate_async'
                 setattr(cls, method_name_with_prefix, func)
                 print(f'Binding {method_name_with_prefix}')
             except Exception as e:

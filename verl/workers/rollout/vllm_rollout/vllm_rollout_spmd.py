@@ -897,7 +897,7 @@ class vLLMRollout(BaseRollout):
         """
         Submit a DataProto batch to the async engine. Each item in the batch becomes a separate Future.
         """
-        assert self.config.async_engine, "generate_sequences_async_tool requires `async_engine=True`"
+        assert self.config.async_engine, "generate_async requires `async_engine=True`"
 
         batch_size = len(prompts)
         # start event loop if it wasn't already started

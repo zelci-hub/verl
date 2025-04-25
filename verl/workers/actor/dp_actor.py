@@ -414,7 +414,10 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode)
             # compute entropy loss from entropy
-            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+            if entropy_coeff !=0:
+                entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+            else:
+                entropy_loss = torch.tensor(0.0)
 
             # compute policy loss
             policy_loss = pg_loss - entropy_loss * entropy_coeff
