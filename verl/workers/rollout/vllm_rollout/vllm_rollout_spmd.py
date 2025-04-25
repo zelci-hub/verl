@@ -31,7 +31,7 @@ from typing import List
 from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import AsyncGenerator, Generator, List, Tuple, TypeVar, Union
+from typing import AsyncGenerator, Generator, List, Tuple, TypeVar, Union, Optional
 import asyncio
 import numpy as np
 import torch
@@ -78,6 +78,16 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
         return value.repeat_interleave(repeats, dim=0)
     else:
         return np.repeat(value, repeats, axis=0)
+
+# vLLM implements sleep and wake_up as a coroutine, so we implement a synchronous version.
+def sleep(self, level: int = 1) -> None:
+    self.engine.sleep(level)
+
+def wake_up(self, tags: Optional[list[str]] = None) -> None:
+    self.engine.wake_up(tags)
+
+AsyncLLMEngine.sleep = sleep
+AsyncLLMEngine.wake_up = wake_up
 
 
 class vLLMRollout(BaseRollout):
@@ -322,6 +332,9 @@ class vLLMRollout(BaseRollout):
 
         if prompts.meta_info.get('agent_rollout', False):
             kwargs['n'] = 1
+        
+        if prompts.meta_info.get('max_tokens', None):
+            kwargs['max_tokens'] = prompts.meta_info['max_tokens']
 
         if is_validate:
             # TODO: try **
@@ -469,7 +482,7 @@ class vLLMRollout(BaseRollout):
             kwargs = {
                 'best_of': 1,
                 'top_p': 1.0,
-                'top_k': -1,
+                'top_k': -1, 
                 'min_p': 0.0,
                 'temperature': 0,
                 'n': 1  # if greedy, only 1 response
@@ -477,6 +490,9 @@ class vLLMRollout(BaseRollout):
             
         if prompts.meta_info.get('agent_rollout', False):
             kwargs['n'] = 1
+
+        if prompts.meta_info.get('max_tokens', None):
+            kwargs['max_tokens'] = prompts.meta_info['max_tokens']
         
         if is_validate:
             # TODO: try **
