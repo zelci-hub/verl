@@ -898,7 +898,6 @@ class vLLMRollout(BaseRollout):
         Submit a DataProto batch to the async engine. Each item in the batch becomes a separate Future.
         """
         assert self.config.async_engine, "generate_async requires `async_engine=True`"
-
         batch_size = len(prompts)
         # start event loop if it wasn't already started
         self._start_event_loop(batch_size)
@@ -942,6 +941,9 @@ class vLLMRollout(BaseRollout):
             
         if prompts.meta_info.get('agent_rollout', False):
             kwargs['n'] = 1
+        
+        if prompts.meta_info.get('max_tokens', None):
+            kwargs['max_tokens'] = prompts.meta_info['max_tokens']
         
         if is_validate:
             # TODO: try **
