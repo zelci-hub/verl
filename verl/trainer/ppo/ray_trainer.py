@@ -183,7 +183,7 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, mask_truncated_samples=True):
+def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, mask_truncated_samples=False, clip_advantages=False):
     # Back-compatible with trainers that do not compute response mask in fit
     if "response_mask" not in data.batch.keys():
         data.batch['response_mask'] = compute_response_mask(data)
@@ -245,6 +245,10 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch['returns'] = returns
     else:
         raise NotImplementedError
+    
+    if clip_advantages:
+        data.batch['advantages'] = torch.clamp(data.batch['advantages'], -1, 1)
+    
     return data
 
 
