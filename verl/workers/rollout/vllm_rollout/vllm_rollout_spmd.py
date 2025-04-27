@@ -80,36 +80,15 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
     else:
         return np.repeat(value, repeats, axis=0)
 
-# Monkey patch for AsyncLLMEngine to support sleep and wakeup operations.
+#  vLLM 0.7.X
 def sleep_v1(self, level: int = 1):
-        """
-        Put the engine to sleep. The engine should not process any requests.
-        The caller should guarantee that no requests are being processed
-        during the sleep period, before `wake_up` is called.
-
-        :param level: The sleep level. Level 1 sleep will offload the model 
-            weights and discard the kv cache. The content of kv cache is 
-            forgotten. Level 1 sleep is good for sleeping and waking up the 
-            engine to run the same model again. The model weights are backed 
-            up in CPU memory. Please make sure there's enough CPU memory to 
-            store the model weights. Level 2 sleep will discard both the model 
-            weights and the kv cache. The content of both the model weights 
-            and kv cache is forgotten. Level 2 sleep is good for sleeping and 
-            waking up the engine to run a different model or update the model, 
-            where previous model weights are not needed. It reduces CPU memory 
-            pressure.
-        """
-        self.engine.reset_prefix_cache()
-        self.engine.sleep(level=level)
+    self.engine.reset_prefix_cache()
+    self.engine.sleep(level=level)
 
 def wake_up_v1(self):
-    """
-    Wake up the engine from sleep mode. See the :meth:`sleep` method
-    for more details."""
     self.engine.wake_up()
 
-
-# vLLM implements sleep and wake_up as a coroutine, so we implement a synchronous version.
+# vLLM 0.8.X implements sleep and wake_up as a coroutine, so we implement a synchronous version.
 def sleep_v2(self, level: int = 1) -> None:
     self.engine.sleep(level)
 
