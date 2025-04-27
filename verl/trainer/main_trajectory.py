@@ -111,7 +111,7 @@ def main(config):
         "agent_rollout": True
     }
 
-    evaluate_trajectories = agent_engine.interact_environment(original_batch=original_batch)
+    evaluate_trajectories = agent_engine.generate_trajectories(original_batch=original_batch)
 
     evaluate_metrics = {
         "evaluate_rollout.mean": np.mean([

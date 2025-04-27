@@ -397,8 +397,8 @@ class RayPPOAgentTrainer(RayPPOTrainer):
         # Reset the agent.
         self.agent_execution_engine.update_envs_and_agents(envs, agents)
         with _timer("collect_trajectory", timing_raw):
-            # Interact_environment returns list of trajectories.
-            trajectories = self.agent_execution_engine.interact_environment(
+            # generate_trajectories returns list of trajectories.
+            trajectories = self.agent_execution_engine.generate_trajectories(
                 timing_raw=timing_raw, mode="Token", meta_info=meta_info
             )
 
