@@ -26,12 +26,14 @@ from verl.single_controller.ray import (
     RayWorkerGroup,
 )
 
-from rllm.environments.browsergym import BatchBrowserGym
+from rllm.environments.browsergym.browsergym import BrowserGym
 from rllm.models.web_agent import WebAgent
-from rllm.models.batch_agent import BatchAgent
+from rllm.models.swe_agent import SweAgent
+from rllm.models.agent_execution_engine import AgentExecutionEngine
 
 AGENT_CLASS_MAPPING = {
     'webagent': WebAgent,
+    'swe': SweAgent,
 }
 
 def init_rollout_engine(config):
@@ -62,7 +64,9 @@ def init_env(config):
             dataset = pd.read_parquet(config.data.path)
             extra_infos = dataset["extra_info"].tolist()
             extra_infos = [x for x in extra_infos for _ in range(config.data.n_samples)]
-            return BatchBrowserGym.from_json(extra_infos)
+            return [BrowserGym.from_extra_info(i) for i in extra_infos]
+    elif config.env.name == 'swe':
+        pass
 
     raise ValueError(f"Environment {config.env.name} not supported")
 
@@ -89,26 +93,25 @@ def main(config):
         tokenizer.pad_token = tokenizer.eos_token
 
     rollout_engine = init_rollout_engine(config)
-    env = init_env(config)
+    envs = init_env(config)
     agent_class = AGENT_CLASS_MAPPING[config.agent.name]
+    agents = [agent_class() for _ in range(len(envs))]
 
-    agent = BatchAgent(
+    agent_engine = AgentExecutionEngine(
         rollout_engine=rollout_engine,
         engine_name="verl",
         tokenizer=tokenizer,
-        agent_class=agent_class,
-        n_parallel_agents=env.batch_size,
-        env=env,
-        episode_len=config.agent.trajectory_episode_len,
+        episode_len=config.agent.max_steps,
+        agents=agents,
+        envs=envs
     )
 
-    original_batch = DataProto.from_dict({"dummy_batch": torch.empty(env.batch_size, 1)})
+    original_batch = DataProto.from_dict({"dummy_batch": torch.empty(len(envs), 1)})
     original_batch.meta_info = {
         "agent_rollout": True
     }
 
-    evaluate_trajectories = agent.interact_environment(original_batch=original_batch)
-    env.close()
+    evaluate_trajectories = agent_engine.generate_trajectories(original_batch=original_batch)
 
     evaluate_metrics = {
         "evaluate_rollout.mean": np.mean([

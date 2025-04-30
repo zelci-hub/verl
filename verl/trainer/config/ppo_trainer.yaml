@@ -35,6 +35,8 @@ actor_rollout_ref:
     use_dynamic_bsz: False
     ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
     grad_clip: 1.0
+    # Max grad norm to skip gradient update.
+    grad_norm_threshold: 1e5
     # pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
     clip_ratio: 0.2 # default value if clip_ratio_low and clip_ratio_high are not specified
     clip_ratio_low: 0.2
@@ -240,5 +242,4 @@ env:
 
 agent:
   name: webagent
-  trajectory_episode_len: 20
-  max_trajectory_length: 8000
+  max_steps: 20

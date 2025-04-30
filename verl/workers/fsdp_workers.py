@@ -20,6 +20,11 @@ import os
 import ray
 import warnings
 import psutil
+from queue import Queue
+import queue
+from concurrent.futures import Future, as_completed
+import threading
+import uuid
 
 import torch
 import torch.distributed
@@ -301,6 +306,7 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After actor optimizer init', logger=logger)
 
         return actor_module_fsdp, actor_optimizer, actor_lr_scheduler, actor_model_config
+    
 
     def _build_rollout(self, trust_remote_code=False):
         from torch.distributed.device_mesh import init_device_mesh
@@ -744,6 +750,62 @@ class ActorRolloutRefWorker(Worker):
         log_gpu_memory_usage('After compute_log_prob', logger=logger)
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, execute_mode=Execute.ALL, blocking=True)
+    def generate_async_sharding_manager_enter(self):
+        """
+        Setup the rollout engine for async generation
+        """
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        self.rollout_sharding_manager.__enter__()
+
+        # after parameters sync with rollout, offload actor model to CPU
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+
+        log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, execute_mode=Execute.ALL, blocking=True)
+    def generate_async_sharding_manager_exit(self):
+        """
+        Sleeps the rollout engine for async generation
+        """
+        self.rollout_sharding_manager.__exit__(None, None, None)
+        torch.cuda.empty_cache()
+        log_gpu_memory_usage('After generate sequences', logger=logger)
+
+    async def generate_async(self, prompts: DataProto = None, **kwargs):
+        assert self._is_rollout, "generate_sequences_async requires rollout capability"
+        assert hasattr(self.rollout, 'generate_sequences_async'), "Rollout engine must support generate_sequences_async"
+
+        if prompts is None:
+            return None
+      
+        # add requests to generation
+        prompts = prompts.to(torch.cuda.current_device())
+        meta_info = {
+            'eos_token_id':
+                self.generation_config.eos_token_id
+                if self.generation_config is not None else self.tokenizer.eos_token_id,
+            'pad_token_id':
+                self.generation_config.pad_token_id
+                if self.generation_config is not None else self.tokenizer.pad_token_id,
+        }
+        prompts.meta_info.update(meta_info)
+
+        # Note: rollout sharding manager is not used for async generation because router handles requests dispatching
+        # prompts = self.rollout_sharding_manager.preprocess_data(prompts
+        output = await self.rollout.generate_async(prompts=prompts, **kwargs) # gives a list of DataProto as result
+        # output = [self.rollout_sharding_manager.postprocess_data(o) for o in output]
+
+        output = [o.to('cpu') for o in output]
+        log_gpu_memory_usage('After generation', logger=logger)
+        
+        return output
+        
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
@@ -796,11 +858,6 @@ class ActorRolloutRefWorker(Worker):
         Args:
             new_actor_module_fsdp: The new FSDP-wrapped actor module (possibly on a different GPU).
         """
-        # Temp bandaid to kill zombie processes from coding.
-        try:
-            os.system('pkill -f "python3 /var/tmp/"')
-        except Exception as e:
-            pass
         new_state_dict = ray.get(new_state_dict_ref)
         # Ensure we are in a rollout role.
         if self.role not in ['rollout', 'actor_rollout', 'actor_rollout_ref']:
@@ -819,16 +876,16 @@ class ActorRolloutRefWorker(Worker):
             for k, v in new_state_dict.items()
         }
 
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        # if self._is_offload_param:
+        #     load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
         # Load the new state dict into our local actor_module_fsdp.
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
         with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
             self.actor_module_fsdp.load_state_dict(new_state_dict)
 
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        # if self._is_offload_param:
+        #     offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
         # Update our reference to the underlying (unwrapped) module.
         self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module

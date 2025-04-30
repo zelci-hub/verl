@@ -167,7 +167,7 @@ class DataParallelPPOActor(BasePPOActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
 
         # if grad_norm is not finite, skip the update
-        if not torch.isfinite(grad_norm):
+        if not torch.isfinite(grad_norm) or grad_norm >= self.config.grad_norm_threshold:
             print(f"WARN: grad_norm is not finite: {grad_norm}")
             self.actor_optimizer.zero_grad()
         else:
@@ -243,8 +243,6 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
-        if 'tool_call_mask' in data.batch:
-            select_keys.append('tool_call_mask')
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
@@ -288,8 +286,6 @@ class DataParallelPPOActor(BasePPOActor):
                     response_mask = attention_mask[:, -response_length:]
                     if "traj_mask" in data:
                         response_mask = data['traj_mask']
-                    if "tool_call_mask" in data:
-                        response_mask = data['tool_call_mask']
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
 
@@ -366,8 +362,6 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
-        if 'tool_call_mask' in data.batch:
-            select_keys.append('tool_call_mask')
         mini_batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
         
@@ -396,8 +390,6 @@ class DataParallelPPOActor(BasePPOActor):
             response_mask = attention_mask[:, -response_length:]
             if "traj_mask" in data:
                 response_mask = data['traj_mask']
-            if "tool_call_mask" in data:
-                response_mask = data['tool_call_mask']
             old_log_prob = data['old_log_probs']
             advantages = data['advantages']
 
@@ -422,7 +414,10 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode)
             # compute entropy loss from entropy
-            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+            if entropy_coeff !=0:
+                entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+            else:
+                entropy_loss = torch.tensor(0.0)
 
             # compute policy loss
             policy_loss = pg_loss - entropy_loss * entropy_coeff

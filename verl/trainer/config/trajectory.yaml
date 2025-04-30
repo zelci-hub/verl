@@ -75,4 +75,4 @@ env:
 
 agent:
   name: webagent
-  trajectory_episode_len: 20
+  max_steps: 20

@@ -108,7 +108,7 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    response_mask: torch.Tensor,
                                    index: np.ndarray,
                                    epsilon: float = 1e-6,
-                                   mask_truncated_samples: bool = True):
+                                   mask_truncated_samples: bool = False):
     """
     Compute advantage for GRPO, operating only on Outcome reward 
     (with only one scalar reward for each response).
@@ -382,7 +382,8 @@ def agg_loss(loss_mat: torch.Tensor, loss_mask: torch.Tensor, loss_agg_mode: str
     if loss_agg_mode == "token-mean":
         loss = verl_F.masked_mean(loss_mat, loss_mask)
     elif loss_agg_mode == "seq-mean-token-sum":
-        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
+        response_length = loss_mat.shape[-1]
+        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / response_length  # token-sum
         loss = torch.mean(seq_losses)  # seq-mean
     elif loss_agg_mode == "seq-mean-token-mean":
         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / torch.sum(loss_mask, dim=-1)  # token-mean
@@ -441,8 +442,7 @@ def compute_policy_loss(old_log_prob,
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
-
-
+    
     pg_losses1 = -advantages * ratio
     pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low,
                                            1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange) * A
