@@ -119,6 +119,10 @@ class ActorRolloutRefWorker(Worker):
             # TODO: it seems that manual offload is slowly than FSDP offload
             self._is_offload_param = self.config.ref.fsdp_config.get('param_offload', False)
 
+        if self.role == 'rollout':
+            # for rollout worker, the FSDP module should always be on CPU
+            self._is_offload_param = True
+
         # normalize config
         if self._is_actor:
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
@@ -841,6 +845,7 @@ class ActorRolloutRefWorker(Worker):
 
         with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
             new_state_dict = self.actor_module_fsdp.state_dict()
+            new_state_dict = {k: v.cpu() for k, v in new_state_dict.items()}
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
