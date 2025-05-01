@@ -128,6 +128,8 @@ class RLHFDataset(Dataset):
                 import polars as pl
                 dataframe = pl.read_parquet(parquet_file)
                 dataframe = dataframe.to_pandas()
+                # Convert to datasets.Dataset
+                dataframe = datasets.Dataset.from_pandas(dataframe)
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
