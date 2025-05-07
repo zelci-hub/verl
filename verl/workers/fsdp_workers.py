@@ -25,6 +25,7 @@ import queue
 from concurrent.futures import Future, as_completed
 import threading
 import uuid
+from typing import List
 
 import torch
 import torch.distributed
@@ -800,10 +801,7 @@ class ActorRolloutRefWorker(Worker):
         prompts.meta_info.update(meta_info)
 
         # Note: rollout sharding manager is not used for async generation because router handles requests dispatching
-        # prompts = self.rollout_sharding_manager.preprocess_data(prompts
-        output = await self.rollout.generate_async(prompts=prompts, **kwargs) # gives a list of DataProto as result
-        # output = [self.rollout_sharding_manager.postprocess_data(o) for o in output]
-
+        output: List[DataProto] = await self.rollout.generate_async(prompts=prompts, **kwargs)
         output = [o.to('cpu') for o in output]
         log_gpu_memory_usage('After generation', logger=logger)
         
