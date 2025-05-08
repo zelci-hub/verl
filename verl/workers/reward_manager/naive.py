@@ -15,17 +15,18 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 from typing import Dict, Any
 
+from collections import defaultdict
+
+import torch
+
 from verl import DataProto
 from verl.utils.reward_score import _default_compute_score
-import torch
-from collections import defaultdict
 
 
 class NaiveRewardManager:
-    """The reward manager.
-    """
+    """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key='data_source') -> None:
+    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or _default_compute_score
@@ -35,13 +36,13 @@ class NaiveRewardManager:
         """We will expand this function gradually based on the available datasets"""
 
         # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
-        if 'rm_scores' in data.batch.keys():
+        if "rm_scores" in data.batch.keys():
             if return_dict:
-                return {"reward_tensor": data.batch['rm_scores']}
+                return {"reward_tensor": data.batch["rm_scores"]}
             else:
-                return data.batch['rm_scores']
+                return data.batch["rm_scores"]
 
-        reward_tensor = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
 
         already_print_data_sources = {}
@@ -65,11 +66,12 @@ class NaiveRewardManager:
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
-            ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
+            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
 
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
 
-            extra_info = data_item.non_tensor_batch.get('extra_info', None)
+            extra_info = data_item.non_tensor_batch.get("extra_info", None)
+
             score = self.compute_score(
                 data_source=data_source,
                 solution_str=response_str,

@@ -22,14 +22,19 @@ import hydra
 import os
 from tabulate import tabulate
 
-os.environ['NCCL_DEBUG'] = 'WARN'
-os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+import hydra
+import numpy as np
+import ray
+
+os.environ["NCCL_DEBUG"] = "WARN"
+os.environ["TOKENIZERS_PARALLELISM"] = "true"
 # os.environ['TORCH_COMPILE_DISABLE'] = '1'
 
-from verl.utils.model import compute_position_id_with_mask
+from pprint import pprint
 
 import pandas as pd
 
+from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 import wandb
 
@@ -65,33 +70,34 @@ def select_reward_fn(data_source):
         return reward_fn
 
 
-@hydra.main(config_path='config', config_name='generation', version_base=None)
+@hydra.main(config_path="config", config_name="generation", version_base=None)
 def main(config):
     run_generation(config)
 
 
 def run_generation(config) -> None:
-
     if not ray.is_initialized():
         # this is for local ray cluster
-        ray.init(runtime_env={'env_vars': {'TOKENIZERS_PARALLELISM': 'true', 'NCCL_DEBUG': 'WARN'}})
+        ray.init(
+            runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN"}},
+            num_cpus=config.ray_init.num_cpus,
+        )
 
     ray.get(main_task.remote(config))
 
 
 @ray.remote(num_cpus=1)
 def main_task(config):
-    from pprint import pprint
-    from omegaconf import OmegaConf
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
+
     local_path = copy_to_local(config.model.path)
-    from verl.utils import hf_tokenizer
-    trust_remote_code = config.data.get('trust_remote_code', False)
+    trust_remote_code = config.data.get("trust_remote_code", False)
     tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
 
-    if config.rollout.temperature == 0.:
-        assert config.data.n_samples == 1, 'When temperature=0, n_samples must be 1.'
+    if config.rollout.temperature == 0.0:
+        assert config.data.n_samples == 1, "When temperature=0, n_samples must be 1."
+    assert config.data.n_samples >= 1, "n_samples should always >= 1"
 
     wandb.init(project='verl')
     run_generation(config)
@@ -226,5 +232,5 @@ def run_generation(config):
     # Print table
     print(tabulate(table_data, headers=['Metric', 'Value'], tablefmt='grid'))
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

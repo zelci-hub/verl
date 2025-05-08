@@ -19,136 +19,63 @@ When working with FSDP:
 When working with Megatron:
 - Use Megatron weight loader
 - During training, only the current pp stage holds the parameters
-- Before inference, broadcast the parameters of the current pp rank to all other pp ranks (all pp ranks holds all the parameters)
+- Before inference, broadcast the parameters of the current pp rank
+  to all other pp ranks (all pp ranks holds all the parameters)
 - Bind the parameters to the inference engine
 - Do inference in tp. pp is treated as additional dp
 - After inference, all the parameters that doesn't belong to this pp rank is freed.
 """
+import asyncio
 import copy
+import logging
 import os
-import numpy as np
-from typing import List
+import random
+import threading
+import uuid
+from concurrent.futures import Future
 from contextlib import contextmanager
 from copy import deepcopy
 from types import SimpleNamespace
-from typing import AsyncGenerator, Generator, List, Literal, Tuple, TypeVar, Union, Optional
-import asyncio
+from typing import Any, AsyncGenerator, Dict, Generator, List, Literal, Optional, Tuple, TypeVar, Union
+
 import numpy as np
 import torch
 import torch.distributed
-import uuid
 from omegaconf import DictConfig
 from tensordict import TensorDict
-from concurrent.futures import Future
-import threading
-
-from rllm.tools.multi_tool import MultiTool
-from rllm.parser import get_tool_parser
-from rllm.tools.tool_base import ToolOutputs
 from torch import nn
-from typing import Any, Dict, Union
+
+from rllm.parser import get_tool_parser
+from rllm.tools.multi_tool import MultiTool
+from rllm.tools.tool_base import ToolOutputs
 from verl import DataProto
+from verl.third_party.vllm import vllm_version
+from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.rollout.vllm_rollout.utils import run_async_generator
-from verl.third_party.vllm import vllm_version
-
+from verl.workers.rollout.vllm_rollout.monkey_patch import (
+    wake_up_v1,
+    wake_up_v2,
+    sleep_v1,
+    sleep_v2,
+    _validate_model_input,
+)
 import vllm
-from vllm import AsyncLLMEngine, LLM, SamplingParams, TokensPrompt, LLMEngine
+from vllm import AsyncLLMEngine, LLM, LLMEngine, SamplingParams, TokensPrompt
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.inputs import SingletonInputs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.outputs import RequestOutput
+from vllm.worker.worker_base import WorkerWrapperBase
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Set very long timeout to effectively disable it
 os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds
-
-# TODO
-# 1. support pp in vllm
-# 2. passing tokenizer is not necessary? no encoding/decoding is happending here
-# 3. simplify init logics
-# NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
-def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
-    # remove the left padding in the prompt token_id
-    # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
-    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
-    token_ids = prompt_token_ids[non_pad_index:].tolist()
-    return token_ids
-
-def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
-    if isinstance(value, torch.Tensor):
-        return value.repeat_interleave(repeats, dim=0)
-    else:
-        return np.repeat(value, repeats, axis=0)
-
-#  vLLM 0.7.X
-def sleep_v1(self, level: int = 1):
-    self.engine.reset_prefix_cache()
-    self.engine.sleep(level=level)
-
-def wake_up_v1(self):
-    self.engine.wake_up()
-
-# vLLM 0.8.X implements sleep and wake_up as a coroutine, so we implement a synchronous version.
-def sleep_v2(self, level: int = 1) -> None:
-    self.engine.reset_prefix_cache()
-    self.engine.sleep(level)
-
-def wake_up_v2(self, tags: Optional[list[str]] = None) -> None:
-    self.engine.wake_up(tags)
-
-def _validate_model_input(
-        self,
-        prompt_inputs: SingletonInputs,
-        lora_request: Optional[LoRARequest],
-        *,
-        prompt_type: Literal["encoder", "decoder"],
-    ):
-    model_config = self.model_config
-    tokenizer = (None if self.tokenizer is None else
-                    self.tokenizer.get_lora_tokenizer(lora_request))
-
-    prompt_ids = prompt_inputs["prompt_token_ids"]
-    if prompt_ids is None or len(prompt_ids) == 0:
-        if prompt_type == "encoder" and model_config.is_multimodal_model:
-            pass  # Mllama may have empty encoder inputs for text-only data
-        else:
-            raise ValueError(f"The {prompt_type} prompt cannot be empty")
-
-    max_prompt_len = self.model_config.max_model_len
-    if len(prompt_ids) > max_prompt_len:
-        if prompt_type == "encoder" and model_config.is_multimodal_model:
-            mm_registry = self.input_preprocessor.mm_registry
-            mm_processor = mm_registry.create_processor(
-                model_config,
-                tokenizer=tokenizer or object(),  # Dummy if no tokenizer
-            )
-            assert isinstance(mm_processor, EncDecMultiModalProcessor)
-
-            if mm_processor.pad_dummy_encoder_prompt:
-                return  # Skip encoder length check for Whisper
-
-        if model_config.is_multimodal_model:
-            suggestion = (
-                "Make sure that `max_model_len` is no smaller than the "
-                "number of text tokens plus multimodal tokens. For image "
-                "inputs, the number of image tokens depends on the number "
-                "of images, and possibly their aspect ratios as well.")
-        else:
-            suggestion = (
-                "Make sure that `max_model_len` is no smaller than the "
-                "number of text tokens.")
-
-        raise ValueError(
-            f"The {prompt_type} prompt (length {len(prompt_ids)}) is "
-            f"longer than the maximum model length of {max_prompt_len}. "
-            f"{suggestion}")
-
-        # TODO: Find out how many placeholder tokens are there so we can
-        # check that chunked prefill does not truncate them
-        # max_batch_len = self.scheduler_config.max_num_batched_tokens
 
 vllm_version = vllm.__version__
 
@@ -168,6 +95,24 @@ else:
 
 LLMEngine._validate_model_input = _validate_model_input
 
+# TODO
+# 1. support pp in vllm
+# 2. passing tokenizer is not necessary? no encoding/decoding is happending here
+# 3. simplify init logics
+# NOTE(sgm): add for verl. We can optimize it by making the dataloader yield List[int] without padding.
+def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
+    # remove the left padding in the prompt token_id
+    # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id
+    # is not None else self.llm_engine.tokenizer.eos_token_id
+    non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)[0][0]
+    token_ids = prompt_token_ids[non_pad_index:].tolist()
+    return token_ids
+
+def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, List[Any]]:
+    if isinstance(value, torch.Tensor):
+        return value.repeat_interleave(repeats, dim=0)
+    else:
+        return np.repeat(value, repeats, axis=0)
 
 
 class vLLMRollout(BaseRollout):
@@ -185,40 +130,47 @@ class vLLMRollout(BaseRollout):
         
         super().__init__()
         self.config = config
-        assert not (not config.enforce_eager and config.free_cache_engine), \
-            "disable CUDA graph (enforce_eager = False) if free cache engine"
+        assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
-        tensor_parallel_size = self.config.get('tensor_model_parallel_size', 1)
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), \
-            "tensor parallel size should be less than or equal to the world size"
-        max_num_batched_tokens = self.config.get('max_num_batched_tokens', 32768)
+        tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
+        max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
         
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
         
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
-            os.environ['CUDA_TIMER_STREAM_KAFKA_ENABLE'] = '0'
-            os.environ['MEGATRON_IMPORT_TIMERS'] = '0'
-            train_tp = kwargs.get('train_tp', None)
-            num_tp_per_train_tp = train_tp // tensor_parallel_size
-            vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size,
-                                              num_tp_per_train_tp=num_tp_per_train_tp)
+            import os
+
+            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
+            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
+            if vllm_version in (
+                "0.5.4",
+                "0.6.3",
+            ):
+                train_tp = kwargs.get("train_tp")
+                num_tp_per_train_tp = train_tp // tensor_parallel_size
+                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
+            else:
+                vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
 
         # assert model_hf_config.max_position_embeddings >= config.prompt_length + config.response_length, \
         #     "model context length should be greater than total sequence length"
 
 
-        max_model_len = self.config.max_model_len if self.config.max_model_len \
-                        else config.prompt_length + config.response_length
-        max_model_len = int(max_model_len)
+        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
 
         # if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
         #     raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
         #                      please increase max_num_batched_tokens or disable chunked prefill')
 
-        trust_remote_code = kwargs.get('trust_remote_code', False)
-        load_format = 'dummy' if config.load_format.startswith('dummy') else config.load_format
+        trust_remote_code = kwargs.get("trust_remote_code", False)
+        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
+
+        limit_mm_per_prompt = None
+        if config.get("limit_images", None):  # support for multi-image data
+            limit_mm_per_prompt = {"image": config.get("limit_images")}
 
         if config.async_engine:
             self.inference_engine = AsyncLLMEngine.from_engine_args(
@@ -240,7 +192,7 @@ class vLLMRollout(BaseRollout):
                     enable_chunked_prefill=config.enable_chunked_prefill,
                     enable_prefix_caching=True,
                     trust_remote_code=trust_remote_code,
-                    seed=int(os.getenv("RANK", "0")) // tensor_parallel_size,
+                    seed=config.get("seed", random.randint(0, 1000000)), # Random seed
                 )
             )
 
@@ -272,7 +224,7 @@ class vLLMRollout(BaseRollout):
                 enable_chunked_prefill=config.enable_chunked_prefill,
                 enable_prefix_caching=True,
                 trust_remote_code=trust_remote_code,
-                seed=int(os.getenv("RANK", "0")) // tensor_parallel_size,
+                seed=config.get("seed", random.randint(0, 1000000)), # Random seed
             )
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
@@ -284,8 +236,8 @@ class vLLMRollout(BaseRollout):
         )
 
         # # we may detokenize the result all together later
-        if vllm_version != '0.3.1':
-            kwargs['detokenize'] = False
+        if vllm_version != "0.3.1":
+            kwargs["detokenize"] = False
 
         # supporting adding any sampling params from the config file
         for k in config.keys():
@@ -347,6 +299,7 @@ class vLLMRollout(BaseRollout):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
 
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         # Handle async engine case
@@ -355,17 +308,25 @@ class vLLMRollout(BaseRollout):
             for output in self.generate_sequences_async(prompts):
                 outputs.append(output)
             return DataProto.concat(outputs)
-        # Rebuild vllm cache engine
-        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+
+        # rebuild vllm cache engine
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+        ):
             self.inference_engine.init_cache_engine()
 
-        idx = prompts.batch['input_ids']  # (bs, prompt_length)
+        idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask
-        attention_mask = prompts.batch['attention_mask']
-        position_ids = prompts.batch['position_ids']
+        attention_mask = prompts.batch["attention_mask"]
+        position_ids = prompts.batch["position_ids"]
 
         # used to construct attention_mask
-        eos_token_id = prompts.meta_info['eos_token_id']
+        eos_token_id = prompts.meta_info["eos_token_id"]
 
         batch_size = idx.size(0)
 
@@ -374,10 +335,10 @@ class vLLMRollout(BaseRollout):
             non_tensor_batch['raw_prompt_ids'] = np.array(
                 [_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
 
-        if batch_size != len(non_tensor_batch['raw_prompt_ids']):
-            raise RuntimeError('vllm sharding manager is not work properly.')
+        if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
+            raise RuntimeError("vllm sharding manager is not work properly.")
 
-        if 'multi_modal_data' in non_tensor_batch:
+        if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
             for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop('raw_prompt_ids'),
                                                         non_tensor_batch.pop('multi_modal_data')):
@@ -392,22 +353,21 @@ class vLLMRollout(BaseRollout):
         # ensure the type of `prompt_token_ids` passed to vllm is list[int]
         # https://github.com/volcengine/verl/pull/772
         for input_data in vllm_inputs:
-            if isinstance(input_data['prompt_token_ids'], np.ndarray):
-                input_data['prompt_token_ids'] = input_data['prompt_token_ids'].tolist()
-            elif not isinstance(input_data['prompt_token_ids'], list):
-                raise TypeError(
-                    f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
+            if isinstance(input_data["prompt_token_ids"], np.ndarray):
+                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
+            elif not isinstance(input_data["prompt_token_ids"], list):
+                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
 
-        do_sample = prompts.meta_info.get('do_sample', True)
-        is_validate = prompts.meta_info.get('validate', False)
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
             kwargs = {
-                'best_of': 1,
-                'top_p': 1.0,
-                'top_k': -1,
-                'min_p': 0.0,
-                'temperature': 0,
-                'n': 1  # if greedy, only 1 response
+                "best_of": 1,
+                "top_p": 1.0,
+                "top_k": -1,
+                "min_p": 0.0,
+                "temperature": 0,
+                "n": 1,  # if greedy, only 1 response
             }
 
         if prompts.meta_info.get('agent_rollout', False):
@@ -477,11 +437,9 @@ class vLLMRollout(BaseRollout):
         # prompt: left pad + response: right pad
         # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
         # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[:, -1:] + delta_position_id
+        response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(response_id=response,
-                                                    eos_token=eos_token_id,
-                                                    dtype=attention_mask.dtype)
+        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
         # all the tp ranks should contain the same data here. data in all ranks are valid
@@ -946,7 +904,14 @@ class vLLMRollout(BaseRollout):
             yield generated_seq
 
         # free vllm cache engine
-        if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+        ):
             self.inference_engine.free_cache_engine()
         return None
 
@@ -1166,3 +1131,57 @@ class vLLMRollout(BaseRollout):
         )
         
         return result
+
+
+class vLLMAsyncRollout:
+    """vLLMAsyncRollout is a thin wrapper of WorkerWrapperBase,
+    which is engine in single worker process.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Engine is deferred to be initialized in init_worker
+        self.inference_engine: WorkerWrapperBase = None
+        self.sharding_manager = None
+        self.is_sleep = False
+
+    def init_worker(self, all_kwargs: List[Dict[str, Any]]):
+        """Initialize worker engine."""
+        all_kwargs[0]["rank"] = int(os.environ["RANK"])
+        all_kwargs[0]["local_rank"] = 0
+
+        self.vllm_config = all_kwargs[0]["vllm_config"]
+        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        self.inference_engine.init_worker(all_kwargs)
+
+    def load_model(self, *args, **kwargs):
+        self.inference_engine.load_model(*args, **kwargs)
+
+        # inference engine is intialized now, update sharding manager
+        self.sharding_manager.inference_engine = self.inference_engine
+        self.sharding_manager.model_runner = self.inference_engine.worker.model_runner
+
+    def sleep(self, *args, **kwargs):
+        """Offload model weights and discard kv cache."""
+        if self.is_sleep:
+            return
+        self.sharding_manager.__exit__(None, None, None)
+        self.is_sleep = True
+
+    def wake_up(self, *args, **kwargs):
+        """Load model weights and build kv cache."""
+        if not self.is_sleep:
+            return
+        self.sharding_manager.__enter__()  # pylint: disable=C2801
+        self.is_sleep = False
+
+    def execute_method(self, method: Union[str, bytes], *args, **kwargs):
+        if method == "init_worker":
+            return self.init_worker(*args, **kwargs)
+        elif method == "load_model":
+            return self.load_model(*args, **kwargs)
+        elif method == "sleep":
+            return self.sleep(*args, **kwargs)
+        elif method == "wake_up":
+            return self.wake_up(*args, **kwargs)
+        else:
+            return self.inference_engine.execute_method(method, *args, **kwargs)
