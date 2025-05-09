@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Dict, List, Tuple, Type
 from uuid import uuid4
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
 import fastapi
@@ -31,6 +32,7 @@ from cachetools import LRUCache
 from omegaconf import DictConfig
 from openai import AsyncOpenAI
 from openai.types.chat.chat_completion import ChatCompletion
+from openai.types.completion import Completion
 from starlette.requests import Request
 
 from verl.protocol import DataProto
@@ -38,6 +40,7 @@ from verl.single_controller.ray.base import RayWorkerGroup
 from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 
+from transformers import AutoTokenizer
 logger = logging.getLogger(__file__)
 
 
@@ -70,6 +73,7 @@ class AsyncServerBase(ABC):
 
         app = fastapi.FastAPI(lifespan=lifespan)
         app.router.add_api_route("/v1/chat/completions", self.chat_completion, methods=["POST"])
+        app.router.add_api_route("/v1/completions", self.completions, methods=["POST"])
 
         self.port = _get_free_port()
         config = uvicorn.Config(app, host=["::", "0.0.0.0"], port=self.port, log_level="warning")
@@ -86,6 +90,14 @@ class AsyncServerBase(ABC):
         """OpenAI chat completion API.
 
         API reference: https://platform.openai.com/docs/api-reference/chat/create
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    async def completions(self, raw_request: Request):
+        """OpenAI completions API.
+
+        API reference: https://platform.openai.com/docs/api-reference/completions/create
         """
         raise NotImplementedError
 
@@ -192,12 +204,82 @@ class ChatCompletionScheduler:
 
         await callback(completions, callback_additional_info, exception)
 
+    async def submit_completions(
+        self,
+        callback: Callable[[Any, Dict[str, Any], Exception], None],
+        callback_additional_info: Dict[str, Any],
+        **completions_request,
+    ):
+        """
+        Submit a completion request to the server with the least number of requests.
+
+        Args:
+            callback: Callable[[Any, Dict[str, Any], Exception], None], async callback function
+                to handle the response. The callback function should have the following signature:
+
+                ```python
+                async def callback(completions: Any, info: Dict[str, Any], exception: Exception):
+                    ...
+                ```
+                - completions: completion response from server.
+                - info: user provided `callback_additional_info`.
+                - exception: exception raise from OpenAI client if request failed, otherwise None.
+
+                **CAUTION**: the callback function must be async and non-blocking, if you have any blocking operation,
+                please move to seperate thread or process pool to avoid blocking the event loop.
+
+            callback_additional_info: Dict[str, Any], additional info to pass to the callback function.
+
+            **completions_request: dict, request parameters same as OpenAI AsyncCompletions.create.
+                OpenAI API reference: https://platform.openai.com/docs/api-reference/completions/create
+        """
+        if "extra_headers" not in completions_request:
+            completions_request["extra_headers"] = {}
+
+        extra_headers = completions_request["extra_headers"]
+        request_id = extra_headers.get("x-request-id", None)
+        if request_id:
+            if request_id.startswith("cmpl-"):
+                request_id = request_id[len("cmpl-"):]
+                extra_headers["x-request-id"] = request_id
+
+            address = self.request_id_to_address.pop(request_id)
+        else:
+            address = self.weighted_addresses[0][1]
+            self.weighted_addresses[0][0] += 1
+            heapq.heapreplace(self.weighted_addresses, self.weighted_addresses[0])
+
+        # use new request_id to avoid duplicate request_id problem
+        request_id = uuid4().hex
+        self.request_id_to_address[request_id] = address
+        completions_request["extra_headers"]["x-request-id"] = request_id
+        
+        if "meta_info" in completions_request:
+            completions_request.pop("meta_info")
+
+        completions, exception = None, None
+        try:
+            completions = await self._completions_openai(address, **completions_request)
+        except Exception as e:
+            # Let user handle the exception
+            print("exception: ", e)
+            exception = e
+
+        await callback(completions, callback_additional_info, exception)
+
     async def _chat_completions_openai(self, address: str, **chat_complete_request) -> ChatCompletion:
         client = AsyncOpenAI(
             base_url=f"http://{address}/v1",
             api_key="token-abc123",
         )
         return await client.chat.completions.create(**chat_complete_request)
+    
+    async def _completions_openai(self, address: str, **completions_request) -> Completion:
+        client = AsyncOpenAI(
+            base_url=f"http://{address}/v1",
+            api_key="token-abc123",
+        )
+        return await client.completions.create(**completions_request)
 
     async def _chat_completions_aiohttp(self, address: str, **chat_complete_request) -> ChatCompletion:
         try:
@@ -334,6 +416,25 @@ class AsyncLLMServerManager:
 
         future = asyncio.run_coroutine_threadsafe(self.chat_scheduler.generate_sequences(prompts, **sampling_params), self.chat_scheduler_loop)
         return future.result()
+    
+    async def generate_sequences_async(self, prompts: DataProto, **sampling_params) -> DataProto:
+        """Generate multiple sequences in parallel via chat scheduler."""
+        assert self.chat_scheduler is not None, "chat scheduler is not initialized."
+
+        # Create a future in the event loop where chat_scheduler is running
+        loop = asyncio.get_event_loop()
+        if loop == self.chat_scheduler_loop:
+            # If we're already in the chat scheduler's event loop, call directly
+            return await self.chat_scheduler.generate_sequences(prompts, **sampling_params)
+        else:
+            # Otherwise, run the coroutine in the chat scheduler's event loop and await its result
+            future = asyncio.run_coroutine_threadsafe(
+                self.chat_scheduler.generate_sequences(prompts, **sampling_params),
+                self.chat_scheduler_loop
+            )
+            # Wait for the future to complete and return its result
+            # We need to use asyncio.wrap_future to await a concurrent.futures.Future
+            return await asyncio.wrap_future(future)
 
 
 def async_server_class(rollout_backend: str) -> Type[AsyncServerBase]:
