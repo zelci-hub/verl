@@ -79,20 +79,14 @@ os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds
 
 vllm_version = vllm.__version__
 
-if vllm_version.startswith("0.7."):
+if vllm_version.startswith("0.7.") and os.environ.get('VLLM_USE_V1', '0') != '1':
     AsyncLLMEngine.sleep = sleep_v1
     AsyncLLMEngine.wake_up = wake_up_v1
-elif vllm_version.startswith("0.8."):
+elif vllm_version.startswith("0.8.") and os.environ.get('VLLM_USE_V1', '0') != '1':
     AsyncLLMEngine.sleep = sleep_v2
     AsyncLLMEngine.wake_up = wake_up_v2
 else:
-    # Handle other versions or raise an error if specific handling is needed
-    # For now, raising an error for unsupported versions seems safest.
-    raise NotImplementedError(
-        f"vLLM version {vllm_version} sleep/wake_up patching is not explicitly handled. "
-        "Please update the code for this version."
-    )
-
+    print(f"Not patching vllm sleep/wake_up for version {vllm_version}, VLLM_USE_V1={os.environ.get('VLLM_USE_V1', '0')}")
 LLMEngine._validate_model_input = _validate_model_input
 
 # TODO

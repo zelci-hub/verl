@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 
 import torch
 from openai.types.chat.chat_completion import ChatCompletion
+from openai.types.completion import Completion
 from tensordict import TensorDict
 
 from verl.protocol import DataProto
