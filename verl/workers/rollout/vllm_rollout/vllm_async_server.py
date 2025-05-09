@@ -145,7 +145,7 @@ class AsyncvLLMServer(AsyncServerBase):
         config = config.rollout
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
-        max_num_batched_tokens = config.get("max_num_batched_tokens", 8192)
+        max_num_batched_tokens = config.get("max_num_batched_tokens", 32768)
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
         max_model_len = int(max_model_len)
 
@@ -198,7 +198,7 @@ class AsyncvLLMServer(AsyncServerBase):
             model_config,
             models,
             "assistant",
-            request_logger=RequestLogger(max_log_len=4096),
+            request_logger=RequestLogger(max_log_len=4096) if not config.disable_logging else None,
             chat_template=None,
             chat_template_content_format="auto",
         )
@@ -207,7 +207,8 @@ class AsyncvLLMServer(AsyncServerBase):
             self.engine,
             model_config,
             models,
-            request_logger=RequestLogger(max_log_len=4096),
+            request_logger=RequestLogger(max_log_len=4096) if not config.disable_logging else None,
+            return_tokens_as_token_ids=True,
         )
 
     async def chat_completion(self, raw_request: Request):
@@ -266,8 +267,8 @@ class AsyncvLLMServer(AsyncServerBase):
             data = generator.model_dump_json(exclude_unset=True)
             yield 200, f"data: {data}\n\n"
 
-    async def wake_up(self):
-        await self.engine.wake_up()
+    async def wake_up(self, tags: Optional[list[str]] = None):
+        await self.engine.wake_up(tags)
 
     async def sleep(self):
         # TODO: https://github.com/vllm-project/vllm/issues/17103
