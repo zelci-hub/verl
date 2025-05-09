@@ -59,7 +59,7 @@ class CompletionsScheduler(ChatCompletionScheduler):
         
         if is_validate:
             kwargs.update({
-                'top_k': self.config.val_kwargs.top_k,
+                #'top_k': self.config.val_kwargs.top_k,
                 'top_p': self.config.val_kwargs.top_p,
                 'temperature': self.config.val_kwargs.temperature,
                 'n': 1,  # if validate, already repeat in ray_trainer
