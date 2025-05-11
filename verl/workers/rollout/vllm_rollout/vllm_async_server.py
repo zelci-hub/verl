@@ -181,6 +181,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=self.vllm_dp_rank,
+            max_num_seqs=1024,
         )
 
         # init async llm engine
