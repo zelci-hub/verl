@@ -189,6 +189,7 @@ class AsyncvLLMServer(AsyncServerBase):
             trust_remote_code=trust_remote_code,
             seed=self.vllm_dp_rank,
             max_num_seqs=1024,
+            hf_overrides={"max_position_embeddings": max_model_len},
         )
 
         # init async llm engine
@@ -218,6 +219,8 @@ class AsyncvLLMServer(AsyncServerBase):
             request_logger=RequestLogger(max_log_len=4096) if not config.disable_logging else None,
             return_tokens_as_token_ids=True,
         )
+
+        print(f"Async vLLM Server running at {await self.get_server_address()}")
 
     async def chat_completion(self, raw_request: Request):
         """OpenAI-compatible HTTP endpoint.
