@@ -17,6 +17,7 @@ model:
 rollout:
   name: vllm
   # Compute reward while generating is broken for eval.
+  mode: sync # sync: LLM, async: AsyncLLM
   compute_reward: False
   enable_log_prob: False
   async_engine: False
@@ -54,3 +55,6 @@ actor:
   ulysses_sequence_parallel_size: 1 # sp size
   fsdp_config:
     fsdp_size: -1
+
+ray_init:
+  num_cpus: null # `None` means using all CPUs, which might cause hang if limited in systems like SLURM. Please set to a number allowed then.
