@@ -94,8 +94,8 @@ class ExternalRayDistributedExecutor(Executor):
         else:
             sent_method = cloudpickle.dumps(method)
         del method
-
-        outputs = ray.get([worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers])
+        futures = [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
+        outputs = ray.get(futures)
         return outputs
 
     def check_health(self):
@@ -244,7 +244,14 @@ class AsyncvLLMServer(AsyncServerBase):
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
             assert isinstance(generator, CompletionResponse)
-            return JSONResponse(content=generator.model_dump())
+            try:
+                return JSONResponse(content=generator.model_dump())
+            except Exception as e:
+                if generator.choices and generator.choices[0].logprobs:
+                    generator.choices[0].logprobs.token_logprobs = [] 
+                    generator.choices[0].logprobs.top_logprobs = []
+                    generator.choices[0].logprobs.text_offset = []
+                return JSONResponse(content=generator.model_dump())
 
     async def chat_completion_generator(self, request: ChatCompletionRequest) -> AsyncGenerator[Tuple[int, str]]:
         """Direct chat completion without FastAPI.
