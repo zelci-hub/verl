@@ -153,7 +153,7 @@ class AsyncvLLMServer(AsyncServerBase):
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
-        max_model_len = int(max_model_len)
+        max_model_len = max(max_model_len, 32768)
         max_num_batched_tokens = max(config.get("max_num_batched_tokens", 32768), max_model_len)
 
         # Override default generation config from hugging face model config,
@@ -251,14 +251,11 @@ class AsyncvLLMServer(AsyncServerBase):
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
             assert isinstance(generator, CompletionResponse)
-            try:
-                return JSONResponse(content=generator.model_dump())
-            except Exception as e:
-                if generator.choices and generator.choices[0].logprobs:
-                    generator.choices[0].logprobs.token_logprobs = [] 
-                    generator.choices[0].logprobs.top_logprobs = []
-                    generator.choices[0].logprobs.text_offset = []
-                return JSONResponse(content=generator.model_dump())
+            if generator.choices and generator.choices[0].logprobs:
+                generator.choices[0].logprobs.token_logprobs = [] 
+                generator.choices[0].logprobs.top_logprobs = []
+                generator.choices[0].logprobs.text_offset = []
+            return JSONResponse(content=generator.model_dump())
 
     async def chat_completion_generator(self, request: ChatCompletionRequest) -> AsyncGenerator[Tuple[int, str]]:
         """Direct chat completion without FastAPI.
