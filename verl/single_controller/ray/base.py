@@ -564,7 +564,7 @@ def create_colocated_worker_cls(class_dict: dict[str, RayClassWithInitArgs]):
         user_defined_cls = _unwrap_ray_remote(user_defined_cls)
         _bind_workers_method_to_parent(WorkerDict, key, user_defined_cls)
 
-    remote_cls = ray.remote(WorkerDict)
+    remote_cls = ray.remote(max_concurrency=2048)(WorkerDict)
     remote_cls = RayClassWithInitArgs(cls=remote_cls)
     return remote_cls
 

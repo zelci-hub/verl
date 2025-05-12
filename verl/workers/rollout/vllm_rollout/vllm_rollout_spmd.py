@@ -65,9 +65,6 @@ import vllm
 from vllm import AsyncLLMEngine, LLM, LLMEngine, SamplingParams, TokensPrompt
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.inputs import SingletonInputs
-from vllm.lora.request import LoRARequest
-from vllm.multimodal.processing import EncDecMultiModalProcessor
 from vllm.outputs import RequestOutput
 from vllm.worker.worker_base import WorkerWrapperBase
 
@@ -75,7 +72,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Set very long timeout to effectively disable it
-os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'  # 1e9 seconds
+os.environ['VLLM_ENGINE_ITERATION_TIMEOUT_S'] = '1000000000'
 
 vllm_version = vllm.__version__
 

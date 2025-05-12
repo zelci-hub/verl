@@ -30,11 +30,16 @@ from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingM
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator)
 
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
+from verl.workers.rollout.vllm_rollout.monkey_patch import all_reduce
 
 logger = logging.getLogger(__file__)
+
+CudaCommunicator.all_reduce = all_reduce
 
 
 class ExternalRayDistributedExecutor(Executor):
@@ -96,6 +101,8 @@ class ExternalRayDistributedExecutor(Executor):
         del method
         futures = [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
         outputs = ray.get(futures)
+        # if sent_method == 'execute_model':
+        #     logger.info(f'execute model exit')
         return outputs
 
     def check_health(self):
@@ -171,7 +178,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
+            #disable_mm_preprocessor_cache=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format="auto",
