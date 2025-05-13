@@ -1,5 +1,6 @@
 from typing import Literal, Optional
 
+import torch
 from vllm.inputs import SingletonInputs
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.processing import EncDecMultiModalProcessor
@@ -70,3 +71,19 @@ def _validate_model_input(
         # TODO: Find out how many placeholder tokens are there so we can
         # check that chunked prefill does not truncate them
         # max_batch_len = self.scheduler_config.max_num_batched_tokens
+
+
+
+def all_reduce(self, input_):
+    ca_comm = self.ca_comm
+    if ca_comm is not None and not ca_comm.disabled and \
+        ca_comm.should_custom_ar(input_):
+        out = ca_comm.custom_all_reduce(input_)
+        assert out is not None
+        return out
+    from vllm.utils import current_stream
+    stream = current_stream()
+    out = input_.clone()
+    with torch.cuda.stream(stream):
+        torch.distributed.all_reduce(out, group=self.device_group)
+    return out

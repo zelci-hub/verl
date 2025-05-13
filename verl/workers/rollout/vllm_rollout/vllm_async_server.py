@@ -30,11 +30,16 @@ from vllm.entrypoints.openai.serving_models import BaseModelPath, OpenAIServingM
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.executor.abstract import Executor
 from vllm.worker.worker_base import WorkerWrapperBase
+from vllm.distributed.device_communicators.cuda_communicator import (
+            CudaCommunicator)
 
 from verl.utils.fs import copy_to_local
 from verl.workers.rollout.async_server import AsyncServerBase
+from verl.workers.rollout.vllm_rollout.monkey_patch import all_reduce
 
 logger = logging.getLogger(__file__)
+
+CudaCommunicator.all_reduce = all_reduce
 
 
 class ExternalRayDistributedExecutor(Executor):
@@ -96,6 +101,8 @@ class ExternalRayDistributedExecutor(Executor):
         del method
         futures = [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
         outputs = ray.get(futures)
+        # if sent_method == 'execute_model':
+        #     logger.info(f'execute model exit')
         return outputs
 
     def check_health(self):
@@ -146,7 +153,7 @@ class AsyncvLLMServer(AsyncServerBase):
 
         tensor_parallel_size = config.get("tensor_model_parallel_size", 1)
         max_model_len = config.max_model_len if config.max_model_len else config.prompt_length + config.response_length
-        max_model_len = int(max_model_len)
+        max_model_len = max(max_model_len, 32768)
         max_num_batched_tokens = max(config.get("max_num_batched_tokens", 32768), max_model_len)
 
         # Override default generation config from hugging face model config,
@@ -171,7 +178,7 @@ class AsyncvLLMServer(AsyncServerBase):
             enforce_eager=config.enforce_eager,
             gpu_memory_utilization=config.gpu_memory_utilization,
             disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
+            #disable_mm_preprocessor_cache=True,
             skip_tokenizer_init=False,
             max_model_len=max_model_len,
             load_format="auto",
@@ -182,6 +189,7 @@ class AsyncvLLMServer(AsyncServerBase):
             trust_remote_code=trust_remote_code,
             seed=self.vllm_dp_rank,
             max_num_seqs=1024,
+            hf_overrides={"max_position_embeddings": max_model_len},
         )
 
         # init async llm engine
@@ -211,6 +219,8 @@ class AsyncvLLMServer(AsyncServerBase):
             request_logger=RequestLogger(max_log_len=4096) if not config.disable_logging else None,
             return_tokens_as_token_ids=True,
         )
+
+        print(f"Async vLLM Server running at {await self.get_server_address()}")
 
     async def chat_completion(self, raw_request: Request):
         """OpenAI-compatible HTTP endpoint.
@@ -244,14 +254,11 @@ class AsyncvLLMServer(AsyncServerBase):
             return StreamingResponse(content=generator, media_type="text/event-stream")
         else:
             assert isinstance(generator, CompletionResponse)
-            try:
-                return JSONResponse(content=generator.model_dump())
-            except Exception as e:
-                if generator.choices and generator.choices[0].logprobs:
-                    generator.choices[0].logprobs.token_logprobs = [] 
-                    generator.choices[0].logprobs.top_logprobs = []
-                    generator.choices[0].logprobs.text_offset = []
-                return JSONResponse(content=generator.model_dump())
+            if generator.choices and generator.choices[0].logprobs:
+                generator.choices[0].logprobs.token_logprobs = [] 
+                generator.choices[0].logprobs.top_logprobs = []
+                generator.choices[0].logprobs.text_offset = []
+            return JSONResponse(content=generator.model_dump())
 
     async def chat_completion_generator(self, request: ChatCompletionRequest) -> AsyncGenerator[Tuple[int, str]]:
         """Direct chat completion without FastAPI.
