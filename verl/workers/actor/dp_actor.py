@@ -325,7 +325,11 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
                     )
-                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                    if entropy_coeff == 0:
+                        loss_agg_mode_entropy = 'token-mean'
+                    else:
+                        loss_agg_mode_entropy = loss_agg_mode
+                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode_entropy)
 
                     # compute policy loss
                     if entropy_coeff != 0:
