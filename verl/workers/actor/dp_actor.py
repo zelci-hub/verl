@@ -21,6 +21,7 @@ import itertools
 import logging
 import os
 from typing import Tuple
+import numpy as np
 
 import torch
 from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -254,7 +255,7 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
-        # TODO: when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
+        
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -379,6 +380,13 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
+            # TODO(colin): need to recheck here
+            if 'is_pad_step' in data.non_tensor_batch:
+                # when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
+                is_pad_step = data.non_tensor_batch["is_pad_step"]
+                valid_step_indices = np.where(~is_pad_step)[0] 
+                data = data.select_idxs(valid_step_indices)
+
         mini_batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
         
