@@ -48,9 +48,15 @@ def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
 
 
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str, Any]:
-    # TODO: add response length
-    sequence_score = batch.batch["token_level_scores"].sum(-1)
-    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
+    if "is_last_step" in batch.non_tensor_batch:
+        is_last_step = batch.non_tensor_batch["is_last_step"]
+        last_step_indices = np.where(is_last_step)[0]  
+        actual_batch = batch.select_idxs(last_step_indices)
+    else:
+        actual_batch = batch
+    # Need to log only task step scores
+    sequence_score = actual_batch.batch["token_level_scores"].sum(-1)
+    sequence_reward = actual_batch.batch["token_level_rewards"].sum(-1)
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]

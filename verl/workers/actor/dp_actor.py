@@ -254,6 +254,7 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
+        # TODO: when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
