@@ -255,7 +255,13 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
-        
+
+            if 'is_pad_step' in data.non_tensor_batch:
+                # when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
+                is_pad_step = data.non_tensor_batch["is_pad_step"]
+                valid_step_indices = np.where(~is_pad_step)[0] 
+                data = data.select_idxs(valid_step_indices)
+
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -313,9 +319,7 @@ class DataParallelPPOActor(BasePPOActor):
                     loss_agg_mode = self.config.loss_agg_mode
 
                     # all return: (bsz, response_length)
-                    calculate_entropy = False
-                    if entropy_coeff != 0:
-                        calculate_entropy = True
+                    calculate_entropy = True
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
@@ -329,11 +333,14 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
                     )
+                    if entropy_coeff == 0:
+                        loss_agg_mode_entropy = 'token-mean'
+                    else:
+                        loss_agg_mode_entropy = loss_agg_mode
+                    entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode_entropy)
 
+                    # compute policy loss
                     if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
-
-                        # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
                     else:
                         policy_loss = pg_loss
@@ -356,6 +363,7 @@ class DataParallelPPOActor(BasePPOActor):
                     loss.backward()
 
                     data = {
+                        'actor/entropy_loss': entropy_loss.detach().item(),
                         "actor/pg_loss": pg_loss.detach().item(),
                         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
                         "actor/ppo_kl": ppo_kl.detach().item(),
@@ -380,7 +388,7 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
-            # TODO(colin): need to recheck here
+
             if 'is_pad_step' in data.non_tensor_batch:
                 # when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
                 is_pad_step = data.non_tensor_batch["is_pad_step"]
