@@ -21,6 +21,7 @@ Data
      train_batch_size: 1024
      return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
      return_raw_chat: False
+     return_full_prompt: False
      shuffle: True
      filter_overlong_prompts: False
      filter_overlong_prompts_workers: 1
@@ -52,7 +53,9 @@ Data
   from the policy. It needs to be decoded first, then apply the RM's
   chat template. If using a model-based RM, and the policy and RM
   chat_templates are different, this flag needs to be set
-- ``data.return_raw_chat``:
+- ``data.return_raw_chat``: Whether to return the original chat (prompt)
+  without applying chat template.
+- ``data.return_full_prompt``: Whether to return the full prompt with chat template
 - ``data.shuffle``: Whether to shuffle the data in the dataloader.
 - ``data.filter_overlong_prompts``: Default don't filter.
 - ``data.filter_overlong_prompts_workers``: For large-scale dataset, filtering
@@ -89,8 +92,12 @@ Actor/Rollout/Reference Policy
     model:
       path: ~/models/deepseek-llm-7b-chat
       external_lib: null
-      override_config: { }
+      override_config:
+        model_config: {}
+        moe_config:  # Megatron only, can adjust moe configuration
+          freeze_moe_router: False  # Megatron only, can freeze moe router (no grad)
       enable_gradient_checkpointing: False
+      trust_remote_code: False
       use_remove_padding: False
     actor:
       strategy: fsdp  # This is for backward-compatibility
@@ -114,7 +121,8 @@ Actor/Rollout/Reference Policy
         lr: 1e-6
         lr_warmup_steps: -1 # Prioritized. Negative values mean delegating to lr_warmup_steps_ratio.
         lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
-        min_lr_ratio: null   # only useful for warmup with cosine
+        min_lr_ratio: 0.0   # only used with cosine lr scheduler, default to 0.0
+        num_cycles: 0.5     # only used with cosine lr scheduler, default to 0.5
         warmup_style: constant  # select from constant/cosine
         total_training_steps: -1  # must be override by program
       fsdp_config:
@@ -186,6 +194,8 @@ Actor/Rollout/Reference Policy
   the model's original configurations, mainly dropout
 - ``actor_rollout_ref.model.enable_gradient_checkpointing``: Whether to
   enable gradient checkpointing for the actor
+- ``actor_rollout_ref.model.trust_remote_code``: Whether to enable loading
+  a remote code model
 
 **Actor model**
 
@@ -280,9 +290,13 @@ Reference model will be enabled when ``actor.use_kl_loss`` or/and ``algorithm.us
 - ``actor_rollout_ref.rollout.dtype``: Rollout model parameters type. This should be align with
   the actor model parameter type in FSDP/Megatron backend.
 
-- ``actor_rollout_ref.rollout.gpu_memory_utilization``: The proportion of the remaining GPU memory
-  allocated for kv cache after other models have initialized when using
-  vllm.
+- ``actor_rollout_ref.rollout.gpu_memory_utilization``:
+
+  - For vLLM v0.5.4 and v0.6.3: The proportion of the **remaining** GPU memory
+    allocated for kv cache after other models have initialized when using
+    vLLM.
+  - For vLLM v0.7.0 and later: The fraction of **total** GPU memory to be used for the vLLM instance.
+  - For SGLang: Corresponding to ``mem_fraction_static``, the fraction of the free GPU memory used for **static** memory like model weights and KV cache. 
 
 - ``actor_rollout_ref.rollout.tensor_model_parallel_size``: TP size for rollout. Only effective
   for vllm.
@@ -358,6 +372,7 @@ Reward Model
        input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
        path: ~/models/Anomy-RM-v0.1
        external_lib: ${actor_rollout_ref.model.external_lib}
+       trust_remote_code: False
        fsdp_config:
          min_num_params: 0
          param_offload: False
@@ -379,6 +394,8 @@ Reward Model
   - ``path``: RM's HDFS path or local path. Note that RM only supports
     AutoModelForSequenceClassification. Other model types need to define
     their own RewardModelWorker and pass it from the code.
+  - ``trust_remote_code``: Whether to enable loading a remote code model,
+    default to False.
 - ``reward_model.reward_manager``:  Reward Manager. This defines the mechanism
   of computing rule-based reward and handling different reward sources. Default
   is ``naive``. If all verification functions are multiprocessing-safe, the reward

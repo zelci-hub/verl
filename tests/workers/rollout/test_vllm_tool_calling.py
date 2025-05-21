@@ -32,7 +32,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from examples.schedulers.naive_chat_scheduler import NaiveChatCompletionScheduler
-from tests.rollout.async_rollout_utils import init_async_rollout_manager
+from tests.workers.rollout.async_rollout_utils import init_async_rollout_manager
 from verl.protocol import DataProto
 
 
@@ -257,14 +257,14 @@ def test_vllm_tool_calling():
     config = OmegaConf.load("verl/trainer/config/ppo_trainer.yaml")
     config.actor_rollout_ref.model.path = "Qwen/Qwen2-7B-Instruct"
     config.actor_rollout_ref.rollout.mode = "async"
-    config.actor_rollout_ref.rollout.chat_scheduler = "tests.rollout.test_vllm_tool_calling.ToolChatCompletionScheduler"
+    config.actor_rollout_ref.rollout.chat_scheduler = "tests.workers.rollout.test_vllm_tool_calling.ToolChatCompletionScheduler"
     config.actor_rollout_ref.rollout.prompt_length = 8192
     config.actor_rollout_ref.rollout.response_length = 8192
 
     # Init sandbox and async rollout manager
     sandbox = Sandbox.options(num_cpus=1).remote()
     sandbox_address = ray.get(sandbox.get_server_address.remote())
-    worker_groups, async_rollout_manager = init_async_rollout_manager(config, scheduler_kwargs={"sandbox_address": sandbox_address, "system_prompt": system_prompt})
+    async_rollout_manager = init_async_rollout_manager(config, scheduler_kwargs={"sandbox_address": sandbox_address, "system_prompt": system_prompt})
 
     # Build dataset
     dataset = load_dataset("Maxwell-Jia/AIME_2024", split="train")

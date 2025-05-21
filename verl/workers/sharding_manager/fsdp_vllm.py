@@ -24,6 +24,12 @@ from torch.distributed.fsdp.api import FullStateDictConfig, ShardedStateDictConf
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from vllm import AsyncLLMEngine
 
+try:
+    # for torch 2.5+
+    from torch.distributed.tensor import DTensor
+except ImportError:
+    from torch.distributed._tensor import DTensor
+
 from verl import DataProto
 from verl.protocol import all_gather_data_proto
 from verl.third_party.vllm import LLM, vllm_version
@@ -54,7 +60,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         # For AsyncLLM, inference_engine and model_runner are defer intialized in vLLMAsyncRollout.load_model
         self.inference_engine = inference_engine
 
-        if 'vllm_v_0_6_3' in str(type(self.inference_engine)) or 'vllm_v_0_5_4' in str(type(self.inference_engine)):
+        if "vllm_v_0_6_3" in str(type(self.inference_engine)) or "vllm_v_0_5_4" in str(type(self.inference_engine)):
             # vLLM <= v0.6.3
             self.model_runner = self.inference_engine.llm_engine.model_executor.worker.model_runner if self.inference_engine else None
         else:
@@ -193,7 +199,6 @@ class FSDPVLLMShardingManager(BaseShardingManager):
     def update_params(self, updated_params):
         model = self.model_runner.model
         patch_vllm_moe_model_weight_loader(model)
-        world_size = torch.distributed.get_world_size()
         device = torch.cuda.current_device()  # used when fsdp2 set cpu_offload_policy
-        loaded_params = model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if world_size != 1 and hasattr(param, "full_tensor") else param) for name, param in updated_params.items()))
+        loaded_params = model.load_weights(((name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param) for name, param in updated_params.items()))
         logger.info("vLLM load weights, loaded_params: %d", len(loaded_params))

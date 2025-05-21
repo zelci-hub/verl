@@ -39,7 +39,7 @@ import torch.distributed
 from omegaconf import DictConfig
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import broadcast_pyobj, get_ip, get_open_port
+from sglang.srt.utils import get_ip, get_open_port
 from tensordict import TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.utils.rnn import pad_sequence
@@ -50,6 +50,7 @@ from verl.utils.debug import GPUMemoryLogger
 from verl.utils.net_utils import is_ipv6
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
     from torch import nn
@@ -109,6 +110,7 @@ class SGLangRollout(BaseRollout):
         reward_fn,
         val_reward_fn,
         port=None,
+        trust_remote_code: bool = False,
         **kwargs,
     ):
         """A SGLang rollout. It requires the module is supported by the SGLang.
@@ -157,22 +159,11 @@ class SGLangRollout(BaseRollout):
 
         # get tp_rank of this process in this tp group
         rank = device_mesh_cpu.get_rank()
-        tp_rank = device_mesh_cpu["tp"].get_local_rank()
         visible_devices = [None] * device_mesh_cpu.size(1)
-        
-        ###
-        # [SUPPORT AMD: torch]
-        from packaging import version
-        import ray
-        if torch.cuda.is_available() and "AMD" in torch.cuda.get_device_name() and version.parse(ray.__version__) >= version.parse("2.45.0"):
-            torch.distributed.all_gather_object(visible_devices, os.environ["HIP_VISIBLE_DEVICES_ENV_VAR"], device_mesh_cpu.get_group("tp"))
-            visible_devices_set = set(",".join(visible_devices).split(","))
-            os.environ["HIP_VISIBLE_DEVICES_ENV_VAR"] = ",".join(sorted(list(visible_devices_set)))
-        else:
-            torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], device_mesh_cpu.get_group("tp"))
-            visible_devices_set = set(",".join(visible_devices).split(","))
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(visible_devices_set)))
-        ###
+
+        torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], device_mesh_cpu.get_group("tp"))
+        visible_devices_set = set(",".join(visible_devices).split(","))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(visible_devices_set)))
 
         nnodes = -(-tp_size // len(visible_devices_set))
         if nnodes > 1:
@@ -180,7 +171,7 @@ class SGLangRollout(BaseRollout):
             port = get_open_port() if port is None else port
             [ip, port] = broadcast_pyobj(
                 [ip, port],
-                rank=tp_rank,
+                rank=rank,
                 dist_group=device_mesh_cpu.get_group("tp"),
                 src=device_mesh_cpu["tp"].mesh[0].item(),
                 force_cpu_device=False,
@@ -216,6 +207,7 @@ class SGLangRollout(BaseRollout):
             load_format=load_format,
             dist_init_addr=dist_init_addr,
             nnodes=nnodes,
+            trust_remote_code=trust_remote_code,
             # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
             # when random.seed is being set during training
             port=30000 + rank,

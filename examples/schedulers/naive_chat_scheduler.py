@@ -47,6 +47,7 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
         print(f"[NaiveChatCompletionScheduler] generate_sequences sampling params: {kwargs}")
 
         async def callback(completions: ChatCompletion, info: Dict[str, Any], exception: Exception):
+            assert exception is None, f"exception: {exception}"
             conversation, batch_conversations, batch_index = (
                 info["conversation"],
                 info["batch_conversations"],
@@ -78,7 +79,7 @@ class NaiveChatCompletionScheduler(ChatCompletionScheduler):
                             "conversation": list(conversation),
                         },
                         model=self.model_name,
-                        messages=conversation,
+                        messages=conversation.tolist(),
                         **kwargs,
                     )
                 )
