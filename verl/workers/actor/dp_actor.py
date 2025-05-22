@@ -256,12 +256,6 @@ class DataParallelPPOActor(BasePPOActor):
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
 
-            if 'is_pad_step' in data.non_tensor_batch:
-                # when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
-                is_pad_step = data.non_tensor_batch["is_pad_step"]
-                valid_step_indices = np.where(is_pad_step == False)[0] 
-                data = data.select_idxs(valid_step_indices)
-
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -389,11 +383,6 @@ class DataParallelPPOActor(BasePPOActor):
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
 
-            if 'is_pad_step' in data.non_tensor_batch:
-                # when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
-                is_pad_step = data.non_tensor_batch["is_pad_step"]
-                valid_step_indices = np.where(is_pad_step == False)[0] 
-                data = data.select_idxs(valid_step_indices)
 
         mini_batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
