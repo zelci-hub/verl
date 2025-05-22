@@ -259,7 +259,7 @@ class DataParallelPPOActor(BasePPOActor):
             if 'is_pad_step' in data.non_tensor_batch:
                 # when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
                 is_pad_step = data.non_tensor_batch["is_pad_step"]
-                valid_step_indices = np.where(~is_pad_step)[0] 
+                valid_step_indices = np.where(is_pad_step == False)[0] 
                 data = data.select_idxs(valid_step_indices)
 
         batch = data.select(batch_keys=select_keys).batch
@@ -392,7 +392,7 @@ class DataParallelPPOActor(BasePPOActor):
             if 'is_pad_step' in data.non_tensor_batch:
                 # when we have stepwise ppo, there might exist padding trajectories where all tokens are masked out. need to filter those out.
                 is_pad_step = data.non_tensor_batch["is_pad_step"]
-                valid_step_indices = np.where(~is_pad_step)[0] 
+                valid_step_indices = np.where(is_pad_step == False)[0] 
                 data = data.select_idxs(valid_step_indices)
 
         mini_batch = data.select(batch_keys=select_keys).batch
