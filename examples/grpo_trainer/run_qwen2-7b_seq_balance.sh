@@ -7,7 +7,7 @@ set -x
 rollout_mode="sync"
 if [ "$rollout_mode" = "async" ]; then
     return_raw_chat="True"
-    chat_scheduler=examples.schedulers.naive_chat_scheduler.NaiveChatCompletionScheduler
+    chat_scheduler=verl.schedulers.naive_chat_scheduler.NaiveChatCompletionScheduler
 fi
 
 python3 -m verl.trainer.main_ppo \

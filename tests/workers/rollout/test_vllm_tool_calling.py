@@ -31,7 +31,7 @@ from openai.types.chat.chat_completion import ChatCompletion
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from examples.schedulers.naive_chat_scheduler import NaiveChatCompletionScheduler
+from verl.schedulers.naive_chat_scheduler import NaiveChatCompletionScheduler
 from tests.workers.rollout.async_rollout_utils import init_async_rollout_manager
 from verl.protocol import DataProto
 

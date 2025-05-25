@@ -587,25 +587,6 @@ class RayWorkerGroup(WorkerGroup):
                     result.append(self._execute_remote_single_worker(self._workers[i], method_name, *sliced_args, **sliced_kwargs))
                 return result
         return [self._execute_remote_single_worker(worker, method_name, *args, **kwargs) for worker in self._workers]
-    
-    def execute_worker_async(self, worker_idx: int, method_name: str, *args, **kwargs):
-        """
-        Execute a method on a specific worker asynchronously.
-        
-        Args:
-            worker_idx: Index of the worker to execute the method on
-            method_name: Name of the method to call
-            *args: Positional arguments to pass to the method
-            **kwargs: Keyword arguments to pass to the method
-            
-        Returns:
-            Ray object reference to the result
-        """
-        if worker_idx < 0 or worker_idx >= len(self._workers):
-            raise IndexError(f"Worker index {worker_idx} out of range (0-{len(self._workers)-1})")
-            
-        remote_call = getattr(self._workers[worker_idx], method_name)
-        return remote_call.remote(*args, **kwargs)
 
     @property
     def master_address(self):

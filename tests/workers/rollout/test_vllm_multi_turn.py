@@ -30,7 +30,7 @@ def init_config() -> DictConfig:
     model_path = "Qwen/Qwen2-7B-Instruct"
     config.actor_rollout_ref.model.path = model_path
     config.actor_rollout_ref.rollout.mode = "async"
-    config.actor_rollout_ref.rollout.chat_scheduler = "examples.schedulers.naive_chat_scheduler.NaiveChatCompletionScheduler"
+    config.actor_rollout_ref.rollout.chat_scheduler = "verl.schedulers.naive_chat_scheduler.NaiveChatCompletionScheduler"
     config.actor_rollout_ref.rollout.prompt_length = 4096
     config.actor_rollout_ref.rollout.response_length = 4096
 

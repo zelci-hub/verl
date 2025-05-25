@@ -104,7 +104,7 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
 
 class vLLMRollout(BaseRollout):
 
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, reward_fn, val_reward_fn, **kwargs):
+    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -122,9 +122,6 @@ class vLLMRollout(BaseRollout):
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
-        
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
         
         if kwargs.get('train_tp', None) is not None:
             # deployed with megatron
@@ -384,15 +381,6 @@ class vLLMRollout(BaseRollout):
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
-        
-        if self.reward_fn is not None and not is_validate:
-            init_batch = DataProto(
-                batch=batch,
-                non_tensor_batch=non_tensor_batch,
-                meta_info=prompts.meta_info
-            )
-            reward_tensor = self.reward_fn(init_batch)
-            batch['token_level_scores'] = reward_tensor
         
         return DataProto(
             batch=batch,
