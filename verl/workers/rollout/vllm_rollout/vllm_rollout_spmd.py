@@ -35,13 +35,12 @@ import uuid
 from concurrent.futures import Future
 from contextlib import contextmanager
 from copy import deepcopy
-from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Union
 
 import numpy as np
 import torch
 import torch.distributed
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 
 from rllm.tools.tool_base import ToolOutputs
@@ -143,7 +142,7 @@ class vLLMRollout(BaseRollout):
             else:
                 vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
 
-        rope_scaling_config = getattr(model_hf_config, 'rope_scaling', None)
+        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
         if not rope_scaling_config:
             max_position_embeddings = None
             if hasattr(model_hf_config, "max_position_embeddings"):
@@ -164,6 +163,13 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             limit_mm_per_prompt = {"image": config.get("limit_images")}
 
+        # copy it to avoid secretly modifying the engine config
+        engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
+        # For each vLLM engine parameter,
+        # - `None` means not setting it, so we pop it, and leave it to vLLM default value
+        #    (which can vary across different vLLM versions);
+        # - Otherwise it's the desired value we want to explicitly set.
+        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=True,
@@ -183,6 +189,7 @@ class vLLMRollout(BaseRollout):
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
             seed=config.get("seed", random.randint(0, 1000000)), # Random seed
+            **engine_kwargs,
         )
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
