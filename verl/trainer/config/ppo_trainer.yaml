@@ -136,16 +136,9 @@ actor_rollout_ref:
       tool_config_path: null  # null for no tool
       format: chatml  # chatml, more formats will be supported in the future
     # RLLM Arguments
-    compute_reward: False # Samplers trajectories and compute rewards on rollout worker (not main).
     enable_log_prob: False # Append log_prob from vllm rollout, disables FSDP log_prob.
-    async_engine: False # Enable async engine for vllm rollout. Must be False for non-pipelined agent training.
-    # Tool Config for vLLM Rollout!
-    #==============================================
-    enable_tools: False # Enable tools for rollout.
-    max_tool_calls: 10 # Maximum number of tool calls per response.
-    tools: [python]
-    tool_parser: deepscaler
-    #==============================================
+    disable_logging: True # Disable logging for vLLM async rollout.
+
 
 critic:
   rollout_n: ${actor_rollout_ref.rollout.n}

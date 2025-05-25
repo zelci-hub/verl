@@ -18,9 +18,7 @@ rollout:
   name: vllm
   # Compute reward while generating is broken for eval.
   mode: sync # sync: LLM, async: AsyncLLM
-  compute_reward: False
   enable_log_prob: False
-  async_engine: False
   temperature: 0.6
   top_k: -1 # 0 for hf rollout, -1 for vllm rollout
   top_p: 0.95

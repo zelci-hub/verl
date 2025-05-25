@@ -119,7 +119,6 @@ actor_rollout_ref:
   rollout:
     name: vllm
     enable_log_prob: True
-    async_engine: True
     temperature: 1.0
     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
     top_p: 1

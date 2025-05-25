@@ -92,7 +92,7 @@ class ActorRolloutRefWorker(Worker):
     or a hybrid engine based on the config.rollout
     """
 
-    def __init__(self, config: DictConfig, role: str, reward_config: DictConfig = None):
+    def __init__(self, config: DictConfig, role: str):
         super().__init__()
         self.config = config
         import torch.distributed
@@ -115,7 +115,6 @@ class ActorRolloutRefWorker(Worker):
             self.ulysses_device_mesh = init_device_mesh("cuda", mesh_shape=(dp, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"])
 
         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
-        self.reward_config = reward_config
 
         self.role = role
         assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
@@ -368,21 +367,6 @@ class ActorRolloutRefWorker(Worker):
         dp = self.world_size // infer_tp
         assert self.world_size % infer_tp == 0, f'rollout world_size: {self.world_size} is not divisible by infer_tp: {infer_tp}'
         rollout_device_mesh = init_device_mesh('cuda', mesh_shape=(dp, infer_tp), mesh_dim_names=['dp', 'infer_tp'])
-
-        self.reward_fn = None
-        self.val_reward_fn = None
-        if self.reward_config is not None and self.config.rollout.compute_reward:
-            reward_manager_name = self.reward_config.get("reward_manager", "naive")
-            if reward_manager_name == 'naive':
-                from verl.workers.reward_manager import NaiveRewardManager
-                reward_manager_cls = NaiveRewardManager
-            elif reward_manager_name == 'prime':
-                from verl.workers.reward_manager import PrimeRewardManager
-                reward_manager_cls = PrimeRewardManager
-            else:
-                raise NotImplementedError
-            self.reward_fn = reward_manager_cls(tokenizer=self.tokenizer, num_examine=0)
-            self.val_reward_fn = reward_manager_cls(tokenizer=self.tokenizer, num_examine=1)
         
         rollout_name = self.config.rollout.name
         if rollout_name == "hf":
@@ -400,7 +384,6 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage(f"Before building {rollout_name} rollout", logger=logger)
             local_path = copy_to_local(self.config.model.path)
             if vllm_mode == "customized":
-                assert self.config.rollout.compute_reward is False, "Reward computation is not supported for customized vLLM rollout."
                 rollout = vLLMRollout(
                     actor_module=self.actor_module_fsdp,
                     config=self.config.rollout,
@@ -416,8 +399,6 @@ class ActorRolloutRefWorker(Worker):
                                       config=self.config.rollout,
                                       tokenizer=self.tokenizer,
                                       model_hf_config=self.actor_model_config,
-                                      reward_fn=self.reward_fn,
-                                      val_reward_fn=self.val_reward_fn,
                                       device_mesh=rollout_device_mesh,
                                       trust_remote_code=trust_remote_code)
             else:
@@ -455,8 +436,6 @@ class ActorRolloutRefWorker(Worker):
                 config=self.config.rollout,
                 tokenizer=self.tokenizer,
                 model_hf_config=self.actor_model_config,
-                reward_fn=self.reward_fn,
-                val_reward_fn=self.val_reward_fn,
                 trust_remote_code=trust_remote_code,
             )
             log_gpu_memory_usage(f"After building {rollout_name} rollout", logger=logger)
@@ -764,72 +743,6 @@ class ActorRolloutRefWorker(Worker):
         torch.cuda.empty_cache()
         return output
 
-    @register(dispatch_mode=Dispatch.GENERATOR, execute_mode=Execute.ALL, blocking=True)
-    def generate_sequences_async(self, prompts: DataProto = None, **kwargs):
-        """Generator function that yields outputs as they complete.
-        
-        Args:
-            prompts: DataProto containing the input prompts
-            **kwargs: Additional arguments to modify sampling parameters
-            
-        Yields:
-            DataProto: Generated sequence outputs as they complete
-        """
-        assert self._is_rollout, "generate_sequences_async requires rollout capability"
-        assert hasattr(self.rollout, 'generate_sequences_async'), "Rollout engine must support generate_sequences_async"
-        
-        if not hasattr(self, '_generator'):
-            self._generator = None
-        
-        if prompts is None and self._generator is None:
-            return None
-        
-        if self._generator is None:
-            if self._is_offload_param:
-                load_fsdp_model_to_gpu(self.actor_module_fsdp)
-
-            prompts = prompts.to(torch.cuda.current_device())
-            meta_info = {
-                'eos_token_id':
-                    self.generation_config.eos_token_id
-                    if self.generation_config is not None else self.tokenizer.eos_token_id,
-                'pad_token_id':
-                    self.generation_config.pad_token_id
-                    if self.generation_config is not None else self.tokenizer.pad_token_id,
-            }
-            prompts.meta_info.update(meta_info)
-            self.rollout_sharding_manager.__enter__()
-            
-            # after parameters sync with rollout, offload actor model to CPU
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-            if self._is_offload_optimizer:
-                offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-
-            log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
-            
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            if self.config.rollout.enable_tools:
-                self._generator = self.rollout.generate_sequences_async_tool(prompts=prompts, **kwargs)
-            else:
-                self._generator = self.rollout.generate_sequences_async(prompts=prompts, **kwargs)
-            return None
-        try:
-            output = next(self._generator)
-            if output is None:
-                raise StopIteration
-            output = self.rollout_sharding_manager.postprocess_data(output)
-            return output.to('cpu')
-        except StopIteration:
-            self._generator = None
-            self.rollout_sharding_manager.__exit__(None, None, None)
-            torch.cuda.empty_cache()
-            log_gpu_memory_usage('After generate sequences', logger=logger)
-            return None
-        except Exception as e:
-            print(e)
-            self.rollout_sharding_manager.__exit__(None, None, None)
-            return None
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
@@ -866,32 +779,6 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage("After offload actor model during compute_log_prob", logger=logger)
 
         return output
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, execute_mode=Execute.ALL, blocking=True)
-    def generate_async_sharding_manager_enter(self):
-        """
-        Setup the rollout engine for async generation
-        """
-        if self._is_offload_param:
-            load_fsdp_model_to_gpu(self.actor_module_fsdp)
-        self.rollout_sharding_manager.__enter__()
-
-        # after parameters sync with rollout, offload actor model to CPU
-        if self._is_offload_param:
-            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        if self._is_offload_optimizer:
-            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
-
-        log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
-
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL, execute_mode=Execute.ALL, blocking=True)
-    def generate_async_sharding_manager_exit(self):
-        """
-        Sleeps the rollout engine for async generation
-        """
-        self.rollout_sharding_manager.__exit__(None, None, None)
-        torch.cuda.empty_cache()
-        log_gpu_memory_usage('After generate sequences', logger=logger)
 
     async def generate_async(self, prompts: DataProto = None, **kwargs):
         assert self._is_rollout, "generate_sequences_async requires rollout capability"

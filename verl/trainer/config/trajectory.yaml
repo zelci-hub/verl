@@ -19,8 +19,7 @@ model:
 
 rollout:
   name: vllm
-  enable_log_prob: True # Append log_prob from vllm rollout, disables FSDP log_prob.
-  async_engine: True # Enable async engine for vllm rollout.
+  enable_log_prob: False # Append log_prob from vllm rollout, disables FSDP log_prob.
   temperature: 0.6
   top_k: -1 # 0 for hf rollout, -1 for vllm rollout
   top_p: 0.95

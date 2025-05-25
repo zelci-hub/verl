@@ -107,8 +107,6 @@ class SGLangRollout(BaseRollout):
         config: DictConfig,
         tokenizer,
         model_hf_config,
-        reward_fn,
-        val_reward_fn,
         port=None,
         trust_remote_code: bool = False,
         **kwargs,
@@ -124,8 +122,6 @@ class SGLangRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
 
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
