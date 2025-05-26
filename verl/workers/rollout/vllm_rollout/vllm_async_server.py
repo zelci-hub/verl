@@ -99,10 +99,9 @@ class ExternalRayDistributedExecutor(Executor):
         else:
             sent_method = cloudpickle.dumps(method)
         del method
-        futures = [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
-        outputs = ray.get(futures)
-        # if sent_method == 'execute_model':
-        #     logger.info(f'execute model exit')
+
+        # ~3ms overhead per schedule step due to SchedulerOutput/ModelRunnerOutput serialization/deserialization.
+        outputs = ray.get([worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers])
         return outputs
 
     def check_health(self):

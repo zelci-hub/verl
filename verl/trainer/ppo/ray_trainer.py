@@ -50,10 +50,12 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
-    reduce_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
+from verl.utils.metric import (
+    reduce_metrics,
+)
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
@@ -96,6 +98,7 @@ class AdvantageEstimator(str, Enum):
     REMAX = "remax"
     RLOO = "rloo"
     LOOP = 'loop'
+    GRPO_PASSK = "grpo_passk"
 
 
 @dataclass
@@ -130,7 +133,7 @@ class ResourcePoolManager:
     def _check_resource_available(self):
         """Check if the resource pool can be satisfied in this ray cluster."""
         node_available_resources = ray.state.available_resources_per_node()
-        node_available_gpus = {node: node_info.get("GPU", 0) for node, node_info in node_available_resources.items()}
+        node_available_gpus = {node: node_info.get("GPU", 0) if "GPU" in node_info else node_info.get("NPU", 0) for node, node_info in node_available_resources.items()}
 
         # check total required gpus can be satisfied
         total_available_gpus = sum(node_available_gpus.values())
@@ -224,6 +227,15 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+    elif adv_estimator == AdvantageEstimator.GRPO_PASSK:
+        advantages, returns = core_algos.compute_grpo_passk_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=data.batch["response_mask"],
+            index=data.non_tensor_batch["uid"],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     elif adv_estimator == AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE:
         advantages, returns = core_algos.compute_reinforce_plus_plus_baseline_outcome_advantage(
             token_level_rewards=data.batch["token_level_rewards"],
@@ -302,9 +314,8 @@ class RayPPOTrainer:
         val_dataset: Optional[Dataset] = None,
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
+        device_name="cuda",
     ):
-        # assert torch.cuda.is_available(), 'cuda must be available on driver'
-
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
@@ -323,6 +334,7 @@ class RayPPOTrainer:
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping and config.actor_rollout_ref.actor.use_kl_loss
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
+        self.device_name = device_name
         self.validation_generations_logger = ValidationGenerationsLogger()
 
         # define in-reward KL control
@@ -334,6 +346,7 @@ class RayPPOTrainer:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
+            AdvantageEstimator.GRPO_PASSK,
             AdvantageEstimator.REINFORCE_PLUS_PLUS,
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
@@ -427,8 +440,7 @@ class RayPPOTrainer:
             "seq-mean-token-mean",
             "seq-mean-token-sum-norm",
         ], f"Invalid loss_agg_mode: {config.actor_rollout_ref.actor.loss_agg_mode}"
-        
-        assert not (config.actor_rollout_ref.rollout.async_engine and config.actor_rollout_ref.rollout.mode == "async"), "RLLM async_engine and VERL mode=async are mutually exclusive"
+
 
         if config.algorithm.use_kl_in_reward and config.actor_rollout_ref.actor.use_kl_loss:
             print("NOTICE: You have both enabled in-reward kl and kl loss.")
@@ -623,16 +635,8 @@ class RayPPOTrainer:
             
             # pad to be divisible by dp_size
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, validate_wg.world_size)
-            
-            if self.config.actor_rollout_ref.rollout.async_engine and self.config.actor_rollout_ref.rollout.mode != "async":
-                gen_seq_generator = validate_wg.generate_sequences_async(prompts=test_gen_batch_padded)
-                outputs = []
-                for item in gen_seq_generator:
-                    if item is None:
-                        break
-                    outputs.append(item)
-                test_output_gen_batch_padded = DataProto.concat(outputs)
-            elif self.async_rollout_mode:
+
+            if self.async_rollout_mode:
                 self.async_rollout_manager.wake_up()
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
                 self.async_rollout_manager.sleep()
@@ -710,7 +714,6 @@ class RayPPOTrainer:
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
                 role="actor_rollout",
-                reward_config=self.config.reward_model,
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
@@ -721,7 +724,6 @@ class RayPPOTrainer:
                 cls=self.role_worker_mapping[Role.Actor],
                 config=self.config.actor_rollout_ref,
                 role='actor',
-                reward_config=self.config.reward_model,
             )
             self.resource_pool_to_cls[actor_resource_pool]['actor'] = actor_cls
 
@@ -732,7 +734,6 @@ class RayPPOTrainer:
                 cls=self.role_worker_mapping[Role.Rollout],
                 config=self.config.actor_rollout_ref,
                 role='rollout',
-                reward_config=self.config.reward_model,
             )
             self.resource_pool_to_cls[rollout_resource_pool]['rollout'] = rollout_cls
 
@@ -761,18 +762,15 @@ class RayPPOTrainer:
         # Instead, directly pass different resource pool to different worker groups.
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
         all_wg = {}
-        self.wg_dicts = []
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
         if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
             wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
-            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, **wg_kwargs)
+            wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls, device_name=self.device_name, **wg_kwargs)
             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
             all_wg.update(spawn_wg)
-            # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
-            self.wg_dicts.append(wg_dict)
 
         if self.use_critic:
             self.critic_wg = all_wg["critic"]
@@ -802,7 +800,7 @@ class RayPPOTrainer:
             self.async_rollout_mode = True
             self.async_rollout_manager = AsyncLLMServerManager(
                 config=self.config.actor_rollout_ref,
-                worker_group=self.actor_rollout_wg,
+                worker_group=self.actor_rollout_wg if self.hybrid_engine else self.rollout_wg,
             )
 
     def _save_checkpoint(self):
@@ -979,23 +977,12 @@ class RayPPOTrainer:
 
                 with _timer('step', timing_raw):
                     with _timer('gen', timing_raw):
-                        if not self.config.actor_rollout_ref.rollout.async_engine:
-                            batch = self.actor_rollout_wg.generate_sequences(batch)
-                        elif self.config.actor_rollout_ref.rollout.async_engine:
-                             #Get the generator function which will yield results as they complete
-                            gen_seq_generator = self.actor_rollout_wg.generate_sequences_async(prompts=batch)
-                            # Collect outputs in a dict keyed by prompt_idx
-                            outputs = []
-                            for output in gen_seq_generator:
-                                outputs.append(output)
-                            # Combine all outputs
-                            batch = DataProto.concat(outputs)
-                        elif self.async_rollout_mode:
+                        if self.async_rollout_mode:
                             self.async_rollout_manager.wake_up()
                             batch = self.async_rollout_manager.generate_sequences(batch)
                             self.async_rollout_manager.sleep()
                         else:
-                            raise ValueError(f"Invalid async_engine mode: {self.config.actor_rollout_ref.rollout.async_engine}")
+                            batch = self.actor_rollout_wg.generate_sequences(batch)
 
                     batch.batch['response_mask'] = compute_response_mask(batch)
                     # compute global_valid tokens
@@ -1018,17 +1005,11 @@ class RayPPOTrainer:
                             batch = batch.union(reward_tensor)
 
                         reward_extra_infos_dict: dict[str, list]
-                        if not self.config.actor_rollout_ref.rollout.compute_reward:
-                                                    # we combine with rule-based rm
-                            reward_extra_infos_dict: dict[str, list]
-                            if self.config.reward_model.launch_reward_fn_async:
-                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                            else:
-                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
-                            batch.batch['token_level_scores'] = reward_tensor
+                        if self.config.reward_model.launch_reward_fn_async:
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         else:
-                            reward_tensor = batch.batch['token_level_scores']
-                            reward_extra_infos_dict = {}
+                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                        batch.batch['token_level_scores'] = reward_tensor
                         
                         print(f'{list(reward_extra_infos_dict.keys())=}')
                         if reward_extra_infos_dict:

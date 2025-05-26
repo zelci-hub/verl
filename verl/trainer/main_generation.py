@@ -104,11 +104,7 @@ def main_task(config):
 
 
 def run_generation(config):
-    assert config.rollout.compute_reward is False, 'compute_reward must be False for generation'
     assert config.rollout.enable_log_prob is False, 'enable_log_prob must be False for generation'
-    assert config.rollout.async_engine is False, 'async_engine must be False for generation'
-    
-    
     
     local_path = copy_to_local(config.model.path)
     

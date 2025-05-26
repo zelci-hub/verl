@@ -16,7 +16,7 @@ from rllm.rewards.rl_reward import rllm_reward_fn
 # from rllm.rewards.code_reward import rllm_code_reward_fn
 import json 
 
-def _default_compute_score(data_source, solution_str, ground_truth, extra_info=None):
+def _default_compute_score(data_source, solution_str, ground_truth, extra_info=None, sandbox_fusion_url=None, concurrent_semaphore=None):
     if data_source == "openai/gsm8k":
         from . import gsm8k
 
@@ -48,9 +48,18 @@ def _default_compute_score(data_source, solution_str, ground_truth, extra_info=N
 
         res = prime_math.compute_score(solution_str, ground_truth)
     # elif data_source in ["codecontests", "apps", "codeforces", "taco"]:
-    #     from . import prime_code
+    #     # Use the passed sandbox_fusion_url if available
+    #     if sandbox_fusion_url:
+    #         from . import sandbox_fusion
 
-    #     res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
+    #         # Pass the URL directly, ground_truth likely contains test cases here
+    #         res = sandbox_fusion.compute_score(sandbox_fusion_url, concurrent_semaphore, solution_str, ground_truth, continuous=True)
+    #     else:
+    #         # If no sandbox URL is provided, fall back to prime_code or raise error
+    #         from . import prime_code
+
+    #         # Assuming prime_code doesn't need the URL
+    #         res = prime_code.compute_score(solution_str, ground_truth, continuous=True)
     elif data_source in ["hiyouga/geometry3k"]:
         from . import geo3k
 
