@@ -99,14 +99,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
     """
-    sequence_score = batch.batch["token_level_scores"].sum(-1)
-    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
     if "is_last_step" in batch.non_tensor_batch:
         is_last_step = batch.non_tensor_batch["is_last_step"]
         last_step_indices = np.where(is_last_step == True)[0]  
-        actual_batch = batch.select_idxs(last_step_indices)
-    else:
-        actual_batch = batch
+        batch = batch.select_idxs(last_step_indices)
     
     if "is_pad_step" in batch.non_tensor_batch:
         is_pad_step = batch.non_tensor_batch["is_pad_step"]
@@ -114,8 +110,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
         batch = batch.select_idxs(valid_step_indices)
         
     # Need to log only task step scores
-    sequence_score = actual_batch.batch["token_level_scores"].sum(-1)
-    sequence_reward = actual_batch.batch["token_level_rewards"].sum(-1)
+    sequence_score = batch.batch["token_level_scores"].sum(-1)
+    sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
     advantages = batch.batch["advantages"]
     returns = batch.batch["returns"]
