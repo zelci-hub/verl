@@ -34,6 +34,7 @@ from codetiming import Timer
 from omegaconf import DictConfig, open_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+from ray import ObjectRef
 
 import verl.utils.torch_functional as verl_F
 from verl import DataProto
@@ -843,74 +844,104 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+
+    ##########################################################################################################
+    # Actor -> Rollout CPU broadcast OOB through Ray ostore
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
-    def get_state_dict(self):
-        """Return the state dict of the FSDP-wrapped module with tensors moved to CPU."""
+    def get_state_dict(self) -> ObjectRef | None:
+        """Return the state dict of the actor worker’s `actor_module_fsdp`.
+
+        Return the state dict of the actor worker’s actor_module_fsdp FSDP-wrapped
+        module with tensors moved to CPU. Parameters will be populated on rank=0, otherwise
+        `None`.
+
+        Returns:
+            ObjectRef | None: Reference to params if rank=0, else `None`
+        """
+        # NOTE: Required to unshard below
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
+        with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True)):
             new_state_dict = self.actor_module_fsdp.state_dict()
-            new_state_dict = {k: v.cpu() for k, v in new_state_dict.items()}
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
-        return ray.put(new_state_dict)
+
+        return ray.put(new_state_dict) if len(new_state_dict) > 0 else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def update_rollout_actor_module(self, new_state_dict_ref):
+    def update_rollout_actor_module(self, new_state_dict_ref: ObjectRef) -> None:
         """
-        Update the rollout worker’s actor_module_fsdp with the new FSDP-wrapped actor module.
-        This function handles the case where the new module is on a different GPU and may have a 
-        different dtype. We extract a full state dict from the new module (offloaded to CPU),
-        convert it to the local module's expected dtype, load it into our local actor_module_fsdp,
-        and then recreate the rollout instance to use the updated module.
-        
+        Update the rollout worker’s `actor_module_fsdp`.
+
+        Update the rollout worker’s `actor_module_fsdp` with the new FSDP-wrapped actor
+        module.
+
         Args:
-            new_actor_module_fsdp: The new FSDP-wrapped actor module (possibly on a different GPU).
+            new_state_dict_ref: Reference to the FSDP-wrapped actor module
         """
+        # Fetch from ostore
         new_state_dict = ray.get(new_state_dict_ref)
-        # Ensure we are in a rollout role.
-        if self.role not in ['rollout', 'actor_rollout', 'actor_rollout_ref']:
-            raise ValueError("update_rollout_actor_module should only be called on a rollout worker.")
 
-        local_dtype = None
+        # Ensure we are in a rollout role
+        if self.role not in ["rollout", "actor_rollout", "actor_rollout_ref"]:
+            raise RuntimeError("update_rollout_actor_module should only be called on a rollout worker.")
+
+        # Determine local dtype
+        local_dtype: torch.dtype | None = None
         for p in self.actor_module_fsdp.parameters():
-            local_dtype = p.dtype
-            break
+            # Dtype
+            if local_dtype is None:
+                local_dtype = p.dtype
+            else:
+                if local_dtype != p.dtype:
+                    raise RuntimeError("Heterogenous dtypes not supported.")
         if local_dtype is None:
-            raise ValueError("Unable to determine the dtype of the local actor_module_fsdp.")
+            raise RuntimeError("Unable to determine the dtype of the local actor_module_fsdp.")
 
-        # Convert each tensor in the state dict to the correct dtype and device
+        # Convert each tensor in the state dict to the correct dtype
         new_state_dict = {
             k: v.to(dtype=local_dtype)
             for k, v in new_state_dict.items()
         }
 
-        # if self._is_offload_param:
-        #     load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        # NOTE: Needed for unshard below - see comment
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
-        # Load the new state dict into our local actor_module_fsdp.
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+        # Load the new state dict into our local actor_module_fsdp
+        # TODO(vsatish): This will potentially start with an unnecessary unshard. Need to
+        # confirm and see if it can be avoided with new FSDP(...) init, taking care to
+        # delete old state.
+        # NOTE: The above also paves the way for a potential optimization where we use
+        # FSDP(..., sync_module_states=True) to only load into rank=0 and then efficiently
+        # broadcast out w/ nccl
         with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
             self.actor_module_fsdp.load_state_dict(new_state_dict)
 
-        # if self._is_offload_param:
-        #     offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
-        # Update our reference to the underlying (unwrapped) module.
-        self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
+        # Update our reference to the underlying (unwrapped) module
+        self.actor_module = self.actor_module_fsdp.module
 
-        # Recreate the rollout instance (and its sharding manager) so that it uses the updated module.
+        # Recreate the rollout instance (and its sharding manager) so that it uses the updated module
         # self.rollout, self.rollout_sharding_manager = self._build_rollout()
         # TODO: we might not need this, double check
         # with FSDP.state_dict_type(self.actor_module_fsdp, StateDictType.FULL_STATE_DICT):
         #     self.rollout_sharding_manager.module.load_state_dict(new_state_dict)
-        logger.info("Updated local actor_module_fsdp from new module and recreated rollout instance.")
+        #logger.info("Updated local actor_module_fsdp from new module and recreated rollout instance.")
+        logger.info("Updated local actor_module_fsdp.")
 
+        # Clean up
         del new_state_dict
-        # Optionally, clear CUDA cache.
+        # TODO(vsatish): Old state dict?
         torch.cuda.empty_cache()
+    
+##########################################################################################################
 
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

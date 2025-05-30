@@ -7,6 +7,7 @@ import time
 import threading
 import queue
 
+import ray
 import numpy as np
 from verl import DataProto
 
@@ -21,10 +22,12 @@ from verl.trainer.ppo.ray_trainer import (
 )
 
 class Timer:
-    def __init__(self, name, timing_dict):
+    def __init__(self, name, timing_dict, print_func=None):
         self.name = name
         self.timing_dict = timing_dict
         self.start_time = None
+
+        self.print_func = print_func
 
     def __enter__(self):
         if self.name not in self.timing_dict:
@@ -35,6 +38,9 @@ class Timer:
     def __exit__(self, *args):
         elapsed = time.time() - self.start_time
         self.timing_dict[self.name] += elapsed
+
+        if self.print_func is not None:
+            self.print_func("%s took %.3fs..." % (self.name, elapsed))
 
 def update_metrics(metrics, new_metrics):
     for k, v in new_metrics.items():
@@ -95,10 +101,13 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         
         print("Broadcasting weights from actor to rollout.")
         # Broadcast weights from actor to rollout.
-        updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
-        if isinstance(updated_actor_module_fsdp_ref, list):
-            updated_actor_module_fsdp_ref = updated_actor_module_fsdp_ref[0]
-        self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
+        with Timer("Broadcasting weights", {}, print_func=print):
+            updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
+
+            # Assume rank=0 is first
+            assert ray.get(updated_actor_module_fsdp_ref[0]) is not None, "Rank=0 broadcast results expected first."
+
+            self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref[0])
         print("Done broadcasting weights from actor to rollout.")
         
         # perform validation before training
