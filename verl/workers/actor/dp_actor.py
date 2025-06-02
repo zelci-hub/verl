@@ -21,6 +21,8 @@ import itertools
 import logging
 import os
 from typing import Tuple
+import numpy as np
+import math
 
 import torch
 from torch import nn
@@ -311,13 +313,26 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
+
+            if 'is_pad_step' in data.non_tensor_batch:
+                is_pad_step = data.non_tensor_batch["is_pad_step"]
+                pad_step_indices = np.where(is_pad_step == True)[0]
+                if len(pad_step_indices) > 0:
+                    data.batch["advantages"][pad_step_indices] = 0
+
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+
+        if self.config.use_dynamic_mini_batch:
+            num_mini_batches = self.config.ppo_num_mini_batches
+            self.config.ppo_mini_batch_size = math.ceil(data.batch.batch_size[0] / self.config.ppo_num_mini_batches)
+            print(f"Dynamic mini batch is enabled, update ppo_mini_batch_size to {self.config.ppo_mini_batch_size}")
+        else:
+            num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         if has_multi_modal_inputs:
-            num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             non_tensor_select_keys = ["multi_modal_inputs"]
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
@@ -437,6 +452,13 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append('ref_log_prob')
         if 'traj_mask' in data.batch:
             select_keys.append('traj_mask')
+
+            if 'is_pad_step' in data.non_tensor_batch:
+                is_pad_step = data.non_tensor_batch["is_pad_step"]
+                pad_step_indices = np.where(is_pad_step == True)[0]
+                if len(pad_step_indices) > 0:
+                    data.batch["advantages"][pad_step_indices] = 0
+
         mini_batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
         
