@@ -99,6 +99,17 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> Dict[str,
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
     """
+    if "is_last_step" in batch.non_tensor_batch:
+        is_last_step = batch.non_tensor_batch["is_last_step"]
+        last_step_indices = np.where(is_last_step == True)[0]  
+        batch = batch.select_idxs(last_step_indices)
+    
+    if "is_pad_step" in batch.non_tensor_batch:
+        is_pad_step = batch.non_tensor_batch["is_pad_step"]
+        valid_step_indices = np.where(is_pad_step == False)[0]  
+        batch = batch.select_idxs(valid_step_indices)
+        
+    # Need to log only task step scores
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 

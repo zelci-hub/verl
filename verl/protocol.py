@@ -110,21 +110,7 @@ def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
 
 def unpad_dataproto(data: "DataProto", pad_size):
     if pad_size != 0:
-        # Remove padding where non_tensor_batch values are None
-        if data.non_tensor_batch:
-            valid_indices = []
-            for i in range(len(data)):
-                is_valid = True
-                for key in data.non_tensor_batch:
-                    if isinstance(data.non_tensor_batch[key], np.ndarray):
-                        if data.non_tensor_batch[key][i] is None:
-                            is_valid = False
-                            break
-                if is_valid:
-                    valid_indices.append(i)
-            data = data[valid_indices]
-        else:
-            data = data[:-pad_size]
+        data = data[:-pad_size]
     return data
 
 
@@ -867,6 +853,63 @@ class DataProto:
             meta_info=self.meta_info,
         )
 
+    def repeat_by_counts(self, repeat_counts, interleave=True):
+        """
+        Repeat each element in the batch a variable number of times.
+        Args:
+            repeat_counts (List[int]): Repeat count for each element in the batch.
+            interleave (bool): Whether to interleave the repeated data.
+        Returns:
+            DataProto: A new DataProto with repeated data.
+        """
+        assert isinstance(repeat_counts, (list, tuple)) and all(isinstance(x, int) for x in repeat_counts), \
+            "repeat_counts must be a list of integers."
+
+        if self.batch is not None:
+            batch_size = self.batch.batch_size[0]
+            assert len(repeat_counts) == batch_size, \
+                f"Length of repeat_counts ({len(repeat_counts)}) must match batch size ({batch_size})."
+
+            repeat_counts_tensor = torch.tensor(repeat_counts, device=self.batch.device)
+
+            if interleave:
+                repeated_tensors = {
+                    key: tensor.repeat_interleave(repeat_counts_tensor, dim=0)
+                    for key, tensor in self.batch.items()
+                }
+            else:
+                # Manually construct gather indices
+                indices = torch.cat([
+                    torch.full((count,), i, dtype=torch.long, device=self.batch.device)
+                    for i, count in enumerate(repeat_counts)
+                ])
+                repeated_tensors = {
+                    key: tensor[indices] for key, tensor in self.batch.items()
+                }
+
+            repeated_batch = TensorDict(
+                source=repeated_tensors,
+                batch_size=(sum(repeat_counts),),
+            )
+        else:
+            repeated_batch = None
+
+        repeated_non_tensor_batch = {}
+        for key, val in self.non_tensor_batch.items():
+            if isinstance(val, np.ndarray):
+                if interleave:
+                    repeated_non_tensor_batch[key] = np.repeat(val, repeat_counts, axis=0)
+                else:
+                    index_array = np.concatenate([[i] * c for i, c in enumerate(repeat_counts)])
+                    repeated_non_tensor_batch[key] = val[index_array]
+            else:
+                raise TypeError(f"Unsupported non-tensor batch type for key '{key}': {type(val)}")
+
+        return DataProto(
+            batch=repeated_batch,
+            non_tensor_batch=repeated_non_tensor_batch,
+            meta_info=self.meta_info,
+        )
 
 @dataclass
 class DataProtoFuture:
