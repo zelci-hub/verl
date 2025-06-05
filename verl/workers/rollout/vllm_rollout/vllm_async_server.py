@@ -201,14 +201,21 @@ class AsyncvLLMServer(AsyncServerBase):
         model_config = self.engine.model_config
         BASE_MODEL_PATHS = [BaseModelPath(name=model_name, model_path=model_path)]
         models = OpenAIServingModels(self.engine, model_config, BASE_MODEL_PATHS)
+        if config.chat_template:
+            with open(config.chat_template, "r", encoding="utf-8") as f:
+                chat_template_str = f.read()
+        else:
+            chat_template_str = None
+        print(f"chat_template_str: {chat_template_str}")
         self.openai_serving_chat = OpenAIServingChat(
             self.engine,
             model_config,
             models,
             "assistant",
             request_logger=RequestLogger(max_log_len=4096) if not config.disable_logging else None,
-            chat_template=None,
+            chat_template=chat_template_str,
             chat_template_content_format="auto",
+            #return_tokens_as_token_ids=True,
         )
 
         self.openai_serving_completion = OpenAIServingCompletion(

@@ -23,6 +23,7 @@ import torch
 import torch.distributed
 from filelock import FileLock
 from transformers import PreTrainedTokenizer, ProcessorMixin
+
 from verl.utils.device import is_cuda_available, is_npu_available
 
 
@@ -125,7 +126,7 @@ class BaseCheckpointManager:
         torch.set_rng_state(rng_state["cpu"])
         np.random.set_state(rng_state["numpy"])
         random.setstate(rng_state["random"])
-        
+
         if is_cuda_available:
             torch.cuda.set_rng_state(rng_state["cuda"])
         elif is_npu_available:
@@ -186,9 +187,16 @@ def is_valid_checkpoint(ckpt_path):
 
 def find_latest_ckpt_path(path, directory_format="global_step_{}"):
     """
-    1. Tries to read the latest checkpoint from a tracker file (if it exists).
-    2. If that fails or is invalid, scans all `global_step_X` folders in descending order
-       and returns the first that passes `is_valid_checkpoint`.
+    Return the most recent checkpoint directory based on a tracker file.
+
+    Args:
+        path (str): Base directory containing the checkpoint tracker.
+        directory_format (str): Template for checkpoint subfolders with one
+            placeholder for the iteration number (default "global_step_{}").
+
+    Returns:
+        str or None: Full path to the latest checkpoint directory, or
+        None if the tracker or checkpoint folder is missing.
     """
     if path is None:
         return None

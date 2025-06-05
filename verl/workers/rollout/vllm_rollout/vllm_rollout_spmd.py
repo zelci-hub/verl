@@ -49,6 +49,7 @@ from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+from vllm.lora.request import LoRARequest
 
 from verl.workers.rollout.vllm_rollout.monkey_patch import (
     wake_up_v1,
@@ -146,6 +147,8 @@ class vLLMRollout(BaseRollout):
                 max_position_embeddings = model_hf_config.max_position_embeddings
             elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
                 max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
+            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
+                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
             if max_position_embeddings is None:
                 raise ValueError("max_position_embeddings not found in model_hf_config")
 
@@ -160,6 +163,8 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             limit_mm_per_prompt = {"image": config.get("limit_images")}
 
+        lora_kwargs = kwargs.pop('lora_kwargs', {})
+        self.lora_kwargs = lora_kwargs
         # copy it to avoid secretly modifying the engine config
         engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
         # For each vLLM engine parameter,
@@ -185,7 +190,8 @@ class vLLMRollout(BaseRollout):
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_prefix_caching=True,
             trust_remote_code=trust_remote_code,
-            seed=config.get("seed", random.randint(0, 1000000)), # Random seed
+            seed=config.get("seed", random.randint(0, 1000000)),
+            **lora_kwargs,
             **engine_kwargs,
         )
         # Offload vllm model to reduce peak memory usage
@@ -308,47 +314,53 @@ class vLLMRollout(BaseRollout):
                 'n': 1,  # if validate, already repeat in ray_trainer
             })
 
+        lora_requests = None
+        if self.lora_kwargs:
+            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
+            if len(lora_int_ids) > 0:
+                lora_int_id=lora_int_ids[0]
+                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}",lora_int_id=lora_int_id,lora_path="/simon-stub-path")] * batch_size
+
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
             outputs = self.inference_engine.generate(
                 prompts=vllm_inputs,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
-                use_tqdm=False)
-        
-        # Extract token IDs and log probabilities
-        response = []
-        log_probs = []
-        for output in outputs:
-            for sample_id in range(len(output.outputs)):
-                response.append(output.outputs[sample_id].token_ids)
-                if self.config.enable_log_prob and hasattr(output.outputs[sample_id], 'logprobs') and output.outputs[sample_id].logprobs is not None:
-                    # Directly use the list of floats returned by vLLM
-                    log_prob_list = []
-                    for log_prob in output.outputs[sample_id].logprobs:
-                        log_prob_list.append(next(iter(log_prob.values())).logprob)
-                    log_probs.append(log_prob_list)
-                else:
-                    log_probs.append([0.0] * len(output.outputs[sample_id].token_ids))
-        
-        response = pad_2d_list_to_length(response, self.pad_token_id,
-                                         max_length=self.config.response_length).to(idx.device)
-        if self.config.enable_log_prob:
-            log_probs = pad_2d_list_to_length(log_probs, 0.0,
-                                            max_length=self.config.response_length).to(idx.device)
+                lora_request=lora_requests,
+                use_tqdm=False,
+            )
 
-        non_tensor_batch = deepcopy(prompts.non_tensor_batch)
-        if self.sampling_params.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
-            idx = _repeat_interleave(idx, self.sampling_params.n)
-            attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-            position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-            batch_size = batch_size * self.sampling_params.n
-            # Create interleaved non_tensor_batch
-            non_tensor_batch = {}
-            for key, val in prompts.non_tensor_batch.items():
-                # Repeat each element n times (interleaved)
-                non_tensor_batch[key] = _repeat_interleave(val, self.sampling_params.n)
+            # TODO(sgm): disable logprob when recompute_log_prob is enable
+            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
-        seq = torch.cat([idx, response], dim=-1)
+            response = []
+            rollout_log_probs = []
+            for output in outputs:
+                for sample_id in range(len(output.outputs)):
+                    response_ids = output.outputs[sample_id].token_ids
+                    response.append(response_ids)
+                    curr_log_prob = []
+                    for i, logprob in enumerate(output.outputs[sample_id].logprobs):
+                        curr_log_prob.append(logprob[response_ids[i]].logprob)
+                    rollout_log_probs.append(curr_log_prob)
+
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
+            rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
+            rollout_log_probs = rollout_log_probs.to(torch.float32)
+
+            non_tensor_batch = deepcopy(prompts.non_tensor_batch)
+            if self.sampling_params.n > 1 and do_sample and not prompts.meta_info.get('agent_rollout', False):
+                idx = _repeat_interleave(idx, self.sampling_params.n)
+                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
+                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
+                batch_size = batch_size * self.sampling_params.n
+                # Create interleaved non_tensor_batch
+                non_tensor_batch = {}
+                for key, val in prompts.non_tensor_batch.items():
+                    # Repeat each element n times (interleaved)
+                    non_tensor_batch[key] = _repeat_interleave(val, self.sampling_params.n)
+
+            seq = torch.cat([idx, response], dim=-1)
 
         response_length = response.size(1)
         delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
@@ -368,15 +380,14 @@ class vLLMRollout(BaseRollout):
         # all the tp ranks should contain the same data here. data in all ranks are valid
         batch = TensorDict(
             {
-                'prompts': idx,
-                'responses': response,
-                'input_ids': seq,
-                'attention_mask': attention_mask,
-                'position_ids': position_ids
+                "prompts": idx,
+                "responses": response,
+                "input_ids": seq,  # here input_ids become the whole sentences
+                'rollout_log_probs': rollout_log_probs, # we will recompute old log prob with actor
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
             },
             batch_size=batch_size)
-        if self.config.enable_log_prob:
-            batch['old_log_probs'] = log_probs
         
         # free vllm cache engine
         if vllm_version in ('0.3.1', '0.4.2', '0.5.4', '0.6.3') and self.config.free_cache_engine:

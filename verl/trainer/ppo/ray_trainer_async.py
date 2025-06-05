@@ -146,16 +146,16 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                 sample_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(sample_batch.batch))], dtype=object)
                 
                 with Timer('step', timing_raw):
-                    if self.async_rollout_modes:
+                    if self.async_rollout_mode:
                         def async_sampler(batch):
                             with Timer('gen', timing_raw):
                                 self.async_rollout_manager.wake_up()
                                 batch = self.async_rollout_manager.generate_sequences(batch)
                                 self.async_rollout_manager.sleep()
                                 replay_queue.put(batch)
-                        thread = threading.Thread(target=async_sampler, args=(sample_batch))
+                        thread = threading.Thread(target=async_sampler, args=(sample_batch,))
                         thread.start()
-                    else:                  
+                    else:
                         def sync_sampler(batch):
                             with Timer('gen', timing_raw):
                                 batch = self.rollout_wg.generate_sequences(batch)
@@ -225,17 +225,10 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                             batch = dataprotoitem_to_dataproto(batch)
 
                         
-                        if self.config.actor_rollout_ref.rollout.enable_log_prob:
-                            # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
-                            batch.meta_info['micro_batch_size'] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-                            batch.meta_info['max_token_len'] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
-                            batch.meta_info['use_dynamic_bsz'] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
-                            batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
-                        else:
-                            # Recompute old_log_probs using Pytorch FSDP.
-                            with Timer('old_log_prob', timing_raw):
-                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                                batch = batch.union(old_log_prob)
+                        # Recompute old_log_probs using Pytorch FSDP.
+                        with Timer('old_log_prob', timing_raw):
+                            old_log_prob = self.actor_wg.compute_log_prob(batch)
+                            batch = batch.union(old_log_prob)
 
                         if self.use_reference_policy:
                             # compute reference log_prob

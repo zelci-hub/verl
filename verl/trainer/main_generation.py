@@ -104,7 +104,6 @@ def main_task(config):
 
 
 def run_generation(config):
-    assert config.rollout.enable_log_prob is False, 'enable_log_prob must be False for generation'
     
     local_path = copy_to_local(config.model.path)
     
