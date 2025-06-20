@@ -89,14 +89,7 @@ def pad_dataproto_to_divisor(data: "DataProto", size_divisor: int):
             if padding_proto.non_tensor_batch is not None:
                 for key in padding_proto.non_tensor_batch:
                     if isinstance(padding_proto.non_tensor_batch[key], np.ndarray):
-                        # Create array of None values with same shape except first dimension
-                        # Handle nested elements in non_tensor_batch
-                        if len(data.non_tensor_batch[key]) > 0 and isinstance(data.non_tensor_batch[key][0], np.ndarray):
-                            # Keep the original nested structure for padding
-                            none_array = padding_proto.non_tensor_batch[key][:take_size]
-                        else:
-                            none_array = np.array([None] * take_size, dtype=object)
-                        padding_proto.non_tensor_batch[key] = none_array
+                        padding_proto.non_tensor_batch[key] = padding_proto.non_tensor_batch[key][:take_size]
             padding_protos.append(padding_proto)
             remaining_pad -= take_size
         data_padded = DataProto.concat([data] + padding_protos)
