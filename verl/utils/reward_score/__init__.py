@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # from . import gsm8k, math, prime_math, prime_code
-from rllm.rewards.rl_reward import rllm_reward_fn
+# from rllm.rewards.rl_reward import rllm_reward_fn
 
 from verl.utils.import_utils import deprecated
 
@@ -80,8 +80,8 @@ def default_compute_score(data_source, solution_str, ground_truth, extra_info=No
         from . import geo3k
 
         res = geo3k.compute_score(solution_str, ground_truth)
-    else:
-        return rllm_reward_fn(data_source, solution_str, ground_truth, extra_info)
+    # else:
+    #     return rllm_reward_fn(data_source, solution_str, ground_truth, extra_info)
 
     if isinstance(res, dict):
         return res
