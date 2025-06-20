@@ -43,7 +43,6 @@ import torch.distributed
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 
-from rllm.tools.tool_base import ToolOutputs
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
