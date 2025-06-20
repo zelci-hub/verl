@@ -295,7 +295,7 @@ env:
   miniwob_url: "file://<PATH_TO_MINIWOB_CLONED_REPO>/miniwob/html/miniwob/" 
 
 agent:
-  name: webagent
+  name: miniwobagent
   max_steps: 20
   async_engine: True
   n_parallel_agents: null
