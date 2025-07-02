@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import inspect
-from enum import Enum
 from functools import wraps
 import inspect
 from typing import Dict, List, Tuple
@@ -21,6 +20,7 @@ from types import FunctionType
 from typing import Dict, List, Tuple
 
 from verl.protocol import DataProtoFuture, _padding_size_key
+from verl.utils.py_functional import DynamicEnum
 
 import ray
 
@@ -28,28 +28,54 @@ import ray
 MAGIC_ATTR = "attrs_3141562937"
 
 
-class Dispatch(Enum):
-    RANK_ZERO = 0
-    ONE_TO_ALL = 1
-    ALL_TO_ALL = 2
-    MEGATRON_COMPUTE = 3
-    MEGATRON_PP_AS_DP = 4
-    MEGATRON_PP_ONLY = 5
-    MEGATRON_COMPUTE_PROTO = 6
-    MEGATRON_PP_AS_DP_PROTO = 7
-    DP_COMPUTE = 8
-    DP_COMPUTE_PROTO = 9
-    DP_COMPUTE_PROTO_WITH_FUNC = 10
-    DP_COMPUTE_METRIC = 11
-    GENERATOR = 12  # used when first launching a generator function
+class Dispatch(DynamicEnum):
+    """Enum class defining different dispatch modes for distributed computation.
 
+    Each mode represents a specific strategy for distributing data across
+    different ranks in a distributed system. The modes are used to control
+    how data is partitioned and processed across different worker groups.
+    """
+
+    _registry = {}
+    _next_value = 0
+
+
+def init_predefined_dispatch_mode():
+    Dispatch.register("RANK_ZERO")
+    Dispatch.register("ONE_TO_ALL")
+    Dispatch.register("ALL_TO_ALL")
+    Dispatch.register("MEGATRON_COMPUTE")
+    Dispatch.register("MEGATRON_PP_AS_DP")
+    Dispatch.register("MEGATRON_PP_ONLY")
+    Dispatch.register("MEGATRON_COMPUTE_PROTO")
+    Dispatch.register("MEGATRON_PP_AS_DP_PROTO")
+    Dispatch.register("DP_COMPUTE")
+    Dispatch.register("DP_COMPUTE_PROTO")
+    Dispatch.register("DP_COMPUTE_PROTO_WITH_FUNC")
+    Dispatch.register("DP_COMPUTE_METRIC")
     # This is a special dispatch mode for vllm ExternalRayDistributedExecutor
-    DIRECT_ROLLOUT_METHOD = 12
+    Dispatch.register("DIRECT_ROLLOUT_METHOD")
 
 
-class Execute(Enum):
-    ALL = 0
-    RANK_ZERO = 1
+class Execute(DynamicEnum):
+    """Enum class defining different execution modes for distributed computation.
+
+    These modes control how a function should be executed across different ranks
+    in a distributed system.
+    """
+
+    _registry = {}
+    _next_value = 0
+
+
+def init_predefined_execute_mode():
+    Execute.register("ALL")
+    Execute.register("RANK_ZERO")
+
+
+# Initialize the two Dynamic Enum Classes
+init_predefined_dispatch_mode()
+init_predefined_execute_mode()
 
 
 def _split_args_kwargs_data_proto(chunks, *args, **kwargs):
@@ -374,98 +400,71 @@ def collect_dp_compute_data_proto(worker_group, output):
     return _concat_data_proto_or_future(output)
 
 
-def dispatch_generic_generator(worker_group, *args, **kwargs):
-    return dispatch_dp_compute_data_proto(worker_group, *args, **kwargs)
-
-
-def collect_generic_generator(worker_group, _):
-    """
-    Poll every worker's remote method and yield available results.
-    When a worker returns None (generator exhausted), remove it from polling.
-    """
-    # Determine which method to call based on what's available
-    if hasattr(worker_group._workers[0], 'actor_rollout_generate_sequences_async'):
-        method_name = 'actor_rollout_generate_sequences_async'
-    elif hasattr(worker_group._workers[0], 'rollout_generate_sequences_async'):
-        method_name = 'rollout_generate_sequences_async'
-    else:
-        method_name = 'generate_sequences_async'
-
-    # Initialize with remote calls to the appropriate method
-    active_workers = {worker: getattr(worker, method_name).remote() 
-                     for worker in worker_group._workers}
-    
-    while active_workers:
-        ready_futures, _ = ray.wait(list(active_workers.values()), num_returns=1)
-        for fut in ready_futures:
-            result = ray.get(fut)
-            # Find the worker corresponding to this future
-            worker = None
-            for w, pending in active_workers.items():
-                if pending == fut:
-                    worker = w
-                    break
-            
-            if result is not None:
-                yield result
-                # Queue up next result from this worker using the same method
-                active_workers[worker] = getattr(worker, method_name).remote()
-            else:
-                # Worker is done, remove it
-                del active_workers[worker]
+# Global registry for dispatch mode.
+DISPATCH_MODE_FN_REGISTRY = {
+    Dispatch.ONE_TO_ALL: {
+        "dispatch_fn": dispatch_one_to_all,
+        "collect_fn": collect_all_to_all,
+    },
+    Dispatch.ALL_TO_ALL: {
+        "dispatch_fn": dispatch_all_to_all,
+        "collect_fn": collect_all_to_all,
+    },
+    Dispatch.MEGATRON_COMPUTE: {
+        "dispatch_fn": dispatch_megatron_compute,
+        "collect_fn": collect_megatron_compute,
+    },
+    Dispatch.MEGATRON_PP_AS_DP: {
+        "dispatch_fn": dispatch_megatron_pp_as_dp,
+        "collect_fn": collect_megatron_pp_as_dp,
+    },
+    Dispatch.MEGATRON_PP_ONLY: {"dispatch_fn": dispatch_one_to_all, "collect_fn": collect_megatron_pp_only},
+    Dispatch.MEGATRON_COMPUTE_PROTO: {
+        "dispatch_fn": dispatch_megatron_compute_data_proto,
+        "collect_fn": collect_megatron_compute_data_proto,
+    },
+    Dispatch.MEGATRON_PP_AS_DP_PROTO: {
+        "dispatch_fn": dispatch_megatron_pp_as_dp_data_proto,
+        "collect_fn": collect_megatron_pp_as_dp_data_proto,
+    },
+    Dispatch.DP_COMPUTE: {"dispatch_fn": dispatch_dp_compute, "collect_fn": collect_dp_compute},
+    Dispatch.DP_COMPUTE_PROTO: {
+        "dispatch_fn": dispatch_dp_compute_data_proto,
+        "collect_fn": collect_dp_compute_data_proto,
+    },
+    Dispatch.DP_COMPUTE_PROTO_WITH_FUNC: {
+        "dispatch_fn": dispatch_dp_compute_data_proto_with_func,
+        "collect_fn": collect_dp_compute_data_proto,
+    },
+    Dispatch.DP_COMPUTE_METRIC: {"dispatch_fn": dispatch_dp_compute_data_proto, "collect_fn": collect_dp_compute},
+    Dispatch.DIRECT_ROLLOUT_METHOD: {
+        "dispatch_fn": dummy_direct_rollout_call,
+        "collect_fn": dummy_direct_rollout_call,
+    },
+}
 
 
 def get_predefined_dispatch_fn(dispatch_mode):
-    predefined_dispatch_mode_fn = {
-        Dispatch.ONE_TO_ALL: {
-            "dispatch_fn": dispatch_one_to_all,
-            "collect_fn": collect_all_to_all,
-        },
-        Dispatch.ALL_TO_ALL: {
-            "dispatch_fn": dispatch_all_to_all,
-            "collect_fn": collect_all_to_all,
-        },
-        Dispatch.MEGATRON_COMPUTE: {
-            "dispatch_fn": dispatch_megatron_compute,
-            "collect_fn": collect_megatron_compute,
-        },
-        Dispatch.MEGATRON_PP_AS_DP: {
-            "dispatch_fn": dispatch_megatron_pp_as_dp,
-            "collect_fn": collect_megatron_pp_as_dp,
-        },
-        Dispatch.MEGATRON_PP_ONLY: {"dispatch_fn": dispatch_one_to_all, "collect_fn": collect_megatron_pp_only},
-        Dispatch.MEGATRON_COMPUTE_PROTO: {
-            "dispatch_fn": dispatch_megatron_compute_data_proto,
-            "collect_fn": collect_megatron_compute_data_proto,
-        },
-        Dispatch.MEGATRON_PP_AS_DP_PROTO: {
-            "dispatch_fn": dispatch_megatron_pp_as_dp_data_proto,
-            "collect_fn": collect_megatron_pp_as_dp_data_proto,
-        },
-        Dispatch.DP_COMPUTE: {"dispatch_fn": dispatch_dp_compute, "collect_fn": collect_dp_compute},
-        Dispatch.DP_COMPUTE_PROTO: {
-            "dispatch_fn": dispatch_dp_compute_data_proto,
-            "collect_fn": collect_dp_compute_data_proto,
-        },
-        Dispatch.DP_COMPUTE_PROTO_WITH_FUNC: {
-            "dispatch_fn": dispatch_dp_compute_data_proto_with_func,
-            "collect_fn": collect_dp_compute_data_proto,
-        },
-        Dispatch.DP_COMPUTE_METRIC: {"dispatch_fn": dispatch_dp_compute_data_proto, "collect_fn": collect_dp_compute},
-        Dispatch.DIRECT_ROLLOUT_METHOD: {
-            "dispatch_fn": dummy_direct_rollout_call,
-            "collect_fn": dummy_direct_rollout_call,
-        },
-        Dispatch.DP_COMPUTE_METRIC: {
-            'dispatch_fn': dispatch_dp_compute_data_proto,
-            'collect_fn': collect_dp_compute
-        },
-        Dispatch.GENERATOR: {  # For launching remote generators.
-            'dispatch_fn': dispatch_generic_generator,
-            'collect_fn': collect_generic_generator,
-        },
-    }
-    return predefined_dispatch_mode_fn[dispatch_mode]
+    return DISPATCH_MODE_FN_REGISTRY[dispatch_mode]
+
+
+def register_dispatch_mode(dispatch_mode_name, dispatch_fn, collect_fn):
+    """
+    Register a new dispatch mode.
+    """
+    dispatch_mode = Dispatch.register(dispatch_mode_name)
+    _check_dispatch_mode(dispatch_mode)
+    assert dispatch_mode not in DISPATCH_MODE_FN_REGISTRY, f"dispatch_mode_name {dispatch_mode_name} already exists"
+    DISPATCH_MODE_FN_REGISTRY[dispatch_mode] = {"dispatch_fn": dispatch_fn, "collect_fn": collect_fn}
+
+
+def update_dispatch_mode(dispatch_mode, dispatch_fn, collect_fn):
+    """
+    Update the dispatch mode.
+    """
+    _check_dispatch_mode(dispatch_mode)
+    assert dispatch_mode in DISPATCH_MODE_FN_REGISTRY, f"dispatch_mode {dispatch_mode} not found"
+    DISPATCH_MODE_FN_REGISTRY[dispatch_mode] = {"dispatch_fn": dispatch_fn, "collect_fn": collect_fn}
 
 
 def get_predefined_execute_fn(execute_mode):
@@ -508,20 +507,31 @@ def _materialize_futures(*args, **kwargs):
 
 
 def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocking=True, materialize_futures=True):
+    """Register a function with distributed execution configuration.
+
+    This decorator registers a function with specific dispatch and execution modes
+    for distributed computation. It handles both synchronous and asynchronous
+    functions, and optionally materializes futures before execution.
+
+    Args:
+        dispatch_mode:
+            Dispatch mode for computation distribution. Default: Dispatch.ALL_TO_ALL.
+        execute_mode:
+            Execute mode for computation distribution. Default: Execute.ALL.
+        blocking:
+            Whether the execution should be blocking. Defaults to True.
+        materialize_futures:
+            Whether to materialize the data before dispatching. Defaults to True.
+
+    Returns:
+        A decorator that wraps the original function with distributed execution
+        configuration.
+    """
     _check_dispatch_mode(dispatch_mode=dispatch_mode)
     _check_execute_mode(execute_mode=execute_mode)
 
     def decorator(func):
-        is_gen_func = inspect.isgeneratorfunction(func)
         is_async_func = inspect.iscoroutinefunction(func)
-
-        @wraps(func)
-        @ray.method(num_returns='dynamic')
-        def inner_gen(*args, **kwargs):
-            if materialize_futures:
-                args, kwargs = _materialize_futures(*args, **kwargs)
-            for item in func(*args, **kwargs):
-                yield item
 
         @wraps(func) 
         def inner_regular(*args, **kwargs):
@@ -535,9 +545,7 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
                 args, kwargs = _materialize_futures(*args, **kwargs)
             return await func(*args, **kwargs)
 
-        if is_gen_func:
-            inner = inner_gen
-        elif is_async_func:
+        if is_async_func:
             inner = async_inner
         else:
             inner = inner_regular

@@ -32,14 +32,15 @@ import os
 from typing import Any, List, Union
 import numpy as np
 from contextlib import contextmanager
+from copy import deepcopy
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch.distributed
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from sglang.srt.entrypoints.verl_engine import VerlEngine
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import broadcast_pyobj, get_ip, get_open_port
+from sglang.srt.utils import get_ip, get_open_port
 from tensordict import TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.utils.rnn import pad_sequence
@@ -50,6 +51,7 @@ from verl.utils.debug import GPUMemoryLogger
 from verl.utils.net_utils import is_ipv6
 from verl.utils.torch_functional import get_response_mask, pad_sequence_to_length
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.sglang_rollout.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
     from torch import nn
@@ -106,9 +108,8 @@ class SGLangRollout(BaseRollout):
         config: DictConfig,
         tokenizer,
         model_hf_config,
-        reward_fn,
-        val_reward_fn,
         port=None,
+        trust_remote_code: bool = False,
         **kwargs,
     ):
         """A SGLang rollout. It requires the module is supported by the SGLang.
@@ -122,8 +123,6 @@ class SGLangRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
-        self.reward_fn = reward_fn
-        self.val_reward_fn = val_reward_fn
         os.environ.setdefault("SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK", "true")
 
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
@@ -157,22 +156,11 @@ class SGLangRollout(BaseRollout):
 
         # get tp_rank of this process in this tp group
         rank = device_mesh_cpu.get_rank()
-        tp_rank = device_mesh_cpu["tp"].get_local_rank()
         visible_devices = [None] * device_mesh_cpu.size(1)
-        
-        ###
-        # [SUPPORT AMD: torch]
-        from packaging import version
-        import ray
-        if torch.cuda.is_available() and "AMD" in torch.cuda.get_device_name() and version.parse(ray.__version__) >= version.parse("2.45.0"):
-            torch.distributed.all_gather_object(visible_devices, os.environ["HIP_VISIBLE_DEVICES_ENV_VAR"], device_mesh_cpu.get_group("tp"))
-            visible_devices_set = set(",".join(visible_devices).split(","))
-            os.environ["HIP_VISIBLE_DEVICES_ENV_VAR"] = ",".join(sorted(list(visible_devices_set)))
-        else:
-            torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], device_mesh_cpu.get_group("tp"))
-            visible_devices_set = set(",".join(visible_devices).split(","))
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(visible_devices_set)))
-        ###
+
+        torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], device_mesh_cpu.get_group("tp"))
+        visible_devices_set = set(",".join(visible_devices).split(","))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(visible_devices_set)))
 
         nnodes = -(-tp_size // len(visible_devices_set))
         if nnodes > 1:
@@ -180,7 +168,7 @@ class SGLangRollout(BaseRollout):
             port = get_open_port() if port is None else port
             [ip, port] = broadcast_pyobj(
                 [ip, port],
-                rank=tp_rank,
+                rank=rank,
                 dist_group=device_mesh_cpu.get_group("tp"),
                 src=device_mesh_cpu["tp"].mesh[0].item(),
                 force_cpu_device=False,
@@ -200,8 +188,9 @@ class SGLangRollout(BaseRollout):
             raise ValueError('Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
                              please increase max_num_batched_tokens or disable chunked prefill')
 
-
-
+        # copy it to avoid secretly modifying the engine config
+        engine_kwargs = {} if "engine_kwargs" not in config or "sglang" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.sglang))
+        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         self.inference_engine = VerlEngine(
             model_path=actor_module,
             dtype=config.dtype,
@@ -216,16 +205,19 @@ class SGLangRollout(BaseRollout):
             load_format=load_format,
             dist_init_addr=dist_init_addr,
             nnodes=nnodes,
+            trust_remote_code=trust_remote_code,
             # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
             # when random.seed is being set during training
             port=30000 + rank,
-            # NOTE(Chenyang): if you want to debug the SGLang engine output
-            # please set the following parameters
-            # Otherwise, it will make the engine run too slow
+            # Note: Enable below to display SGLang engine logs at INFO level
             # log_level="INFO",
+            # Note: Enable below to display ReqInput in details, be careful about the log volume
             # log_requests=True,
+            # Note: Log level for ReqInput, 0 for concise, 1 for log middle leve, 2 for verbose
             # log_requests_level=2,
+            # Note: Enable below to limit the number of running requests
             # max_running_requests=1,
+            **engine_kwargs,
         )
 
         # offload
@@ -335,7 +327,7 @@ class SGLangRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            print(f"{self.sampling_params=}")
+            # print(f"{self.sampling_params=}")
             output = self.inference_engine.generate(
                 prompt=None,  # because we have already convert it to prompt token id
                 sampling_params=self.sampling_params,
@@ -390,8 +382,6 @@ class SGLangRollout(BaseRollout):
             },
             batch_size=batch_size,
         )
-        if self.config.enable_log_prob:
-            batch['old_log_probs'] = log_probs
         
         # free cache engine
         if self.config.free_cache_engine and self.inference_engine._engine is not None and self.inference_engine._engine.tokenizer_manager is not None:

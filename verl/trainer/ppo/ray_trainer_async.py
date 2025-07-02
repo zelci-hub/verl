@@ -7,6 +7,7 @@ import time
 import threading
 import queue
 
+import ray
 import numpy as np
 from verl import DataProto
 
@@ -21,10 +22,12 @@ from verl.trainer.ppo.ray_trainer import (
 )
 
 class Timer:
-    def __init__(self, name, timing_dict):
+    def __init__(self, name, timing_dict, print_func=None):
         self.name = name
         self.timing_dict = timing_dict
         self.start_time = None
+
+        self.print_func = print_func
 
     def __enter__(self):
         if self.name not in self.timing_dict:
@@ -35,6 +38,9 @@ class Timer:
     def __exit__(self, *args):
         elapsed = time.time() - self.start_time
         self.timing_dict[self.name] += elapsed
+
+        if self.print_func is not None:
+            self.print_func("%s took %.3fs..." % (self.name, elapsed))
 
 def update_metrics(metrics, new_metrics):
     for k, v in new_metrics.items():
@@ -95,10 +101,13 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         
         print("Broadcasting weights from actor to rollout.")
         # Broadcast weights from actor to rollout.
-        updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
-        if isinstance(updated_actor_module_fsdp_ref, list):
-            updated_actor_module_fsdp_ref = updated_actor_module_fsdp_ref[0]
-        self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref)
+        with Timer("Broadcasting weights", {}, print_func=print):
+            updated_actor_module_fsdp_ref = self.actor_wg.get_state_dict()
+
+            # Assume rank=0 is first
+            assert ray.get(updated_actor_module_fsdp_ref[0]) is not None, "Rank=0 broadcast results expected first."
+
+            self.rollout_wg.update_rollout_actor_module(updated_actor_module_fsdp_ref[0])
         print("Done broadcasting weights from actor to rollout.")
         
         # perform validation before training
@@ -116,15 +125,14 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
         batch_dict = next(train_dataloader_gen)
         batch: DataProto = DataProto.from_single_dict(batch_dict)
         batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-        if self.config.actor_rollout_ref.rollout.async_engine:
-            gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=batch)
-            outputs = []
-            for item in gen_seq_generator:
-                outputs.append(item)
-            replay_queue.put(DataProto.concat(outputs))
+        
+        if self.async_rollout_mode:
+            self.async_rollout_manager.wake_up()
+            batch = self.async_rollout_manager.generate_sequences(batch)
+            self.async_rollout_manager.sleep()
         else:
-            batch = self.rollout_wg.generate_sequences(batch)
-            replay_queue.put(batch)
+            batch = self.actor_rollout_wg.generate_sequences(batch)
+        replay_queue.put(batch)
         end_time = time.perf_counter()  
         print(f'Done initializing replay buffer in {end_time - start_time:.2f} seconds')
 
@@ -138,25 +146,21 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                 sample_batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(sample_batch.batch))], dtype=object)
                 
                 with Timer('step', timing_raw):
-                    if self.config.actor_rollout_ref.rollout.async_engine:
-                        def async_sampler(generator, q):
+                    if self.async_rollout_mode:
+                        def async_sampler(batch):
                             with Timer('gen', timing_raw):
-                                outputs = []
-                                for item in generator:
-                                    if item is None:
-                                        break
-                                    outputs.append(item)
-                                replay_queue.put(DataProto.concat(outputs))
-                        # Get the generator function which will yield results as they complete
-                        gen_seq_generator = self.rollout_wg.generate_sequences_async(prompts=sample_batch)
-                        thread = threading.Thread(target=async_sampler, args=(gen_seq_generator, replay_queue))
+                                self.async_rollout_manager.wake_up()
+                                batch = self.async_rollout_manager.generate_sequences(batch)
+                                self.async_rollout_manager.sleep()
+                                replay_queue.put(batch)
+                        thread = threading.Thread(target=async_sampler, args=(sample_batch,))
                         thread.start()
-                    else:                  
-                        def sync_sampler(q, batch):
+                    else:
+                        def sync_sampler(batch):
                             with Timer('gen', timing_raw):
                                 batch = self.rollout_wg.generate_sequences(batch)
                                 replay_queue.put(batch)                        
-                        thread = threading.Thread(target=sync_sampler, args=(replay_queue, sample_batch))
+                        thread = threading.Thread(target=sync_sampler, args=(sample_batch))
                         thread.start()
                     
                     
@@ -167,11 +171,8 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                     batch = replay_queue.get()
                     
                     with Timer('adv', timing_raw):
-                        if not self.config.actor_rollout_ref.rollout.compute_reward:
-                            reward_tensor = self.reward_fn(batch)
-                            batch.batch['token_level_scores'] = reward_tensor
-                        else:
-                            reward_tensor = batch.batch['token_level_scores']
+                        reward_tensor = self.reward_fn(batch)
+                        batch.batch['token_level_scores'] = reward_tensor
                         # Rejection sampling based on rewards
                         # Group rewards by uid
                         uids = batch.non_tensor_batch['uid']
@@ -224,17 +225,10 @@ class RayPPOAsyncTrainer(RayPPOTrainer):
                             batch = dataprotoitem_to_dataproto(batch)
 
                         
-                        if self.config.actor_rollout_ref.rollout.enable_log_prob:
-                            # Avoid recompute log_prob bugs. Log probs from vLLM. (Could be buggy)
-                            batch.meta_info['micro_batch_size'] = self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
-                            batch.meta_info['max_token_len'] = self.config.actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu
-                            batch.meta_info['use_dynamic_bsz'] = self.config.actor_rollout_ref.rollout.log_prob_use_dynamic_bsz
-                            batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
-                        else:
-                            # Recompute old_log_probs using Pytorch FSDP.
-                            with Timer('old_log_prob', timing_raw):
-                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                                batch = batch.union(old_log_prob)
+                        # Recompute old_log_probs using Pytorch FSDP.
+                        with Timer('old_log_prob', timing_raw):
+                            old_log_prob = self.actor_wg.compute_log_prob(batch)
+                            batch = batch.union(old_log_prob)
 
                         if self.use_reference_policy:
                             # compute reference log_prob

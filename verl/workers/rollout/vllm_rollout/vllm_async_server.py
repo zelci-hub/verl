@@ -99,10 +99,9 @@ class ExternalRayDistributedExecutor(Executor):
         else:
             sent_method = cloudpickle.dumps(method)
         del method
-        futures = [worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers]
-        outputs = ray.get(futures)
-        # if sent_method == 'execute_model':
-        #     logger.info(f'execute model exit')
+
+        # ~3ms overhead per schedule step due to SchedulerOutput/ModelRunnerOutput serialization/deserialization.
+        outputs = ray.get([worker.execute_method.remote(sent_method, *args, **(kwargs or {})) for worker in self.workers])
         return outputs
 
     def check_health(self):
@@ -202,14 +201,21 @@ class AsyncvLLMServer(AsyncServerBase):
         model_config = self.engine.model_config
         BASE_MODEL_PATHS = [BaseModelPath(name=model_name, model_path=model_path)]
         models = OpenAIServingModels(self.engine, model_config, BASE_MODEL_PATHS)
+        if config.chat_template:
+            with open(config.chat_template, "r", encoding="utf-8") as f:
+                chat_template_str = f.read()
+        else:
+            chat_template_str = None
+        print(f"chat_template_str: {chat_template_str}")
         self.openai_serving_chat = OpenAIServingChat(
             self.engine,
             model_config,
             models,
             "assistant",
             request_logger=RequestLogger(max_log_len=4096) if not config.disable_logging else None,
-            chat_template=None,
+            chat_template=chat_template_str,
             chat_template_content_format="auto",
+            #return_tokens_as_token_ids=True,
         )
 
         self.openai_serving_completion = OpenAIServingCompletion(
