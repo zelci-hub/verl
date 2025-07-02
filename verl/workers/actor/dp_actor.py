@@ -330,6 +330,8 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss_agg_mode_entropy = loss_agg_mode
                     entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode_entropy)
+                    with torch.no_grad():
+                        entropy_token_mean_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode='token-mean')
 
                     # compute policy loss
                     if entropy_coeff != 0:
@@ -355,6 +357,7 @@ class DataParallelPPOActor(BasePPOActor):
                     loss.backward()
 
                     data = {
+                        'actor/entropy_token_mean_loss': entropy_token_mean_loss.detach().item(),
                         'actor/entropy_loss': entropy_loss.detach().item(),
                         "actor/pg_loss": pg_loss.detach().item(),
                         "actor/pg_clipfrac": pg_clipfrac.detach().item(),

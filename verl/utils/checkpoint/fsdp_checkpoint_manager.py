@@ -86,26 +86,25 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         local_optim_path = copy_to_local(remote_optim_path)
         local_extra_state_path = copy_to_local(remote_extra_state_path)
 
+        # Load and apply model state dict first
         model_state_dict = torch.load(local_model_path, weights_only=False)
-        optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
-        extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
-
-        if del_local_after_load:
-            try:
-                os.remove(local_model_path) if is_non_local(local_model_path) else None
-                os.remove(local_optim_path) if is_non_local(local_optim_path) else None
-                os.remove(local_extra_state_path) if is_non_local(local_extra_state_path) else None
-            except Exception as e:
-                print(f"[rank-{self.rank}]: remove local resume ckpt file after loading failed, exception {e} will be ignored")
-
-        lr_scheduler_state_dict = extra_state_dict["lr_scheduler"]
-
         state_dict_cfg = ShardedStateDictConfig(offload_to_cpu=True)
         optim_cfg = ShardedOptimStateDictConfig(offload_to_cpu=True)
         with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
             self.model.load_state_dict(model_state_dict)
-            if self.optimizer is not None:
+        del model_state_dict
+        torch.cuda.empty_cache()
+
+        # Then load optimizer
+        if self.optimizer is not None:
+            optimizer_state_dict = torch.load(local_optim_path, weights_only=False)
+            with get_fsdp_state_ctx(self.model, StateDictType.SHARDED_STATE_DICT, state_dict_cfg, optim_cfg):
                 self.optimizer.load_state_dict(optimizer_state_dict)
+            del optimizer_state_dict
+            torch.cuda.empty_cache()
+
+        extra_state_dict = torch.load(local_extra_state_path, weights_only=False)
+        lr_scheduler_state_dict = extra_state_dict["lr_scheduler"]
 
         # recover random state
         if extra_state_dict and "rng" in extra_state_dict:
@@ -115,8 +114,6 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         if self.lr_scheduler is not None:
             self.lr_scheduler.load_state_dict(lr_scheduler_state_dict)
 
-        del model_state_dict
-        del optimizer_state_dict
         del extra_state_dict
         torch.cuda.empty_cache()
 

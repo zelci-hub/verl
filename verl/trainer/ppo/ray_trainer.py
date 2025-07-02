@@ -887,7 +887,10 @@ class RayPPOTrainer:
             load_actor_cls = self.actor_rollout_wg
         else:
             load_actor_cls = self.actor_wg
-            
+        
+        if self.async_rollout_mode:
+            self.async_rollout_manager.sleep()
+        
         load_actor_cls.load_checkpoint(actor_path,
                                               del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
