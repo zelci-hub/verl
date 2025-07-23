@@ -20,7 +20,12 @@ import ray
 from omegaconf import DictConfig
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
+
+import vllm
+vllm.plugins.load_general_plugins()
+
 from vllm import SamplingParams
+
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import ChatCompletionRequest, ChatCompletionResponse, CompletionRequest, CompletionResponse, ErrorResponse
@@ -195,6 +200,7 @@ class AsyncvLLMServer(AsyncServerBase):
         vllm_config = engine_args.create_engine_config()
         namespace = ray.get_runtime_context().namespace
         vllm_config.instance_id = f"{namespace}:{self.wg_prefix}:{self.vllm_dp_size}:{self.vllm_dp_rank}"
+        
         self.engine = AsyncLLM.from_vllm_config(vllm_config)
 
         # build serving chat

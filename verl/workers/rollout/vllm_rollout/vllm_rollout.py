@@ -121,6 +121,11 @@ class vLLMRollout(BaseRollout):
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
         lora_kwargs = kwargs.pop('lora_kwargs', {})
         self.lora_kwargs = lora_kwargs
+        
+        # Load vLLM plugins before creating the engine
+        from vllm import plugins
+        plugins.load_general_plugins()
+        
         self.inference_engine = LLM(
             actor_module,
             tokenizer=tokenizer,

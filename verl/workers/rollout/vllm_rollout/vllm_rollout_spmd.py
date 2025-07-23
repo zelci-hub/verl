@@ -48,6 +48,10 @@ from verl.third_party.vllm import vllm_version
 from verl.utils.debug import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
+
+import vllm
+vllm.plugins.load_general_plugins()
+
 from vllm.lora.request import LoRARequest
 
 from verl.workers.rollout.vllm_rollout.monkey_patch import (
@@ -171,6 +175,8 @@ class vLLMRollout(BaseRollout):
         #    (which can vary across different vLLM versions);
         # - Otherwise it's the desired value we want to explicitly set.
         engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
+        
+        # Load vLLM plugins before creating the engine
         self.inference_engine = LLM(
             model=model_path,
             enable_sleep_mode=True,
