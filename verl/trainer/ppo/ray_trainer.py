@@ -333,6 +333,48 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
     
     return data
 
+def log_memory_before(prefix=""):
+    if not torch.cuda.is_available():
+        print(f"Before {prefix}: CUDA not available")
+        return
+    
+    try:
+        # Get current device
+        device = torch.cuda.current_device()
+        
+        # Synchronize to ensure accurate memory readings
+        torch.cuda.synchronize(device)
+        
+        mem_allocated = torch.cuda.memory_allocated(device) / 1024**2  # MB
+        mem_reserved = torch.cuda.memory_reserved(device) / 1024**2    # MB
+        
+        # Reset peak memory stats for the specific device
+        torch.cuda.reset_peak_memory_stats(device)
+        
+        print(f"Before {prefix} [GPU:{device}] Allocated: {mem_allocated:.2f} MB | Reserved: {mem_reserved:.2f} MB")
+    except Exception as e:
+        print(f"Before {prefix}: Error reading GPU memory: {e}")
+
+def log_memory_after(prefix=""):
+    if not torch.cuda.is_available():
+        print(f"After {prefix}: CUDA not available")
+        return
+        
+    try:
+        # Get current device
+        device = torch.cuda.current_device()
+        
+
+        # Synchronize to ensure accurate memory readings
+        torch.cuda.synchronize(device)
+        
+        mem_allocated = torch.cuda.memory_allocated(device) / 1024**2  # MB
+        mem_reserved = torch.cuda.memory_reserved(device) / 1024**2    # MB
+        peak = torch.cuda.max_memory_allocated(device) / 1024**2
+        
+        print(f"After {prefix} [GPU:{device}] Allocated: {mem_allocated:.2f} MB | Reserved: {mem_reserved:.2f} MB | Peak: {peak:.2f} MB")
+    except Exception as e:
+        print(f"After {prefix}: Error reading GPU memory: {e}")
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -1052,6 +1094,7 @@ class RayPPOTrainer:
 
                 with _timer('step', timing_raw):
                     with _timer('gen', timing_raw):
+                        #print('\n gen async: ',self.async_rollout_mode) false
                         if self.async_rollout_mode:
                             self.async_rollout_manager.wake_up()
                             batch = self.async_rollout_manager.generate_sequences(batch)
@@ -1065,28 +1108,33 @@ class RayPPOTrainer:
 
                     with _timer("reward", timing_raw):
                         # compute reward model score
+                        #print('\n use_rm: ',self.use_rm) false
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
-
+                        #print('\n launch_reward_fn_async: ',self.config.reward_model.launch_reward_fn_async) false
                         if self.config.reward_model.launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                             reward_tensor, reward_extra_infos_dict = None, None
 
                     with _timer('adv', timing_raw):
+
                         # compute scores using reward model and/or reward function
+                        #print('\n use_rm: ',self.use_rm) false
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
                         reward_extra_infos_dict: dict[str, list]
+                        #print('\n launch_reward_fn_async: ',self.config.reward_model.launch_reward_fn_async) false
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                         batch.batch['token_level_scores'] = reward_tensor
-                        
-                        print(f'{list(reward_extra_infos_dict.keys())=}')
+
+
+                        #print(f'{list(reward_extra_infos_dict.keys())=}')
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})  
 
@@ -1114,6 +1162,7 @@ class RayPPOTrainer:
                         metrics['batch/solve_all'] = solve_all
                         metrics['batch/solve_partial'] = len(unique_uids) - solve_none - solve_all
 
+                        #print('\n rejection_sample: ',self.config.trainer.rejection_sample) false
                         if self.config.trainer.rejection_sample:
                             # If no valid samples remain, skip this batch and get a new one
                             if not valid_mask.any():
@@ -1145,6 +1194,7 @@ class RayPPOTrainer:
                         
                         # Recompute old_log_probs using Pytorch FSDP.                     # recompute old_log_probs
                         with _timer("old_log_prob", timing_raw):
+                           
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             # entropys = old_log_prob.batch["entropys"]
                             # response_masks = batch.batch["response_mask"]
@@ -1179,12 +1229,13 @@ class RayPPOTrainer:
                                     }
                                 )
 
+                        #print('\n use_reference_policy: ',self.use_reference_policy) true
                         if self.use_reference_policy:
                             # compute reference log_prob
                             with _timer('ref', timing_raw):
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                                 batch = batch.union(ref_log_prob)
-
+                        #print('\n use_critic: ',self.use_critic) false
                         # compute values
                         if self.use_critic:
                             with _timer('values', timing_raw):
@@ -1192,6 +1243,7 @@ class RayPPOTrainer:
                                 batch = batch.union(values)
 
                         # compute rewards. apply_kl_penalty if available
+                        #print('\n use_kl_in_reward: ',self.config.algorithm.use_kl_in_reward) false
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
                             metrics.update(kl_metrics)
@@ -1219,6 +1271,7 @@ class RayPPOTrainer:
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
+                    #print('\n balance_batch: ',self.config.trainer.balance_batch) true
                     if self.config.trainer.balance_batch:
                         self._balance_batch(batch, metrics=metrics)
 
@@ -1226,6 +1279,7 @@ class RayPPOTrainer:
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                     # update critic
+                    #print('\n use_critic: ',self.use_critic) false
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
@@ -1233,11 +1287,14 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
+                    #print('\n critic_warmup: ',self.config.trainer.critic_warmup) 0
                     if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                            # update actor
                         with _timer("update_actor", timing_raw):
+
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
+
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -1245,7 +1302,7 @@ class RayPPOTrainer:
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
                         with _timer("dump_rollout_generations", timing_raw):
-                            print(batch.batch.keys())
+                            #print(batch.batch.keys())
                             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
                             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
                             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
@@ -1260,6 +1317,7 @@ class RayPPOTrainer:
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                         with _timer("testing", timing_raw):
+
                             val_metrics: dict = self._validate()
                             if is_last_step:
                                 last_val_metrics = val_metrics

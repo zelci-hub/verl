@@ -134,6 +134,14 @@ actor_rollout_ref:
     engine_kwargs: # inference engine parameters
       vllm:
         swap_space: null # null means "use the engine default value" (usually 4 GB), setting it to, e.g., 32 means 32 GB
+        # Arctic-Inference Speculative Decoding Configuration
+        speculative_config:
+          method: null # "suffix" or "arctic" or null to disable
+          enable_suffix_decoding: false
+          suffix_cache_max_depth: 64
+          disable_by_batch_size: null
+          num_speculative_tokens: null
+          model: null # speculator model for "arctic" method
       sglang:
         attention_backend: null # null means use the engine default value, available options: flashinfer, triton, flashmla
     val_kwargs:
