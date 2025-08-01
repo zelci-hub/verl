@@ -39,6 +39,7 @@ from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs, ulysses_pad
 from verl.workers.actor import BasePPOActor
+from verl.utils.debug.performance import log_gpu_memory_usage
 
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
@@ -317,6 +318,8 @@ class DataParallelPPOActor(BasePPOActor):
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
+        print(f"update_policy: in function update_policy")
+        log_gpu_memory_usage("Start update_policy", logger=logger)
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
@@ -372,13 +375,15 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
-
+                log_gpu_memory_usage("After zero grad", logger=logger)
                 for data in micro_batches:
                     # Support all hardwares
+                    log_gpu_memory_usage("Start of new micro batch", logger=logger)
                     if isinstance(data, DataProto):
                         data = {**data.batch.to(get_torch_device().current_device()), **data.non_tensor_batch}
                     else:
                         data = data.to(get_torch_device().current_device())  # actor device is cpu when using offload
+                    log_gpu_memory_usage("After to device", logger=logger)
                     responses = data["responses"]
                     response_length = responses.size(1)
                     attention_mask = data['attention_mask']
@@ -400,7 +405,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # all return: (bsz, response_length)
                     calculate_entropy = True
+                    log_gpu_memory_usage("Before forward micro batch", logger=logger)
                     entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature, calculate_entropy=calculate_entropy)
+                    log_gpu_memory_usage("After forward micro batch", logger=logger)
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         old_log_prob=old_log_prob,
@@ -413,6 +420,7 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
                     )
+                    log_gpu_memory_usage("After compute policy loss", logger=logger)
                     if entropy_coeff == 0:
                         loss_agg_mode_entropy = 'token-mean'
                     else:
@@ -442,7 +450,9 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
                     else:
                         loss = policy_loss / self.gradient_accumulation
+                    log_gpu_memory_usage("Before backward", logger=logger)
                     loss.backward()
+                    log_gpu_memory_usage("After backward", logger=logger)
 
                     data = {
                         'actor/entropy_token_mean_loss': entropy_token_mean_loss.detach().item(),

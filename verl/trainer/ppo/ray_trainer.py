@@ -76,7 +76,6 @@ class Role(Enum):
     """
     To create more roles dynamically, you can subclass Role and add new members
     """
-
     Actor = 0
     Rollout = 1
     ActorRollout = 2
@@ -418,7 +417,7 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-             AdvantageEstimator.LOOP,
+            AdvantageEstimator.LOOP,
         ]:
             self.use_critic = False
         else:
@@ -1052,7 +1051,7 @@ class RayPPOTrainer:
 
                 with _timer('step', timing_raw):
                     with _timer('gen', timing_raw):
-                        if self.async_rollout_mode:
+                        if self.async_rollout_mode: #false
                             self.async_rollout_manager.wake_up()
                             batch = self.async_rollout_manager.generate_sequences(batch)
                             self.async_rollout_manager.sleep()
@@ -1065,22 +1064,22 @@ class RayPPOTrainer:
 
                     with _timer("reward", timing_raw):
                         # compute reward model score
-                        if self.use_rm:
+                        if self.use_rm: #false
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async: #false
                             future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
                             reward_tensor, reward_extra_infos_dict = None, None
 
                     with _timer('adv', timing_raw):
                         # compute scores using reward model and/or reward function
-                        if self.use_rm:
+                        if self.use_rm: #false
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
 
                         reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
+                        if self.config.reward_model.launch_reward_fn_async: #false
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         else:
                             reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
@@ -1114,7 +1113,7 @@ class RayPPOTrainer:
                         metrics['batch/solve_all'] = solve_all
                         metrics['batch/solve_partial'] = len(unique_uids) - solve_none - solve_all
 
-                        if self.config.trainer.rejection_sample:
+                        if self.config.trainer.rejection_sample: #false
                             # If no valid samples remain, skip this batch and get a new one
                             if not valid_mask.any():
                                 continue
@@ -1179,20 +1178,20 @@ class RayPPOTrainer:
                                     }
                                 )
 
-                        if self.use_reference_policy:
+                        if self.use_reference_policy: #True
                             # compute reference log_prob
                             with _timer('ref', timing_raw):
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                                 batch = batch.union(ref_log_prob)
 
                         # compute values
-                        if self.use_critic:
+                        if self.use_critic: #false
                             with _timer('values', timing_raw):
                                 values = self.critic_wg.compute_values(batch)
                                 batch = batch.union(values)
 
                         # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
+                        if self.config.algorithm.use_kl_in_reward: #false
                             batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
                             metrics.update(kl_metrics)
                         else:
@@ -1219,20 +1218,20 @@ class RayPPOTrainer:
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
-                    if self.config.trainer.balance_batch:
+                    if self.config.trainer.balance_batch: #True
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 
                     # update critic
-                    if self.use_critic:
+                    if self.use_critic: #false
                         with _timer("update_critic", timing_raw):
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
+                    # implement critic warmup 
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer("update_actor", timing_raw):
