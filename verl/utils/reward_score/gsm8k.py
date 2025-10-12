@@ -79,16 +79,17 @@ def compute_score(solution_str, ground_truth,method="strict", format_score=0.0, 
     try:
         # 1. Regex-based robust extraction (handles "\\boxed  {", newlines, etc.)
         import re
-
-        regex_match = re.search(r"\\boxed\s*\{([^{}]*)\}", solution_str, flags=re.DOTALL)
         answer = None
-        if regex_match:
-            answer = regex_match.group(1).strip()
+        if  "\\boxed" in solution_str:
+            regex_match = re.search(r"\\boxed\s*\{([^{}]*)\}", solution_str, flags=re.DOTALL)
+            if regex_match:
+                answer = regex_match.group(1).strip()
+            else:
+                string_in_last_boxed = last_boxed_only_string(solution_str)
+                answer = remove_boxed(string_in_last_boxed)
         else:
             # 2. Fallback to the legacy parser
-            string_in_last_boxed = last_boxed_only_string(solution_str)
-            if string_in_last_boxed is not None:
-                answer = remove_boxed(string_in_last_boxed)
+            answer = extract_solution(solution_str)
 
         # Compare with ground truth if we managed to extract something
         if answer is not None and is_equiv(answer, ground_truth):

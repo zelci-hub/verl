@@ -27,6 +27,12 @@ When working with Megatron:
 """
 
 import json
+try:
+    import orjson  # Optional, faster JSON
+    _HAS_ORJSON = True
+except Exception:
+    orjson = None  # type: ignore
+    _HAS_ORJSON = False
 import logging
 import os
 import pickle
@@ -251,6 +257,13 @@ class vLLMRollout(BaseRollout):
         
         # Initialize suffix cache data storage path if available
         self.suffix_cache_data_path = config.get("suffix_cache_data_path", None)
+        # Optional: path to problem_id_to_files mapping (overrides default in suffix_cache_data_path)
+        self.suffix_cache_mapping_path = config.get("suffix_cache_mapping_path", None)
+        # Optional: window size (how many latest files per problem to read)
+        try:
+            self.suffix_cache_window_size = int(config.get("suffix_cache_window_size", 2))
+        except Exception:
+            self.suffix_cache_window_size = 2
         
         # Initialize speculative_config from engine_kwargs
         # Check if speculative_config was passed in engine_kwargs
@@ -282,55 +295,115 @@ class vLLMRollout(BaseRollout):
         if not os.path.exists(self.suffix_cache_data_path):
             print(f"Suffix cache data path does not exist: {self.suffix_cache_data_path}")
             return {}
-        # Handle both directory and file paths
-        files_to_process = []
-        if os.path.isdir(self.suffix_cache_data_path):
-            # Search for JSONL files in the directory
-            for filename in os.listdir(self.suffix_cache_data_path):
-                if filename.endswith('.jsonl'):
-                    files_to_process.append(os.path.join(self.suffix_cache_data_path, filename))
-        elif os.path.isfile(self.suffix_cache_data_path):
-            files_to_process = [self.suffix_cache_data_path]
-        
-        if not files_to_process:
-            print(f"No JSONL files found in suffix cache data path: {self.suffix_cache_data_path}")
+        # Load mapping of problem_id -> file list and select top-2 numerically largest files
+        # Determine mapping path: prefer explicit setting, otherwise default inside suffix_cache_data_path
+        mapping_path = self.suffix_cache_mapping_path or (
+            os.path.join(self.suffix_cache_data_path, "problem_id_to_files.json")
+            if self.suffix_cache_data_path else None
+        )
+        if not mapping_path:
+            print("No mapping_path available (suffix_cache_mapping_path and suffix_cache_data_path are empty)")
             return {}
-        #print("DEBUG:Files found:", files_to_process)
+        if not os.path.exists(mapping_path):
+            print(f"problem_id_to_files mapping not found: {mapping_path}")
+            return {}
         try:
-            for file_path in files_to_process:
+            with open(mapping_path, "r", encoding="utf-8") as mf:
+                pid_to_files_map = json.load(mf)
+        except Exception as e:
+            print(f"Failed to load mapping file: {e}")
+            return {}
+
+        base_dir = os.path.dirname(mapping_path)
+        pid_str_to_original = {str(pid): pid for pid in problem_ids}
+        file_to_needed_pids = {}
+
+        for pid_str, orig_pid in pid_str_to_original.items():
+            filenames = pid_to_files_map.get(pid_str, [])
+            if not filenames:
+                continue
+
+            def parse_num(name):
+                try:
+                    return int(os.path.splitext(name)[0])
+                except Exception:
+                    return -1
+
+            filenames_sorted = sorted(filenames, key=parse_num)
+            window_size = self.suffix_cache_window_size if self.suffix_cache_window_size and self.suffix_cache_window_size > 0 else 2
+            selected = filenames_sorted[-window_size:] if len(filenames_sorted) >= window_size else filenames_sorted
+            for fname in selected:
+                file_path = os.path.join(base_dir, fname)
+                file_to_needed_pids.setdefault(file_path, set()).add(pid_str)
+
+        if not file_to_needed_pids:
+            print("No files selected from mapping for requested problem_ids.")
+            return {}
+
+        processed_files = 0
+        try:
+            # Prepare global early-stop tracking when a per-pid maximum is configured
+            max_per_pid = getattr(self, "suffix_cache_max_sequences_per_pid", None)
+            if max_per_pid is not None:
+                all_needed_pid_strs = set()
+                for s in file_to_needed_pids.values():
+                    all_needed_pid_strs.update(s)
+                collected_per_pid = {pid_str: 0 for pid_str in all_needed_pid_strs}
+            else:
+                collected_per_pid = None
+
+            for file_path, needed_pid_strs in file_to_needed_pids.items():
+                processed_files += 1
                 print(f"Loading suffix cache data from: {file_path}")
-                with open(file_path, 'r') as f:
-                    for line in f:
-                        try:                            
-                            data = json.loads(line.strip())
-                            # Only support token IDs format
-                            # if 'output_token_ids' in data:
-                            #     # Data saved with save_token_ids=True
-                            #     output_data = data['output_token_ids']
-                            #     print(f"DEBUG: Loaded token IDs: {len(output_data)} tokens")
-                            #     problem_id_to_sequences.append(output_data)
-                            # else:
-                            #     print(f"WARNING: No 'output_token_ids' field found in data: {list(data.keys())}. Only token IDs format is supported.")
-                            #     continue
-                            # print("DEBUG:'problem_id' in data", 'problem_id' in data)
-                            # print("DEBUG:'output' in data", 'output_token_ids' in data)
-                            if 'problem_id' in data and 'output_token_ids' in data:
-                                problem_id = data['problem_id']
-                                if problem_id in problem_ids:
-                                    #print("DEBUG:problem_id in problem_ids", problem_id)
-                                    output_text = data['output_token_ids']
-                                    if problem_id not in problem_id_to_sequences:
-                                        problem_id_to_sequences[problem_id] = []
-                                    # Store the output text
-                                    problem_id_to_sequences[problem_id].append(output_text)
-                        except json.JSONDecodeError as e:
-                            print(f"Failed to parse JSON line in {file_path}: {line.strip()}, error: {e}")
-                            continue
-                        
+                # Work on a per-file mutable copy for early termination within the file
+                pending_pid_strs = set(needed_pid_strs)
+                try:
+                    # Use large buffering and binary mode; prefer orjson when available
+                    with open(file_path, 'rb', buffering=1 << 20) as f:
+                        for line in f:
+                            # Fast pre-filter: skip lines that cannot contain any target pid
+                            if pending_pid_strs and not any(pid.encode() in line for pid in pending_pid_strs):
+                                continue
+
+                            # Parse JSON (prefer orjson on bytes; fallback to json on str)
+                            try:
+                                if _HAS_ORJSON:
+                                    data = orjson.loads(line)
+                                else:
+                                    data = json.loads(line.decode('utf-8').strip())
+                            except Exception:
+                                continue
+
+                            pid_value = data.get('problem_id')
+                            if pid_value is None or 'output_token_ids' not in data:
+                                continue
+                            pid_as_str = str(pid_value)
+                            if pid_as_str not in pending_pid_strs:
+                                continue
+
+                            orig_pid = pid_str_to_original.get(pid_as_str, pid_value)
+                            if orig_pid not in problem_id_to_sequences:
+                                problem_id_to_sequences[orig_pid] = []
+                            problem_id_to_sequences[orig_pid].append(data['output_token_ids'])
+
+                            # Update early-stop tracking
+                            if collected_per_pid is not None:
+                                collected_per_pid[pid_as_str] += 1
+                                if collected_per_pid[pid_as_str] >= max_per_pid:
+                                    pending_pid_strs.discard(pid_as_str)
+                                    # If this file no longer needs any pids, stop reading it
+                                    if not pending_pid_strs:
+                                        break
+                except FileNotFoundError:
+                    continue
+
+                # Global early stop: if we satisfied all pids across files, end the loop
+                if collected_per_pid is not None and all(v >= max_per_pid for v in collected_per_pid.values()):
+                    break
         except Exception as e:
             print(f"Failed to load suffix cache data: {e}")
             
-        print(f"Loaded suffix cache data for {len(problem_id_to_sequences)} problem IDs from {len(files_to_process)} files")
+        print(f"Loaded suffix cache data for {len(problem_id_to_sequences)} problem IDs from {processed_files} files")
           
         return problem_id_to_sequences
 
@@ -417,18 +490,27 @@ class vLLMRollout(BaseRollout):
         problem_ids = non_tensor_batch.get("problem_id", None)
         # print("DEBUG:in generate_sequences: problem_ids", problem_ids)
         
+        # Handle problem_id - generate if not present
+        if "problem_id" in non_tensor_batch:
+            problem_ids = non_tensor_batch.pop("problem_id")
+        else:
+            # Generate problem_ids if not present in the data
+            batch_size = len(non_tensor_batch["raw_prompt_ids"])
+            problem_ids = [f"generated_{i:05d}" for i in range(batch_size)]
+            print(f"WARNING: problem_id not found in batch, generated {batch_size} problem_ids")
+
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
-            for i, (raw_prompt_ids, multi_modal_data,problem_id) in enumerate(zip(
-                non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"),non_tensor_batch.pop("problem_id"),
+            for i, (raw_prompt_ids, multi_modal_data, problem_id) in enumerate(zip(
+                non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data"), problem_ids,
                 strict=True
             )):
-                vllm_input = {"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data,"problem_id":problem_id}
+                vllm_input = {"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data, "problem_id": problem_id}
                 vllm_inputs.append(vllm_input)
         else:
             vllm_inputs = []
-            for i, (raw_prompt_ids,problem_id) in enumerate(zip(non_tensor_batch.pop("raw_prompt_ids"),non_tensor_batch.pop("problem_id"))):
-                vllm_input = {"prompt_token_ids": raw_prompt_ids,"problem_id":problem_id}
+            for i, (raw_prompt_ids, problem_id) in enumerate(zip(non_tensor_batch.pop("raw_prompt_ids"), problem_ids)):
+                vllm_input = {"prompt_token_ids": raw_prompt_ids, "problem_id": problem_id}
                 vllm_inputs.append(vllm_input)
 
         #print("DEBUG: sample problem_ids:", [x["problem_id"] for x in vllm_inputs])
@@ -482,7 +564,15 @@ class vLLMRollout(BaseRollout):
             if SuffixCache is None:
                 raise ImportError("SuffixCache not available. Please install arctic_inference package.")
             suffix_cache_max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
-            suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", 8)
+            suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", None)
+            
+            # 🎯 SuffixCache线程数配置：硬编码为10线程
+            if suffix_cache_max_threads is None:
+                suffix_cache_max_threads = 10
+                print(f"🎯 SuffixCache使用硬编码线程数: {suffix_cache_max_threads}")
+            else:
+                print(f"🎯 SuffixCache使用配置指定线程数: {suffix_cache_max_threads}")
+            
             # 🚀 启用C++对象级锁定+GIL释放的线程安全模式
             self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixCache(
                 max_depth=suffix_cache_max_depth, 
@@ -502,7 +592,7 @@ class vLLMRollout(BaseRollout):
                 print(f"DEBUG: 数据加载总耗时: {total_time:.4f}秒，处理了{len(unique_problem_ids)}个problem_ids")
 
                 assert problem_id_to_sequences is not None, "problem_id_to_sequences must be provided when enable_suffix_prebuild is True"
-                print(f"🚀 SuffixCache C++对象级锁定并行构建: {len(problem_id_to_sequences)} 个问题")
+                #print(f"🚀 SuffixCache C++对象级锁定并行构建: {len(problem_id_to_sequences)} 个问题")
                 
                 # 获取suffix_cache引用（现在已经是线程安全模式）
                 suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
@@ -516,24 +606,27 @@ class vLLMRollout(BaseRollout):
                             sequences = problem_id_to_sequences[problem_id]
                             problems_data.append((problem_id, prompt_tokens, sequences))
                 
-                print(f"📊 准备并行处理: {len(problems_data)} 个问题, "
-                      f"总序列数: {sum(len(seqs) for _, _, seqs in problems_data)}")
+                #print(f"📊 准备并行处理: {len(problems_data)} 个问题, "f"总序列数: {sum(len(seqs) for _, _, seqs in problems_data)}")
                 
                 # ⚡ 使用C++对象级锁定+GIL释放的真正并行处理
                 import time
-                total_start_time = time.perf_counter()
-                
+                total_start_time = time.perf_counter()               
                 parallel_result = suffix_cache.prebuild_problems_parallel(problems_data)
-                
                 total_time = time.perf_counter() - total_start_time
-                
-                # 📈 性能报告
-                print(f"🎯 C++对象级锁定并行构建完成:")
-                print(f"  ✅ 成功问题: {parallel_result['successful_problems']}/{len(problems_data)}")
-                print(f"  ⚡ 总时间: {total_time:.4f}秒")
-                print(f"  🚀 实际加速: {parallel_result.get('actual_speedup', 'N/A')}x")
-                print(f"  🧵 活跃线程: {parallel_result.get('active_threads', 'N/A')}")
-                print(f"  🔒 技术: 每个SuffixTree独立C++锁+GIL释放")
+
+                # 📈 性能报告（健壮性：缺失键时使用回退值）
+                successful = parallel_result.get("successful_problems")
+                if successful is None:
+                    successful = parallel_result.get("total_problems", 0)
+                active_threads = parallel_result.get("active_threads", "N/A")
+                actual_speedup = parallel_result.get("actual_speedup", "N/A")
+
+                # print(f"🎯 C++对象级锁定并行构建完成:")
+                # print(f"  ✅ 成功问题: {successful}/{len(problems_data)}")
+                # print(f"  ⚡ 总时间: {total_time:.4f}秒")
+                # print(f"  🚀 实际加速: {actual_speedup}x")
+                # print(f"  🧵 活跃线程: {active_threads}")
+                # print(f"  🔒 技术: 每个SuffixTree独立C++锁+GIL释放")
                 
                 # 验证结果
                 cache_stats = suffix_cache.get_cache_stats()
@@ -542,49 +635,39 @@ class vLLMRollout(BaseRollout):
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
-            if enable_suffix_prebuild:
-                # Initialize context manager for problem_id to req_id mapping if problem_ids provided
-                try:
-                    # Import ArcticInference plugin's ProblemIdContextManager
-                    from arctic_inference.vllm.model_runner import ProblemIdContextManager
-                    
-                    # Create empty req_id to problem_id mapping context
-                    ProblemIdContextManager.clear_req_id_mapping()
-                    ProblemIdContextManager.set_req_id_to_problem_id_mapping({})
-                    
-                    # Call generate with problem_ids parameter - LLM patches will handle the mapping
-                    outputs = self.inference_engine.generate(
-                        prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                        sampling_params=self.sampling_params,
-                        lora_request=lora_requests,
-                        use_tqdm=False,
-                        problem_ids=problem_ids,  # Pass problem_ids to generate method
-                    )
+            # Initialize context manager for problem_id to req_id mapping if problem_ids provided
+            try:
+                # Import ArcticInference plugin's ProblemIdContextManager
+                from arctic_inference.vllm.model_runner import ProblemIdContextManager
+                
+                # Create empty req_id to problem_id mapping context
+                ProblemIdContextManager.clear_req_id_mapping()
+                ProblemIdContextManager.set_req_id_to_problem_id_mapping({})
+                
+                # Call generate with problem_ids parameter - LLM patches will handle the mapping
+                outputs = self.inference_engine.generate(
+                    prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                    sampling_params=self.sampling_params,
+                    lora_request=lora_requests,
+                    use_tqdm=False,
+                    problem_ids=problem_ids,  # Pass problem_ids to generate method
+                )
 
-                except (ImportError, TypeError):
-                    # Fallback if ArcticInference plugin is not available or LLM patches are disabled
-                    print("Warning: ArcticInference LLM plugin not available or disabled, problem_ids will be ignored")
-                    outputs = self.inference_engine.generate(
-                        prompts=vllm_inputs,
-                        sampling_params=self.sampling_params,
-                        lora_request=lora_requests,
-                        use_tqdm=False,
-                    )
-                    
-                # Clear suffix cache after generation to free up C++ memory
-                try:    
-                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.clear_all_cache()
-                except Exception as e:
-                    print(f"DEBUG: Failed to clear suffix cache: {e}")
-            else:
-                # Suffix cache not enabled or conditions not met - use simple generate call
-                print("DEBUG: Suffix cache conditions not met, using standard generate call")
+            except (ImportError, TypeError):
+                # Fallback if ArcticInference plugin is not available or LLM patches are disabled
+                print("Warning: ArcticInference LLM plugin not available or disabled, problem_ids will be ignored")
                 outputs = self.inference_engine.generate(
                     prompts=vllm_inputs,
                     sampling_params=self.sampling_params,
                     lora_request=lora_requests,
                     use_tqdm=False,
                 )
+                
+            # Clear suffix cache after generation to free up C++ memory
+            try:    
+                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.clear_all_cache()
+            except Exception as e:
+                print(f"DEBUG: Failed to clear suffix cache: {e}")
 
             # Output generation length statistics
             total_generated_tokens = 0

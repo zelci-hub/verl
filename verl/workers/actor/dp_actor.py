@@ -16,9 +16,11 @@
 """
 Single Process Actor
 """
-
+import itertools
 import logging
 import os
+from typing import Tuple
+
 
 import torch
 from torch import nn
@@ -35,7 +37,7 @@ from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_b
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad, ulysses_pad_and_slice_inputs
 from verl.workers.actor import BasePPOActor
-
+import torch.nn.functional as F
 if is_cuda_available:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 elif is_npu_available:
@@ -46,6 +48,57 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def get_act_in(name, act_in_dict):
+    def hook(model, input, output):
+        act_in_dict[name] =  input[0].detach().cpu()
+    return hook
+
+def get_in(name, in_dict):
+    def hook(model, input, output):
+        in_dict[name] =  input[0].detach().cpu()
+    return hook
+
+def register_act_hooks(model, act_in_dict):
+    hooks = []
+    for name, layer in model.named_modules():       
+        # print(name)
+        if "23._fsdp_wrapped_module.mlp.up_proj" in name:
+            hooks.append(layer.register_forward_hook(get_act_in(name, act_in_dict)))
+    return hooks
+
+
+def remove_hooks(hooks):
+    for hook in hooks:
+        hook.remove()
+
+
+def get_run_lengths(indices):
+    """
+    计算 1D 整数张量 `indices` 中连续整数段的长度。
+    返回一个包含各段长度的列表。
+    """
+    # 1. 确保 indices 按升序排列
+    sorted_idx = torch.sort(indices)[0]
+    
+    # 2. 计算相邻元素之差
+    diffs = sorted_idx[1:] - sorted_idx[:-1]
+    
+    # 3. 找到差值不等于 1 的位置，这些就是“中断点”
+    breakpoints = torch.nonzero(diffs != 1).flatten()
+    
+    run_lengths = []
+    start = 0
+    # 4. 对于每个中断点，在 start 到该中断点之间就是一段连续序列
+    for bp in breakpoints:
+        run_lengths.append((bp - start + 1).item())
+        start = bp + 1
+    
+    # 5. 最后一段从最后一个中断点到结束
+    run_lengths.append(int(len(sorted_idx) - start))
+    
+    return run_lengths
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -163,7 +216,10 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
-
+#===================================================================================
+                act_in_dict={}
+                #hooks = register_act_hooks(self.actor_module, act_in_dict)
+#===================================================================================
                 output = self.actor_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
@@ -172,7 +228,38 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
-
+# #===================================================================================                
+#                 # print(output)
+#                 remove_hooks(hooks)
+#                 # print(act_in_dict)
+#                 last_tensor = act_in_dict['_fsdp_wrapped_module.model.layers.23._fsdp_wrapped_module.mlp.up_proj']
+#                 last_tensor = last_tensor.squeeze(0)  
+#                 run_indices = get_run_lengths(indices)
+#                 #print(f"DEBUG: batch_size={batch_size}, indices.shape={indices.shape}, run_indices={run_indices}, sum(run_indices)={sum(run_indices)}")
+#                 chunks = torch.split(last_tensor, run_indices, dim=0)
+#                 chunks_list = list(chunks)
+#                 #print(f"DEBUG: len(chunks_list)={len(chunks_list)}, last_tensor.shape={last_tensor.shape}")
+                
+                # 创建与原始结构一致的angle_metric - 一维列表，每个样本一个标量值
+                angle_metric = [0.0] * batch_size
+#                 for i, last_tensor in enumerate(chunks_list):
+#                     last_tensor=last_tensor.unsqueeze(0)
+#                     last_tensor_normalized = F.normalize(last_tensor, p=2, dim=1)
+#                     cos = torch.bmm(last_tensor_normalized, last_tensor_normalized.transpose(1, 2))
+#                     cos = cos * torch.tril(torch.ones_like(cos), diagonal=1)
+                    
+#                     sum_per_batch = cos.sum(dim=(1, 2))
+#                     nnz_per_batch = torch.count_nonzero(cos, dim=(1, 2)).float()
+#                     pro_data = sum_per_batch / nnz_per_batch.clamp(min=1.0)
+#                     angle_metric.append(pro_data.item())
+#                     # pro_data = pro_data.sum()/((pro_data != 0).sum())
+#                     # Angle_metric.append(pro_data.item())
+#                     # print(pro_data)
+                
+#                 #print(f"DEBUG: len(angle_metric)={len(angle_metric)}, expected batch_size={batch_size}")
+               
+#===================================================================================
+                
                 if self.use_fused_kernels:
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
@@ -242,6 +329,12 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
+#===================================================================================
+                act_in_dict={}
+                #hooks = register_act_hooks(self.actor_module, act_in_dict)
+                # 创建与原始结构一致的angle_metric - 一维列表，每个样本一个标量值
+                angle_metric = [0.0] * batch_size
+#===================================================================================
                 output = self.actor_module(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
@@ -250,6 +343,27 @@ class DataParallelPPOActor(BasePPOActor):
                     use_cache=False,
                     **extra_args,
                 )  # prevent model thinks we are generating
+               
+#===================================================================================                
+                # remove_hooks(hooks)
+                # # print(act_in_dict)
+                # last_tensor = act_in_dict['_fsdp_wrapped_module.model.layers.23._fsdp_wrapped_module.mlp.up_proj']
+                # print(last_tensor.size())
+                # last_tensor = last_tensor.float()
+                
+                # last_tensor_normalized = F.normalize(last_tensor, p=2, dim=1)
+                # cos = torch.bmm(last_tensor_normalized, last_tensor_normalized.transpose(1, 2))
+                # cos = cos * torch.tril(torch.ones_like(cos), diagonal=1)
+                
+                # sum_per_batch = cos.sum(dim=(1, 2))
+                # nnz_per_batch = torch.count_nonzero(cos, dim=(1, 2)).float()
+                # pro_data = sum_per_batch / nnz_per_batch.clamp(min=1.0)
+                # # pro_data = pro_data.sum()/((pro_data != 0).sum())
+                # Angle_metric.append(pro_data.item())
+                # print(pro_data)
+               
+#===================================================================================
+                
 
                 if self.use_fused_kernels:
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
@@ -267,7 +381,7 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
 
-            return entropy, log_probs
+            return entropy, log_probs, angle_metric
 
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
@@ -326,13 +440,15 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropy_lst = []
+        angle_metric_lst = []
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
             with torch.no_grad():
-                entropy, log_probs = self._forward_micro_batch(
+                entropy, log_probs, angle_metric = self._forward_micro_batch(
                     model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                 )
             log_probs_lst.append(log_probs)
+            angle_metric_lst.extend(angle_metric)
             if calculate_entropy:
                 entropy_lst.append(entropy)
 
@@ -346,7 +462,8 @@ class DataParallelPPOActor(BasePPOActor):
             if calculate_entropy:
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
 
-        return log_probs, entropys
+        #print(f"DEBUG: Final return - log_probs.shape={log_probs.shape}, len(angle_metric_lst)={len(angle_metric_lst)}")
+        return log_probs, entropys, angle_metric_lst
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
@@ -389,7 +506,7 @@ class DataParallelPPOActor(BasePPOActor):
                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
-
+                Angle_metric = []
                 for micro_batch in micro_batches:
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -412,9 +529,10 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy = False
                     if entropy_coeff != 0:
                         calculate_entropy = True
-                    entropy, log_prob = self._forward_micro_batch(
+                    entropy, log_prob, pro_data = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    Angle_metric.append(pro_data)
 
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 

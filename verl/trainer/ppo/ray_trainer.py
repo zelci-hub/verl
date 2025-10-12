@@ -54,6 +54,9 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.debug import marked_timer
+
+# Alias for compatibility
+_timer = marked_timer
 from verl.utils.metric import (
     reduce_metrics,
 )
@@ -572,24 +575,48 @@ class RayPPOTrainer:
             )
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
-        if train_sampler is None:
-            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
-        if collate_fn is None:
-            from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
 
-            collate_fn = default_collate_fn
-
-        num_workers = self.config.data["dataloader_num_workers"]
-
-        self.train_dataloader = StatefulDataLoader(
-            dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
-            num_workers=num_workers,
-            drop_last=True,
-            collate_fn=collate_fn,
-            sampler=train_sampler,
-        )
-
+        #================================================================================================================================
+        # Use GAINRL Sampler
+        if self.config.data.gainrl.enable:
+            from .gainrl_sampler import GAINRLSampler
+            import torch
+            correct_list = torch.load(f"{self.config.data.gainrl.processed_file}")
+            correct_list = correct_list.tolist()
+            # print(self.config.data.train_batch_size)
+            self.sampler = GAINRLSampler(
+                sort_list=correct_list,
+                subset_size=self.config.data.train_batch_size,
+                n = self.config.data.gainrl.n,
+                alpha = self.config.data.gainrl.alpha,
+                beta = self.config.data.gainrl.beta,
+                adj_max = self.config.data.gainrl.adj_max,
+                adj_min = self.config.data.gainrl.adj_min,
+            )
+            self.train_dataloader = StatefulDataLoader(
+                dataset=self.train_dataset,
+                collate_fn=collate_fn,
+                batch_sampler=self.sampler  # Custom batch sampler providing batches of indices
+            )
+            
+        else:
+            if train_sampler is None:
+                train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+            if collate_fn is None:
+                from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+    
+                collate_fn = default_collate_fn
+    
+            self.train_dataloader = StatefulDataLoader(
+                dataset=self.train_dataset,
+                batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+                num_workers=self.config.data.get("dataloader_num_workers", 8),
+                drop_last=True,
+                collate_fn=collate_fn,
+                sampler=train_sampler,
+            )
+            
+        #=================================================================================================================================
         val_batch_size = self.config.data.val_batch_size  # Prefer config value if set
         if val_batch_size is None:
             val_batch_size = len(self.val_dataset)
@@ -597,7 +624,7 @@ class RayPPOTrainer:
         self.val_dataloader = StatefulDataLoader(
             dataset=self.val_dataset,
             batch_size=val_batch_size,
-            num_workers=num_workers,
+            num_workers=self.config.data.get("dataloader_num_workers", 8),
             shuffle=self.config.data.get("validation_shuffle", True),
             drop_last=False,
             collate_fn=collate_fn,
@@ -658,8 +685,8 @@ class RayPPOTrainer:
                 "score": scores,
                 "step": [self.global_steps] * n,
             }
-        print("DEBUG:reward_extra_infos_dict[problem_id]", reward_extra_infos_dict["problem_id"])
-        print("DEBUG:len(reward_extra_infos_dict[problem_id]) == n", len(reward_extra_infos_dict["problem_id"]) == n)
+        #print("DEBUG:reward_extra_infos_dict[problem_id]", reward_extra_infos_dict["problem_id"])
+        #print("DEBUG:len(reward_extra_infos_dict[problem_id]) == n", len(reward_extra_infos_dict["problem_id"]) == n)
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
@@ -707,6 +734,13 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
         sample_turns = []
+        
+        # Lists to collect token IDs (for save_token_ids option)
+        sample_input_token_ids = []
+        sample_output_token_ids = []
+        
+        # List to collect problem_ids
+        sample_problem_ids = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -723,6 +757,16 @@ class RayPPOTrainer:
 
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
+            # Store token IDs for potential saving
+            sample_input_token_ids.extend(input_ids.cpu().tolist())
+            
+            # Store problem_ids if available
+            if "problem_id" in test_batch.non_tensor_batch:
+                sample_problem_ids.extend(test_batch.non_tensor_batch["problem_id"])
+            else:
+                # If no problem_id, use placeholder
+                sample_problem_ids.extend([f"unknown_{i}" for i in range(len(input_ids))])
+            
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
@@ -775,6 +819,9 @@ class RayPPOTrainer:
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
+            # Store token IDs for potential saving
+            sample_output_token_ids.extend(output_ids.cpu().tolist())
+            
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
@@ -805,14 +852,28 @@ class RayPPOTrainer:
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
-            # For validation data, we always save as text (not token IDs)
+            # Add problem_ids to reward_extra_infos_dict for dumping
+            if sample_problem_ids:
+                reward_extra_infos_dict["problem_id"] = sample_problem_ids
+            
+            # Use trainer.save_token_ids to control validation output format
+            save_token_ids = self.config.trainer.get("save_token_ids", False)
+            if save_token_ids:
+                # Save token IDs
+                inputs_to_save = sample_input_token_ids
+                outputs_to_save = sample_output_token_ids
+            else:
+                # Save decoded text
+                inputs_to_save = sample_inputs
+                outputs_to_save = sample_outputs
+                
             self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
+                inputs=inputs_to_save,
+                outputs=outputs_to_save,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
-                save_token_ids=False,
+                save_token_ids=save_token_ids,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -1275,6 +1336,7 @@ class RayPPOTrainer:
                         loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
                         entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
                         old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                        angle_metric = old_log_prob.non_tensor_batch.pop("angle_metric")                        
                         metrics.update(old_log_prob_metrics)
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
@@ -1352,6 +1414,17 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                    #============================================================================================================================================
+                    if self.config.data.gainrl.enable:
+                        acc_tensor = batch.batch['token_level_rewards'].sum(-1)
+                        acc_list = acc_tensor.tolist()
+                        signals = [
+                            {'accuracy': a, 'angle': ang}
+                            for a, ang in zip(acc_list, angle_metric)
+                        ]
+                        self.sampler.update_after_epoch(signals)
+                    #============================================================================================================================================
+
 
                     # update critic
                     if self.use_critic:
@@ -1406,17 +1479,17 @@ class RayPPOTrainer:
                                 save_token_ids=save_token_ids,
                             )
 
-                    # validate
-                    # if (
-                    #     self.val_reward_fn is not None
-                    #     and self.config.trainer.test_freq > 0
-                    #     and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
-                    # ):
-                    #     with marked_timer("testing", timing_raw, color="green"):
-                    #         val_metrics: dict = self._validate()
-                    #         if is_last_step:
-                    #             last_val_metrics = val_metrics
-                    #     metrics.update(val_metrics)
+                    # # validate
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
+                    ):
+                        with marked_timer("testing", timing_raw, color="green"):
+                            val_metrics: dict = self._validate()
+                            if is_last_step:
+                                last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
 
                     # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                     esi_close_to_expiration = should_save_ckpt_esi(

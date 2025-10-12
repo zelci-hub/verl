@@ -74,7 +74,13 @@ class NaiveRewardManager:
             prompt_str = self.tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
             response_str = self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
 
-            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+            # Handle both nested dict and JSON string formats for reward_model
+            reward_model_data = data_item.non_tensor_batch["reward_model"]
+            if isinstance(reward_model_data, str):
+                # Parse JSON string format (from flattened data)
+                import json
+                reward_model_data = json.loads(reward_model_data)
+            ground_truth = reward_model_data["ground_truth"]
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
             extra_info = data_item.non_tensor_batch.get("extra_info", {})
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)

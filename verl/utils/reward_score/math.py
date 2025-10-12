@@ -1,5 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
-# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -11,21 +11,93 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# Adapted from https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/hendrycks_math/utils.py
+
+import re
 
 
-def compute_score(solution_str, ground_truth) -> float:
+def extract_solution(solution_str, method="strict"):
+    assert method in ["strict", "flexible"]
+
+    if method == "strict":
+        # this also tests the formatting of the model
+        solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
+        if solution is None:
+            final_answer = None
+        else:
+            final_answer = solution.group(0)
+            final_answer = final_answer.split("#### ")[1].replace(",", "").replace("$", "")
+    elif method == "flexible":
+        answer = re.findall("(\\-?[0-9\\.\\,]+)", solution_str)
+        final_answer = None
+        if len(answer) == 0:
+            # no reward is there is no answer
+            pass
+        else:
+            invalid_str = ["", "."]
+            # find the last number that is not '.'
+            for final_answer in reversed(answer):
+                if final_answer not in invalid_str:
+                    break
+    return final_answer
+
+
+# def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):
+#     """The scoring function for GSM8k.
+
+#     Reference: Trung, Luong, et al. "Reft: Reasoning with reinforced fine-tuning." Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers). 2024.
+
+#     Args:
+#         solution_str: the solution text
+#         ground_truth: the ground truth
+#         method: the method to extract the solution, choices are 'strict' and 'flexible'
+#         format_score: the score for the format
+#         score: the score for the correct answer
+#     """
+#     answer = extract_solution(solution_str=solution_str, method=method)
+#     print("================================================")
+#     print(answer)
+#     print("================================================")
+#     if answer is None:
+#         return 0
+#     else:
+#         if answer == ground_truth:
+#             return score
+#         else:
+#             return format_score
+
+def compute_score(solution_str, ground_truth,method="strict", format_score=0.0, score=1.0) -> float:
+    """Return 1.0 if the model answer matches the ground-truth, otherwise 0.0.
+
+    This version first tries a fast regex-based extraction that tolerates any
+    amount of whitespace (including newlines) between the "\\boxed" token and
+    the opening brace. If that fails we fall back to the legacy heuristic
+    implemented by `last_boxed_only_string`/`remove_boxed`.
+    """
+
     retval = 0.0
-    try:
-        string_in_last_boxed = last_boxed_only_string(solution_str)
-        if string_in_last_boxed is not None:
-            answer = remove_boxed(string_in_last_boxed)
-            if is_equiv(answer, ground_truth):
-                retval = 1.0
-    except Exception as e:
-        print(e)
 
+    try:
+        # 1. Regex-based robust extraction (handles "\\boxed  {", newlines, etc.)
+        import re
+
+        regex_match = re.search(r"\\boxed\s*\{([^{}]*)\}", solution_str, flags=re.DOTALL)
+        answer = None
+        if regex_match:
+            answer = regex_match.group(1).strip()
+        else:
+            # 2. Fallback to the legacy parser
+            string_in_last_boxed = last_boxed_only_string(solution_str)
+            if string_in_last_boxed is not None:
+                answer = remove_boxed(string_in_last_boxed)
+
+        # Compare with ground truth if we managed to extract something
+        if answer is not None and is_equiv(answer, ground_truth):
+            retval = 1.0
+    except Exception as e:
+        # Swallow parser errors but print them for debugging purposes.
+        print("[compute_score error]", e)
     return retval
+
 
 
 # string normalization from https://github.com/EleutherAI/lm-evaluation-harness/blob/master/lm_eval/tasks/hendrycks_math.py
@@ -210,8 +282,7 @@ def strip_string(string):
     # remove spaces
     string = string.replace(" ", "")
 
-    # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1).
-    # Also does a/b --> \\frac{a}{b}
+    # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1). Also does a/b --> \\frac{a}{b}
     string = fix_fracs(string)
 
     # manually change 0.5 --> \frac{1}{2}

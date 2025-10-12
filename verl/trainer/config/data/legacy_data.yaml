@@ -97,6 +97,16 @@ sampler:
   # the name of the curriculum class like `MySampler`
   class_name: null
 
+# GAINRL sampler configuration
+gainrl:
+  enable: False
+  n: 500
+  beta: 0.5
+  alpha: 2
+  adj_max: 1000
+  adj_min: 0
+  processed_file: ~/processed_data/processed_gsm8k.pt
+
 # Data generation configuration for augmenting the dataset.
 datagen:
 
