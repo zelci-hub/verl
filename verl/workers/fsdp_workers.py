@@ -492,6 +492,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 
             vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
+            
+            # Get trainer rollout_data_dir and pass it to vLLMRollout
+            trainer_rollout_data_dir = self.config.get("trainer_rollout_data_dir", None)
+            
             rollout = vllm_rollout_cls(
                 model_path=local_path,
                 config=self.config.rollout,
@@ -499,6 +503,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 model_hf_config=self.actor_model_config,
                 device_mesh=rollout_device_mesh,
                 trust_remote_code=trust_remote_code,
+                trainer_rollout_data_dir=trainer_rollout_data_dir,
                 **lora_kwargs,
             )
 
@@ -753,6 +758,24 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # clear kv cache
         get_torch_device().empty_cache()
         return output
+
+    @register(blocking=False)
+    def enqueue_prebuild(self, problem_ids, raw_prompt_ids=None, iteration: int | None = None):
+        """Forward enqueue_prebuild call to the underlying rollout if it supports it.
+        
+        This enables Arctic-Inference suffix cache prebuild functionality for FSDP workers
+        when using vLLM rollout backend.
+        
+        Args:
+            problem_ids: list of problem IDs
+            raw_prompt_ids: optional list of prompt token lists aligned with problem_ids
+            iteration: optional current training iteration
+        """
+        if hasattr(self.rollout, 'enqueue_prebuild'):
+            return self.rollout.enqueue_prebuild(problem_ids, raw_prompt_ids, iteration)
+        else:
+            print("DEBUG:rollout doesn't support enqueue_prebuild")
+        # If rollout doesn't support enqueue_prebuild, silently ignore
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")

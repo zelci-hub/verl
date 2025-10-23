@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -27,7 +28,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pprint import pprint
 from typing import Optional
-
+import logging
 import numpy as np
 import ray
 import torch
@@ -346,6 +347,9 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        
+        # Initialize problem_id to files mapping as global dict
+        self._problem_id_to_files = {}
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -390,6 +394,49 @@ class RayPPOTrainer:
 
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _prebuild_next_batch(self) -> None:
+        """Collect next-step problem IDs and prompt tokens and enqueue prebuild on rollout.
+
+        If `self._next_batch` exists, extract `problem_id` and optional `raw_prompt_ids`.
+        If `raw_prompt_ids` are absent, derive them by stripping left pads from `input_ids`.
+        Then, hint rollout to prebuild via its non-blocking `enqueue_prebuild` RPC.
+        """
+        if not getattr(self, "_next_batch", None):
+            logging.warning("No next batch found, skipping prebuild")
+            return
+        try:
+            next_ntb = self._next_batch.non_tensor_batch
+            next_pids = next_ntb.get("problem_id", None)
+            assert next_pids is not None, "problem_id is not found in next_batch for prebuild"
+            next_pids = next_pids.tolist()
+            next_raw = next_ntb.get("raw_prompt_ids", None)
+            assert next_raw is not None, "raw_prompt_ids is not found in next_batch for prebuild"
+            next_raw = next_raw.tolist()
+            next_input_ids = self._next_batch.batch.get("input_ids", None)
+            next_raw = []
+            for i in range(next_input_ids.size(0)):
+                seq = next_input_ids[i]
+                next_raw.append(seq.tolist())
+
+            # # Redundantly attach to batch meta for other consumers
+            # if target_batch is not None:
+            #     try:
+            #         target_batch.meta_info["prebuild_problem_ids"] = next_pids
+            #         if next_raw is not None:
+            #             target_batch.meta_info["prebuild_raw_prompt_ids"] = next_raw
+            #     except Exception:
+            #         pass
+
+            # Directly hint rollout via non-blocking RPC, include current iteration
+            try:
+                current_iteration = int(self.global_steps)
+                self.actor_rollout_wg.enqueue_prebuild(next_pids, next_raw, current_iteration)
+            except Exception as e:
+                print(f"WARN: enqueue_prebuild RPC failed: {e}")
+        except Exception as e:
+            print(f"WARN: prebuild_next_batch failed: {e}")
+
 
     def _validate_config(self):
         config = self.config
@@ -672,9 +719,36 @@ class RayPPOTrainer:
 
         n = len(inputs)
         if save_token_ids:
+            # Remove padding tokens from inputs and outputs
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            
+            # Remove padding from inputs (left padding)
+            cleaned_inputs = []
+            for input_ids in inputs:
+                if isinstance(input_ids, list):
+                    # Find first non-pad token
+                    first_non_pad_idx = 0
+                    while first_non_pad_idx < len(input_ids) and input_ids[first_non_pad_idx] == pad_token_id:
+                        first_non_pad_idx += 1
+                    cleaned_inputs.append(input_ids[first_non_pad_idx:] if first_non_pad_idx < len(input_ids) else input_ids)
+                else:
+                    cleaned_inputs.append(input_ids)
+            
+            # Remove padding from outputs (right padding)
+            cleaned_outputs = []
+            for output_ids in outputs:
+                if isinstance(output_ids, list):
+                    # Find last non-pad token
+                    last_non_pad_idx = len(output_ids) - 1
+                    while last_non_pad_idx >= 0 and output_ids[last_non_pad_idx] == pad_token_id:
+                        last_non_pad_idx -= 1
+                    cleaned_outputs.append(output_ids[:last_non_pad_idx + 1] if last_non_pad_idx >= 0 else output_ids)
+                else:
+                    cleaned_outputs.append(output_ids)
+            
             base_data = {
-                "input_token_ids": inputs,
-                "output_token_ids": outputs,
+                "input_token_ids": cleaned_inputs,
+                "output_token_ids": cleaned_outputs,
                 "score": scores,
                 "step": [self.global_steps] * n,
             }
@@ -700,6 +774,101 @@ class RayPPOTrainer:
             f.write("\n".join(lines) + "\n")
 
         print(f"Dumped generations to {filename}")
+        
+        # Update problem_id_to_files.jsonl mapping
+        self._update_problem_id_mapping(dump_path, filename, reward_extra_infos_dict)
+
+    def _update_problem_id_mapping(self, dump_path, filename, reward_extra_infos_dict):
+        """Update file_to_problem_ids.jsonl
+        
+        Args:
+            dump_path: Directory path where files are dumped
+            filename: Full path to the dumped file
+            reward_extra_infos_dict: Dictionary containing problem_id information
+        """
+        # Extract problem_ids from reward_extra_infos_dict
+        problem_ids = reward_extra_infos_dict.get("problem_id", None)
+        assert problem_ids is not None, "problem_id should befound during mapping update"
+        
+        # Get just the filename (not full path) for storage
+        base_filename = os.path.basename(filename)
+        
+        # Step 1: Append to file_to_problem_ids.jsonl
+        file_to_problem_ids_file = os.path.join(dump_path, "file_to_problem_ids.jsonl")
+        file_entry = {
+            "filename": base_filename,
+            "problem_ids": list(set(problem_ids)),  # Remove duplicates
+            "step": self.global_steps
+        }
+        
+        try:
+            with open(file_to_problem_ids_file, "a") as f:
+                f.write(json.dumps(file_entry, ensure_ascii=False) + "\n")
+        except IOError as e:
+            print(f"Warning: Could not write to {file_to_problem_ids_file}: {e}")
+            return
+        
+    def _dump_generations_rollout(self, inputs, outputs, problem_ids, dump_path, save_token_ids=False):
+        """Dump rollout/validation samples as JSONL."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
+        
+        n = len(inputs)
+        if save_token_ids:
+            # Remove padding tokens from inputs and outputs
+            pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id
+            
+            # Remove padding from inputs (left padding)
+            cleaned_inputs = []
+            for input_ids in inputs:
+                if isinstance(input_ids, list):
+                    # Find first non-pad token
+                    first_non_pad_idx = 0
+                    while first_non_pad_idx < len(input_ids) and input_ids[first_non_pad_idx] == pad_token_id:
+                        first_non_pad_idx += 1
+                    cleaned_inputs.append(input_ids[first_non_pad_idx:] if first_non_pad_idx < len(input_ids) else input_ids)
+                else:
+                    cleaned_inputs.append(input_ids)
+            
+            # Remove padding from outputs (right padding)
+            cleaned_outputs = []
+            for output_ids in outputs:
+                if isinstance(output_ids, list):
+                    # Find last non-pad token
+                    last_non_pad_idx = len(output_ids) - 1
+                    while last_non_pad_idx >= 0 and output_ids[last_non_pad_idx] == pad_token_id:
+                        last_non_pad_idx -= 1
+                    cleaned_outputs.append(output_ids[:last_non_pad_idx + 1] if last_non_pad_idx >= 0 else output_ids)
+                else:
+                    cleaned_outputs.append(output_ids)
+            
+            base_data = {
+                "input_token_ids": cleaned_inputs,
+                "output_token_ids": cleaned_outputs,
+                "problem_id": problem_ids,
+                "step": [self.global_steps] * n,
+            }
+        else:
+            base_data = {
+                "input": inputs,
+                "output": outputs,
+                "problem_id": problem_ids,
+                "step": [self.global_steps] * n,
+            }
+        lines = []
+        for i in range(n):
+            entry = {k: v[i] for k, v in base_data.items()}
+            lines.append(json.dumps(entry, ensure_ascii=False))
+
+        with open(filename, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+        print(f"Dumped generations to {filename}")
+        
+        # Update problem_id_to_files.jsonl mapping
+        # Create a reward_extra_infos_dict-like structure for consistency
+        reward_extra_infos_dict = {"problem_id": problem_ids}
+        self._update_problem_id_mapping(dump_path, filename, reward_extra_infos_dict)
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -921,9 +1090,18 @@ class RayPPOTrainer:
         # create actor and rollout
         if self.hybrid_engine:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+            
+            # Add trainer rollout_data_dir to actor_rollout_ref config for suffix cache
+            actor_rollout_config = self.config.actor_rollout_ref
+            trainer_rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+            if trainer_rollout_data_dir is not None:
+                from omegaconf import OmegaConf
+                actor_rollout_config = OmegaConf.create(OmegaConf.to_container(actor_rollout_config, resolve=True))
+                actor_rollout_config.trainer_rollout_data_dir = trainer_rollout_data_dir
+            
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
+                config=actor_rollout_config,
                 role="actor_rollout",
                 profile_option=self.config.trainer.npu_profile.options,
             )
@@ -1192,6 +1370,13 @@ class RayPPOTrainer:
 
         # load checkpoint before doing anything
         self._load_checkpoint()
+        
+        # rebuild problem_id mapping after checkpoint loading
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        if rollout_data_dir:
+            enable_suffix_prebuild = self.config.trainer.get("enable_suffix_prebuild", False)
+            if enable_suffix_prebuild:
+                self._rebuild_problem_id_mapping_from_file(rollout_data_dir)
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
@@ -1211,8 +1396,16 @@ class RayPPOTrainer:
         last_val_metrics = None
         self.max_steps_duration = 0
 
-        for epoch in range(self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+        for epoch in range(self.config.trainer.total_epochs):            
+            data_iter = iter(self.train_dataloader)
+            next_batch_dict = next(data_iter, None)
+            while next_batch_dict is not None:
+                batch_dict = next_batch_dict
+                # prefetch the next step's data for lookahead
+                next_batch_dict = next(data_iter, None)
+                # expose next step's batch to the current step
+                self._next_batch_dict = next_batch_dict
+                self._next_batch = DataProto.from_single_dict(next_batch_dict) if next_batch_dict is not None else None
                 metrics = {}
                 timing_raw = {}
 
@@ -1258,7 +1451,8 @@ class RayPPOTrainer:
                     repeat_times=self.config.actor_rollout_ref.rollout.n, 
                     interleave=self.config.actor_rollout_ref.rollout.get("interleave", True)
                 )
-                print("DEBUG:gen_batch info:")
+                # Defer prebuild hint until after update_actor is launched to avoid CPU contention in rollout
+                #print("DEBUG:gen_batch info:")
                 # print("  batch keys:", list(gen_batch.batch.keys()) if gen_batch.batch is not None else "None")
                 # print("  non_tensor_batch keys:", list(gen_batch.non_tensor_batch.keys()) if gen_batch.non_tensor_batch else "None")
                 # print("  meta_info keys:", list(gen_batch.meta_info.keys()) if gen_batch.meta_info else "None")
@@ -1274,6 +1468,33 @@ class RayPPOTrainer:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                    # Print the elapsed time for generate_sequences
+                    if getattr(self.config.trainer, "rollout_only", False):
+                                            # Log rollout generations if enabled
+                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                        if rollout_data_dir:
+                            with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+                                save_token_ids = self.config.trainer.get("save_token_ids", False)
+                                print("DEBUG:save_token_ids", save_token_ids)
+                                if save_token_ids:
+                                    # Save token IDs instead of decoded text
+                                    inputs = gen_batch_output.batch["prompts"].cpu().tolist()
+                                    outputs = gen_batch_output.batch["responses"].cpu().tolist()
+                                else:
+                                    # Save decoded text (original behavior)
+                                    inputs = self.tokenizer.batch_decode(gen_batch_output.batch["prompts"], skip_special_tokens=True)
+                                    outputs = self.tokenizer.batch_decode(gen_batch_output.batch["responses"], skip_special_tokens=True)
+                                self._dump_generations_rollout(
+                                    inputs=inputs,
+                                    outputs=outputs,
+                                    problem_ids=gen_batch.non_tensor_batch["problem_id"],
+                                    dump_path=rollout_data_dir,
+                                    save_token_ids=save_token_ids,
+                                )
+                        print(f"generate_sequences time: {timing_raw['gen']:.4f}s")
+                        return
+
+
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1415,14 +1636,14 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
                     #============================================================================================================================================
-                    if self.config.data.gainrl.enable:
-                        acc_tensor = batch.batch['token_level_rewards'].sum(-1)
-                        acc_list = acc_tensor.tolist()
-                        signals = [
-                            {'accuracy': a, 'angle': ang}
-                            for a, ang in zip(acc_list, angle_metric)
-                        ]
-                        self.sampler.update_after_epoch(signals)
+                    # if self.config.data.gainrl.enable:
+                    #     acc_tensor = batch.batch['token_level_rewards'].sum(-1)
+                    #     acc_list = acc_tensor.tolist()
+                    #     signals = [
+                    #         {'accuracy': a, 'angle': ang}
+                    #         for a, ang in zip(acc_list, angle_metric)
+                    #     ]
+                    #     self.sampler.update_after_epoch(signals)
                     #============================================================================================================================================
 
 
@@ -1432,17 +1653,7 @@ class RayPPOTrainer:
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, color="red"):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-
-
+                        
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
@@ -1478,6 +1689,24 @@ class RayPPOTrainer:
                                 dump_path=rollout_data_dir,
                                 save_token_ids=save_token_ids,
                             )
+                    # implement critic warmup
+                    if self.config.trainer.critic_warmup <= self.global_steps:
+                        # update actor
+                        with marked_timer("update_actor", timing_raw, color="red"):
+                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                            # Hint rollout to prebuild right before launching update_actor (reduced CPU contention)
+                            import datetime
+                            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                            print(f"[PERF] {timestamp} | ACTOR_UPDATE_START | step={self.global_steps}")
+                            self._prebuild_next_batch()
+                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                            print(f"[PERF] {timestamp} | ACTOR_UPDATE_END | step={self.global_steps}")
+                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        metrics.update(actor_output_metrics)
+                    else:
+                        # Actor update is skipped due to warmup; still trigger prebuild now
+                        self._prebuild_next_batch()
 
                     # # validate
                     if (

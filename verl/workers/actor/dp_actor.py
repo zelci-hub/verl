@@ -333,7 +333,7 @@ class DataParallelPPOActor(BasePPOActor):
                 act_in_dict={}
                 #hooks = register_act_hooks(self.actor_module, act_in_dict)
                 # 创建与原始结构一致的angle_metric - 一维列表，每个样本一个标量值
-                angle_metric = [0.0] * batch_size
+                #angle_metric = [0.0] * batch_size
 #===================================================================================
                 output = self.actor_module(
                     input_ids=input_ids,

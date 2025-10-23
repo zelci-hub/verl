@@ -298,6 +298,10 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
             from verl.workers.rollout.vllm_rollout import vLLMAsyncRollout
 
             vllm_rollout_cls = vLLMRollout if self.config.rollout.mode == "sync" else vLLMAsyncRollout
+            
+            # Get trainer rollout_data_dir and pass it to vLLMRollout
+            trainer_rollout_data_dir = self.config.get("trainer_rollout_data_dir", None)
+            
             rollout = vllm_rollout_cls(
                 model_path=local_path,
                 config=self.config.rollout,
@@ -305,6 +309,7 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
                 model_hf_config=self.actor_model_config,
                 device_mesh=rollout_device_mesh,
                 trust_remote_code=trust_remote_code,
+                trainer_rollout_data_dir=trainer_rollout_data_dir,
             )
             log_gpu_memory_usage("After building vllm rollout", logger=logger)
 

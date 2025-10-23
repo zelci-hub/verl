@@ -38,10 +38,14 @@ import os
 import pickle
 import socket
 import threading
+import time
+import queue
+import datetime
 from contextlib import contextmanager
 from copy import deepcopy
 from types import MethodType
 from typing import Any
+import concurrent.futures as _futures
 
 # Problem ID context manager is available through ArcticInference plugin
 # No need to import manually - vllm.plugins.load_general_plugins() handles this
@@ -59,31 +63,6 @@ from tqdm import tqdm
 # C++对象级锁定并行SuffixCache构建已集成到SuffixCache类中
 # 不再需要全局multiprocessing函数
 
-try:
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-    from transformers import AutoConfig
-    
-    # Store original methods
-    orig_mapping_register = CONFIG_MAPPING.register
-    orig_auto_register = AutoConfig.register
-    
-    # Create safe wrappers that allow aimv2 duplicates
-    def safe_mapping_register(key, value, exist_ok=False):
-        if key == "aimv2":
-            exist_ok = True
-        return orig_mapping_register(key, value, exist_ok=exist_ok)
-    
-    def safe_auto_register(model_type, config, exist_ok=False):
-        if model_type == "aimv2":
-            exist_ok = True
-        return orig_auto_register(model_type, config, exist_ok=exist_ok)
-    
-    # Apply patches
-    CONFIG_MAPPING.register = safe_mapping_register
-    AutoConfig.register = safe_auto_register
-except:
-    pass
-
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
@@ -91,6 +70,7 @@ from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.worker.worker_base import WorkerWrapperBase
 
 from verl import DataProto
+from verl.single_controller.base.decorator import register
 from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
@@ -98,14 +78,95 @@ from verl.workers.rollout.base import BaseRollout
 # Import SuffixCache for speculative decoding
 try:
     from arctic_inference.common.suffix_cache import SuffixCache
-except ImportError:
-    SuffixCache = None
+except Exception as e:
+    raise ImportError(f"Failed to import Arctic-Inference: {e}")
 
 import vllm
 vllm.plugins.load_general_plugins()
 
 logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "DEBUG"))  # 临时改为DEBUG级别
+
+def _log_performance_info(event_name: str, extra_info: str = ""):
+    """Log performance monitoring information with timestamp, thread, and process info"""
+    timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]  # millisecond precision
+    thread_id = threading.current_thread().ident
+    thread_name = threading.current_thread().name
+    process_id = os.getpid()
+    
+    # Try to get CPU usage if available
+    try:
+        import psutil
+        cpu_percent = psutil.cpu_percent()
+        memory_info = psutil.virtual_memory()
+        extra_info += f" | CPU: {cpu_percent:.1f}% | Memory: {memory_info.percent:.1f}%"
+    except ImportError:
+        pass
+    
+    logger.info(f"[PERF] {timestamp} | PID:{process_id} | Thread:{thread_name}({thread_id}) | {event_name} {extra_info}")
+
+# ---------------------------------------------------------------------------
+# Module-level helper for parallel suffix cache scanning
+# ---------------------------------------------------------------------------
+def _suffix_cache_scan_file(
+    file_path: str,
+    needed_pid_strs: list[str],
+    pid_str_to_original: dict[str, Any],
+    max_per_pid: int | None,
+    has_orjson: bool,
+):
+    """Scan a single JSONL file and collect sequences for target problem IDs.
+
+    Returns a tuple: (orig_pid_to_sequences, per_pid_counts)
+    - orig_pid_to_sequences: dict[orig_pid, list[list[int]]]
+    - per_pid_counts: dict[pid_str, int]
+    """
+    results: dict[Any, list] = {}
+    per_pid_counts: dict[str, int] = {pid: 0 for pid in needed_pid_strs}
+
+    pending_pid_strs = set(needed_pid_strs)
+
+    try:
+        with open(file_path, 'rb', buffering=1 << 20) as f:
+            load_json = orjson.loads if has_orjson else None
+            pid_bytes = {pid: pid.encode() for pid in pending_pid_strs}
+            max_per = max_per_pid
+
+            for line in f:
+                if pending_pid_strs and not any(pb in line for pb in pid_bytes.values()):
+                    continue
+                try:
+                    if load_json is not None:
+                        data = load_json(line)
+                    else:
+                        data = json.loads(line.decode('utf-8').strip())
+                except Exception:
+                    continue
+
+                pid_value = data.get('problem_id')
+                if pid_value is None or 'output_token_ids' not in data:
+                    continue
+                pid_as_str = str(pid_value)
+                if pid_as_str not in pending_pid_strs:
+                    continue
+
+                orig_pid = pid_str_to_original.get(pid_as_str, pid_value)
+                if orig_pid not in results:
+                    results[orig_pid] = []
+                results[orig_pid].append(data['output_token_ids'])
+
+                if max_per is not None:
+                    per_pid_counts[pid_as_str] += 1
+                    if per_pid_counts[pid_as_str] >= max_per:
+                        pending_pid_strs.discard(pid_as_str)
+                        if not pending_pid_strs:
+                            break
+    except FileNotFoundError:
+        return {}, per_pid_counts
+    except Exception:
+        return results, per_pid_counts
+
+    return results, per_pid_counts
 
 # TODO
 # 1. support pp in vllm
@@ -136,6 +197,7 @@ class vLLMRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
+        self.trainer_rollout_data_dir = kwargs.pop("trainer_rollout_data_dir", None)  # Get trainer rollout_data_dir
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
@@ -250,20 +312,9 @@ class vLLMRollout(BaseRollout):
             if hasattr(SamplingParams(), str(k)) and k != "seed":
                 kwargs[k] = config.get(k)
         kwargs["n"] = 1  # already repeat in ray_trainer
-        print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
-        
-        # Initialize suffix cache data storage path if available
-        self.suffix_cache_data_path = config.get("suffix_cache_data_path", None)
-        # Optional: path to problem_id_to_files mapping (overrides default in suffix_cache_data_path)
-        self.suffix_cache_mapping_path = config.get("suffix_cache_mapping_path", None)
-        # Optional: window size (how many latest files per problem to read)
-        try:
-            self.suffix_cache_window_size = int(config.get("suffix_cache_window_size", 2))
-        except Exception:
-            self.suffix_cache_window_size = 2
         
         # Initialize speculative_config from engine_kwargs
         # Check if speculative_config was passed in engine_kwargs
@@ -274,7 +325,127 @@ class vLLMRollout(BaseRollout):
         )
         self.speculative_config = original_engine_kwargs.get("speculative_config", None)
         
-        # Problem ID context manager is ready to use (no installation needed)
+        # Initialize suffix cache configuration
+        self.enable_suffix_prebuild = config.get("enable_suffix_prebuild", False)
+        if self.enable_suffix_prebuild:
+            self.suffix_cache_data_path = self.trainer_rollout_data_dir
+            assert self.suffix_cache_data_path is not None, "rollout_data_dir must be set when enable_suffix_prebuild is True"
+            if config.get("suffix_cache_window_size") is not None:
+                self.suffix_cache_window_size = int(config.get("suffix_cache_window_size"))
+            else:
+                self.suffix_cache_window_size = 4 
+                logger.info(f"suffix_cache_window_size not set, using default value: {self.suffix_cache_window_size}")
+            
+            # Initialize problem_id_to_files mapping window from file_to_problem_ids.jsonl
+            self._problem_id_to_files_window = {}
+            self._mapping_loaded = False  # Flag to track if mapping has been loaded
+            
+            # Initialize suffix prebuild infrastructure (background queue + worker thread)
+            self._suffix_prebuild_queue: queue.Queue = queue.Queue()
+            # Track ongoing prebuild tasks for synchronization
+            self._active_prebuild_pids = set()  # Currently being processed problem IDs
+            self._prebuild_lock = threading.Lock()  # Lock for thread-safe access to active_pids
+        # Cache of length-rank categories computed during prebuild
+            self._hard_pid_set = set()
+            self._medium_pid_set = set()
+            self._easy_pid_set = set()
+            self._suffix_prebuild_thread = threading.Thread(
+                target=self._suffix_prebuild_loop, name="suffix-prebuild-worker", daemon=True
+            )
+            self._suffix_prebuild_thread.start()
+        else:
+            # Initialize default values when suffix prebuild is disabled
+            self.suffix_cache_data_path = None
+            self.suffix_cache_window_size = 2
+            self._problem_id_to_files_window = {}
+            self._mapping_loaded = False  # Flag to track if mapping has been loaded
+            self._suffix_prebuild_queue = None
+            self._active_prebuild_pids = set()
+            self._prebuild_lock = threading.Lock()
+            self._hard_pid_set = set()
+            self._medium_pid_set = set()
+            self._easy_pid_set = set()
+            self._suffix_prebuild_thread = None
+
+    def _load_problem_id_mapping_from_file(self, max_iteration=None):
+        """
+        Load problem_id_to_files mapping from file_to_problem_ids.jsonl and build local window.
+        This method reads from the suffix_cache_data_path and constructs the mapping window based on suffix_cache_window_size.
+        
+        Args:
+            max_iteration: Optional maximum iteration to filter files. Only files with step <= max_iteration will be included.
+        """
+        if not self.enable_suffix_prebuild:
+            return
+            
+        # Assert that interleave is False for suffix cache functionality
+        assert not self.config.get("interleave", True), "now prebuild Suffix cache requires interleave=False"
+            
+        # Look for file_to_problem_ids.jsonl in the suffix_cache_data_path
+        file_to_problem_ids_path = os.path.join(self.suffix_cache_data_path, "file_to_problem_ids.jsonl")
+        
+        if not os.path.exists(file_to_problem_ids_path):
+            logger.warning(f"file_to_problem_ids.jsonl not found at {file_to_problem_ids_path}")
+            return
+            
+        logger.info(f"Loading problem_id mapping from {file_to_problem_ids_path}")
+        
+        try:
+            # Read all entries from file_to_problem_ids.jsonl
+            file_entries = []
+            with open(file_to_problem_ids_path, 'r', encoding='utf-8') as f:
+                for line_num, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        if 'filename' in entry and 'problem_ids' in entry and 'step' in entry and entry['step'] <= max_iteration:
+                            file_entries.append(entry)
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"JSON decode error in {file_to_problem_ids_path} line {line_num}: {e}")
+                        continue
+            
+            if not file_entries:
+                logger.warning("No valid entries found in file_to_problem_ids.jsonl")
+                return
+                
+            # Build problem_id_to_files mapping with window size limit
+            problem_id_to_all_files = {}
+            for entry in file_entries:
+                filename = entry['filename']
+                problem_ids = entry['problem_ids']
+                step = entry.get('step', None)
+                if step is None:
+                    logger.warning(f"step is not found for filename: {filename}")
+                    continue
+                
+                for problem_id in problem_ids:
+                    if problem_id not in problem_id_to_all_files:
+                        problem_id_to_all_files[problem_id] = []
+                    problem_id_to_all_files[problem_id].append({"filename": filename, "step": step})
+            
+            # Apply max_iteration filter and window size limit - keep only the latest files for each problem_id
+            for problem_id, file_list in problem_id_to_all_files.items():
+                # Sort by step (descending) and keep only the latest window_size files
+                file_list.sort(key=lambda x: x["step"], reverse=True)
+                latest_files = file_list[:self.suffix_cache_window_size]
+                self._problem_id_to_files_window[problem_id] = [f for f in latest_files]
+            
+            filter_info = f" (max_iteration={max_iteration})" if max_iteration is not None else ""
+            logger.info(f"Loaded mapping for {len(self._problem_id_to_files_window)} problem_ids with window_size={self.suffix_cache_window_size}{filter_info}")
+            
+            # Log some statistics
+            local_rank = os.getenv("LOCAL_RANK", "0")
+            total_files = sum(len(files) for files in self._problem_id_to_files_window.values())
+            avg_files_per_problem = total_files / len(self._problem_id_to_files_window) if self._problem_id_to_files_window else 0
+            if local_rank == 0:
+                logger.info(f"Average files per problem_id: {avg_files_per_problem:.2f}")
+            
+            
+        except Exception as e:
+            logger.error(f"Failed to load problem_id mapping from file: {e}")
+            self._problem_id_to_files_window = {}
 
     def _load_suffix_cache_data_for_problem_ids(self, problem_ids):
         """
@@ -286,126 +457,222 @@ class vLLMRollout(BaseRollout):
         Returns:
             dict: Mapping from problem_id to list of token sequences for suffix cache bootstrap
         """
-        if not self.suffix_cache_data_path or not problem_ids:
+                # Get process info for filename
+        local_rank = os.getenv("LOCAL_RANK", "0")
+        rank = os.getenv("RANK", "0")  
+        if not self.enable_suffix_prebuild or not problem_ids:
             return {}
             
         problem_id_to_sequences = {}
 
-        # Check if the path exists
-        if not os.path.exists(self.suffix_cache_data_path):
-            print(f"Suffix cache data path does not exist: {self.suffix_cache_data_path}")
-            return {}
-        # Load mapping of problem_id -> file list and select top-2 numerically largest files
-        # Determine mapping path: prefer explicit setting, otherwise default inside suffix_cache_data_path
-        mapping_path = self.suffix_cache_mapping_path or (
-            os.path.join(self.suffix_cache_data_path, "problem_id_to_files.json")
-            if self.suffix_cache_data_path else None
-        )
-        if not mapping_path:
-            print("No mapping_path available (suffix_cache_mapping_path and suffix_cache_data_path are empty)")
-            return {}
-        if not os.path.exists(mapping_path):
-            print(f"problem_id_to_files mapping not found: {mapping_path}")
-            return {}
-        try:
-            with open(mapping_path, "r", encoding="utf-8") as mf:
-                pid_to_files_map = json.load(mf)
-        except Exception as e:
-            print(f"Failed to load mapping file: {e}")
-            return {}
-
-        base_dir = os.path.dirname(mapping_path)
+        # Check if the data path exists
+        assert os.path.exists(self.suffix_cache_data_path), f"suffix cache data path does not exist: {self.suffix_cache_data_path}"
+        
+        # Use local problem_id_to_files mapping window instead of reading from file
+        base_dir = self.suffix_cache_data_path
         pid_str_to_original = {str(pid): pid for pid in problem_ids}
         file_to_needed_pids = {}
+        
+        # Track file selection info for each problem_id
+        pid_to_selected_files = {}
+
+        def parse_num(name):
+            try:
+                return int(os.path.splitext(name)[0])
+            except Exception:
+                return -1
 
         for pid_str, orig_pid in pid_str_to_original.items():
-            filenames = pid_to_files_map.get(pid_str, [])
-            if not filenames:
+            # Get file info from local mapping window
+            file_infos = self._problem_id_to_files_window.get(int(pid_str), []) if pid_str.isdigit() else []
+            if not file_infos:
+                logger.warning(f"No file info found for problem_id: {pid_str}")
                 continue
 
+            # Extract filenames from file info (handle both old format and new format)
+            if file_infos and isinstance(file_infos[0], dict):
+                # New format: list of {"filename": "xxx.jsonl", "step": 123}
+                filenames = [info["filename"] for info in file_infos]
+            else:
+                # Old format: list of filenames
+                filenames = file_infos
+            
+            # Record selected files for this problem_id
+            pid_to_selected_files[pid_str] = filenames
+            
+            for fname in filenames:
+                file_path = os.path.join(base_dir, fname)
+                file_to_needed_pids.setdefault(file_path, set()).add(pid_str)
+
+        if not file_to_needed_pids:
+            logger.warning("No files selected from mapping for requested problem_ids.")
+            return {}
+        
+        # Print file range statistics
+        all_selected_files = []
+        for files in pid_to_selected_files.values():
+            all_selected_files.extend(files)
+        if all_selected_files:
             def parse_num(name):
                 try:
                     return int(os.path.splitext(name)[0])
                 except Exception:
                     return -1
-
-            filenames_sorted = sorted(filenames, key=parse_num)
-            window_size = self.suffix_cache_window_size if self.suffix_cache_window_size and self.suffix_cache_window_size > 0 else 2
-            selected = filenames_sorted[-window_size:] if len(filenames_sorted) >= window_size else filenames_sorted
-            for fname in selected:
-                file_path = os.path.join(base_dir, fname)
-                file_to_needed_pids.setdefault(file_path, set()).add(pid_str)
-
-        if not file_to_needed_pids:
-            print("No files selected from mapping for requested problem_ids.")
-            return {}
+            file_numbers = [parse_num(f) for f in all_selected_files if parse_num(f) != -1]
+            if file_numbers:
+                min_file_num = min(file_numbers)
+                max_file_num = max(file_numbers)
+                if rank == 0:
+                    logger.info(f"File range: [{min_file_num}, {max_file_num}], window_size={self.suffix_cache_window_size}")
+        
+        # Print per-problem_id file selection (sample)
+        if rank == 0:
+            sample_pids = list(pid_to_selected_files.keys())[:1]
+            for pid in sample_pids:
+                files = pid_to_selected_files[pid]
+                logger.info(f" sample problem_id={pid}: using {len(files)} files {files}")
 
         processed_files = 0
         try:
-            # Prepare global early-stop tracking when a per-pid maximum is configured
+            # Prepare job list and global early-stop tracking
             max_per_pid = getattr(self, "suffix_cache_max_sequences_per_pid", None)
-            if max_per_pid is not None:
-                all_needed_pid_strs = set()
-                for s in file_to_needed_pids.values():
-                    all_needed_pid_strs.update(s)
-                collected_per_pid = {pid_str: 0 for pid_str in all_needed_pid_strs}
-            else:
-                collected_per_pid = None
-
+            jobs = []
+            all_needed_pid_strs = set()
             for file_path, needed_pid_strs in file_to_needed_pids.items():
-                processed_files += 1
-                print(f"Loading suffix cache data from: {file_path}")
-                # Work on a per-file mutable copy for early termination within the file
-                pending_pid_strs = set(needed_pid_strs)
-                try:
-                    # Use large buffering and binary mode; prefer orjson when available
-                    with open(file_path, 'rb', buffering=1 << 20) as f:
-                        for line in f:
-                            # Fast pre-filter: skip lines that cannot contain any target pid
-                            if pending_pid_strs and not any(pid.encode() in line for pid in pending_pid_strs):
-                                continue
+                jobs.append((file_path, list(needed_pid_strs)))
+                all_needed_pid_strs.update(needed_pid_strs)
 
-                            # Parse JSON (prefer orjson on bytes; fallback to json on str)
-                            try:
-                                if _HAS_ORJSON:
-                                    data = orjson.loads(line)
-                                else:
-                                    data = json.loads(line.decode('utf-8').strip())
-                            except Exception:
-                                continue
+            max_workers = 10
+            per_pid_counts_total: dict[str, int] = {pid: 0 for pid in all_needed_pid_strs}
+            has_orjson = _HAS_ORJSON
 
-                            pid_value = data.get('problem_id')
-                            if pid_value is None or 'output_token_ids' not in data:
-                                continue
-                            pid_as_str = str(pid_value)
-                            if pid_as_str not in pending_pid_strs:
-                                continue
+            with _futures.ProcessPoolExecutor(max_workers=max_workers) as ex:
+                futures = [
+                    ex.submit(
+                        _suffix_cache_scan_file,
+                        fp,
+                        pids,
+                        pid_str_to_original,
+                        max_per_pid,
+                        has_orjson,
+                    )
+                    for (fp, pids) in jobs
+                ]
 
-                            orig_pid = pid_str_to_original.get(pid_as_str, pid_value)
-                            if orig_pid not in problem_id_to_sequences:
-                                problem_id_to_sequences[orig_pid] = []
-                            problem_id_to_sequences[orig_pid].append(data['output_token_ids'])
+                for fut in _futures.as_completed(futures):
+                    processed_files += 1
+                    try:
+                        res_map, res_counts = fut.result()
+                    except Exception:
+                        continue
 
-                            # Update early-stop tracking
-                            if collected_per_pid is not None:
-                                collected_per_pid[pid_as_str] += 1
-                                if collected_per_pid[pid_as_str] >= max_per_pid:
-                                    pending_pid_strs.discard(pid_as_str)
-                                    # If this file no longer needs any pids, stop reading it
-                                    if not pending_pid_strs:
-                                        break
-                except FileNotFoundError:
-                    continue
+                    for k, v in res_map.items():
+                        if k not in problem_id_to_sequences:
+                            problem_id_to_sequences[k] = []
+                        problem_id_to_sequences[k].extend(v)
 
-                # Global early stop: if we satisfied all pids across files, end the loop
-                if collected_per_pid is not None and all(v >= max_per_pid for v in collected_per_pid.values()):
-                    break
+                    for pid_str, cnt in res_counts.items():
+                        per_pid_counts_total[pid_str] = per_pid_counts_total.get(pid_str, 0) + cnt
+
+                    if max_per_pid is not None and all(c >= max_per_pid for c in per_pid_counts_total.values()):
+                        for pending in futures:
+                            if not pending.done():
+                                pending.cancel()
+                        break
         except Exception as e:
-            print(f"Failed to load suffix cache data: {e}")
+            logger.error(f"Failed to load suffix cache data: {e}")          
+        # Print statistics: sequences count per problem_id
+        if problem_id_to_sequences and local_rank == 0:
+            sequence_counts = {pid: len(seqs) for pid, seqs in problem_id_to_sequences.items()}
+            total_sequences = sum(sequence_counts.values())
+            avg_sequences = total_sequences / len(sequence_counts) if sequence_counts else 0
+            min_count = min(sequence_counts.values()) if sequence_counts else 0
+            max_count = max(sequence_counts.values()) if sequence_counts else 0
             
-        print(f"Loaded suffix cache data for {len(problem_id_to_sequences)} problem IDs from {processed_files} files")
+            logger.info(f"📊 Sequence statistics: TOTAL={total_sequences}, AVG={avg_sequences:.1f}, MIN={min_count}, MAX={max_count}")
+            logger.info(f"📊 Per-problem sequences: {len(sequence_counts)} problems loaded")
+             
           
         return problem_id_to_sequences
+
+    def _update_problem_id_to_files_mapping(self, filename, current_step,problem_ids):
+        """Update problem_id_to_files mapping in local window with window size limit.
+        
+        Args:
+            dump_path: Directory path where files are dumped (for compatibility)
+            filename: Filename to add to the mapping
+            problem_ids: List of problem_ids in this file
+        """
+        if not self.enable_suffix_prebuild:
+            return
+            
+        # Assert that interleave is False for suffix cache functionality
+        assert not self.config.get("interleave", True), "Suffix cache requires interleave=False"
+        
+        
+        # Update mapping for each problem_id in local window
+        for problem_id in set(problem_ids):
+            if problem_id not in self._problem_id_to_files_window:
+                self._problem_id_to_files_window[problem_id] = []
+            
+            # Add current file with step info
+            file_info = {"filename": filename, "step": current_step}
+            
+            # Remove if already exists (to avoid duplicates)
+            self._problem_id_to_files_window[problem_id] = [
+                f for f in self._problem_id_to_files_window[problem_id] 
+                if f.get("filename") != filename
+            ]
+            
+            # Add new file
+            self._problem_id_to_files_window[problem_id].append(file_info)
+            
+            # Sort by step (descending) and keep only the latest window_size files
+            self._problem_id_to_files_window[problem_id].sort(key=lambda x: x["step"], reverse=True)
+            self._problem_id_to_files_window[problem_id] = self._problem_id_to_files_window[problem_id][:self.suffix_cache_window_size]
+        
+        logger.debug(f"Updated local mapping window for {len(set(problem_ids))} problem_ids")
+
+
+    def get_length_rank(self, problem_id_to_sequences):
+        """Classify problems by max output token length.
+
+        This computes the maximum sequence length (over all sequences) for
+        each ``problem_id`` and classifies them into two categories:
+        - hard: max length > 12000
+        - medium: 6000 < max length < 12000
+
+        Args:
+            problem_id_to_sequences: dict mapping problem_id -> list of
+                sequences (each sequence is a list of token IDs).
+
+        Returns:
+            tuple[list, list]: (hard_ids, medium_ids) where each list contains
+            problem_ids sorted by their max length in descending order.
+        """
+        max_lengths = {}
+        for pid, sequences in problem_id_to_sequences.items():
+            max_len = 0
+            if sequences:
+                for seq in sequences:
+                    try:
+                        seq_len = len(seq)
+                    except Exception:
+                        # Ignore malformed entries
+                        continue
+                    if seq_len > max_len:
+                        max_len = seq_len
+            max_lengths[pid] = float(max_len)
+
+        hard_ids = [pid for pid, m in max_lengths.items() if m > 14000 or m == 0]
+        medium_ids = [pid for pid, m in max_lengths.items() if 10000 < m <= 14000]
+        easy_ids = [pid for pid, m in max_lengths.items() if 6000 < m <= 10000]
+
+        # Sort within each category by max length (desc) for determinism
+        hard_ids.sort(key=lambda pid: max_lengths[pid], reverse=True)
+        medium_ids.sort(key=lambda pid: max_lengths[pid], reverse=True)
+        easy_ids.sort(key=lambda pid: max_lengths[pid], reverse=True)
+        return hard_ids, medium_ids,easy_ids
 
     def get_prompt_token_ids(self, vllm_inputs, problem_id):
         """
@@ -425,7 +692,7 @@ class vLLMRollout(BaseRollout):
             if vllm_input.get("problem_id") == problem_id:
                 return vllm_input.get("prompt_token_ids")
 
-        print(f"DEBUG: No prompt token IDs found for problem_id: {problem_id}")
+        logger.debug(f"DEBUG: No prompt token IDs found for problem_id: {problem_id}")
         return None
 
     @contextmanager
@@ -443,6 +710,223 @@ class vLLMRollout(BaseRollout):
         # if len(old_sampling_params_args):
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
+
+    def enqueue_prebuild(self, problem_ids, raw_prompt_ids=None, iteration: int | None = None):
+        """Non-blocking: enqueue a prebuild task for given problem_ids.
+
+        Args:
+            problem_ids: list of problem IDs
+            raw_prompt_ids: optional list of prompt token lists aligned with problem_ids
+        """
+        try:
+            # Skip entirely if no suffix cache data path configured
+            if not self.suffix_cache_data_path:
+                return
+            if not problem_ids:
+                return
+            task = {"problem_ids": list(problem_ids), "raw_prompt_ids": raw_prompt_ids, "iteration": iteration}
+            self._suffix_prebuild_queue.put_nowait(task)
+            # logger.info(f"📥 Enqueued prebuild task: {len(problem_ids)} problem_ids, iteration={iteration}")
+            # logger.info(f"📥 Problem_ids preview: {list(problem_ids)[:20]}{'...' if len(problem_ids) > 20 else ''}")
+            _log_performance_info("PREBUILD_ENQUEUED", f"pids={len(problem_ids)}, iter={iteration}")
+        except Exception as e:
+            logger.error(f"enqueue_prebuild failed: {e}")
+
+    def _suffix_prebuild_loop(self):
+        local_rank = os.getenv("LOCAL_RANK", "0")
+        rank = os.getenv("RANK", "0") 
+        while True:
+            task = self._suffix_prebuild_queue.get()
+            try:
+                assert self.enable_suffix_prebuild, "suffix prebuild should be enabled"
+                problem_ids = task.get("problem_ids") or None
+                raw_prompt_ids = task.get("raw_prompt_ids") or None 
+                max_iteration = task.get("iteration") or None
+                assert problem_ids is not None, "problem_ids must be provided when enable_suffix_prebuild is True"
+                assert raw_prompt_ids is not None, "raw_prompt_ids must be provided when enable_suffix_prebuild is True"
+                assert max_iteration is not None, "max_iteration must be provided when enable_suffix_prebuild is True"
+                # logger.info(f"🚀 PREBUILD STARTED: Processing {len(problem_ids)} problem_ids from queue (iteration={max_iteration})")
+                # logger.info(f"🚀 Problem_ids: {problem_ids[:20]}{'...' if len(problem_ids) > 20 else ''}")
+                _log_performance_info("PREBUILD_STARTED", f"pids={len(problem_ids)}, iter={max_iteration}")
+
+                # Mark these problem IDs as being processed
+                with self._prebuild_lock:
+                    self._active_prebuild_pids.update(pid for pid in problem_ids)
+                
+                # DEBUG: Log received problem_ids
+                unique_pids_received = sorted(list(set(problem_ids)))
+                logger.info(f"🔍 PREBUILD DEBUG: Received {len(problem_ids)} problem_ids ({len(unique_pids_received)} unique)")
+                logger.info(f"🔍 PREBUILD DEBUG: First 20 unique pids: {unique_pids_received[:20]}")
+
+                # ensure suffix cache exists (thread-safe)
+                try:
+                    suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+                except Exception:
+                    suffix_cache = None
+                if suffix_cache is None:
+                    if isinstance(self.speculative_config, dict):
+                        max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
+                        max_threads = self.speculative_config.get("suffix_cache_max_threads", 10)
+                    suffix_cache = SuffixCache(max_depth=max_depth, thread_safe=True, max_threads=max_threads)
+                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = suffix_cache
+
+                # assemble problems_data
+                unique_ids = list(dict.fromkeys([p for p in problem_ids]))
+                pid_native = unique_ids
+                try:
+                    problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(pid_native)
+                except Exception as e:
+                    logger.error(f"prebuild: load data failed: {e}")
+                    problem_id_to_sequences = {}
+                
+                # DEBUG: Check which problem_ids have historical data
+                pids_with_data = set(str(p) for p in problem_id_to_sequences.keys())
+                pids_without_data = set(str(p) for p in unique_ids) - pids_with_data
+                logger.info(f"🔍 PREBUILD DEBUG: {len(pids_with_data)} pids have historical data, {len(pids_without_data)} don't")
+                #.info(f"🔍 PREBUILD DEBUG: pids WITHOUT data: {sorted(list(pids_with_data))}")
+
+                # Select only hard and medium problems for prebuild
+                try:
+                    # Check if distribution_aware is enabled
+                    distribution_aware = False
+                    if isinstance(self.speculative_config, dict):
+                        distribution_aware = self.speculative_config.get("distribution_aware", False)
+                    
+                    if distribution_aware and problem_id_to_sequences:
+                        # distribution_aware=True: use length-based classification
+                        hard_ids, medium_ids,easy_ids = self.get_length_rank(problem_id_to_sequences)
+                        logger.info(f"🎯 Prebuild classification (distribution_aware=True): {len(hard_ids)} hard + {len(medium_ids)} medium problems (from {len(problem_id_to_sequences)} with historical data)")
+                    else:
+                        # distribution_aware=False or no historical data: treat all as medium
+                        hard_ids, medium_ids,easy_ids = unique_ids, [], []
+                        if distribution_aware:
+                            logger.info(f"🎯 Prebuild (distribution_aware=True): no historical data, treating all {len(unique_ids)} problems as medium difficulty")
+                        else:
+                            logger.info(f"🎯 Prebuild (distribution_aware=False): treating all {len(unique_ids)} problems as medium difficulty")
+
+                    allowed_pid_strs = set([str(p) for p in list(hard_ids) + list(medium_ids)])
+                    # Record categories for later reuse in generate_sequences
+                    # Clear previous categories and update with current batch only
+                    self._hard_pid_set.clear()
+                    self._medium_pid_set.clear()
+                    self._easy_pid_set.clear()
+                    self._hard_pid_set.update(str(p) for p in hard_ids)
+                    self._medium_pid_set.update(str(p) for p in medium_ids)
+                    self._easy_pid_set.update(str(p) for p in easy_ids)
+                    logger.info(f"🎯 Total allowed problem_ids for prebuild: {len(allowed_pid_strs)}")
+                except Exception:
+                    allowed_pid_strs = None
+
+                pid_to_prompt = {}
+                if raw_prompt_ids is not None:
+                    for pid, pr in zip(problem_ids, raw_prompt_ids):
+                        pid_to_prompt.setdefault(pid, pr)
+
+                problems_data = []
+                for pid in problem_ids:
+                    # Filter by hard/medium selection if available
+                    if allowed_pid_strs is not None and str(pid) not in allowed_pid_strs:
+                        continue
+                    
+                    sequences = problem_id_to_sequences.get(pid, problem_id_to_sequences.get(str(pid), []))
+                    prompt_tokens = pid_to_prompt.get(pid)
+                    
+                    if prompt_tokens is None:
+                        continue
+                    
+                    if sequences:
+                        # We have historical sequences - use them for prebuild
+                        problems_data.append((pid, prompt_tokens, sequences))
+                    else:
+                        # No historical sequences (first training step) - create minimal prebuild data
+                        # Use empty sequences list, SuffixCache will handle this gracefully
+                        problems_data.append((pid, prompt_tokens, []))
+                        logger.debug(f"prebuild: no historical sequences for problem {pid}, using empty sequences")
+
+                if problems_data:
+                    try:
+                        with_historical = sum(1 for _, _, seqs in problems_data if seqs)
+                        without_historical = len(problems_data) - with_historical
+                        logger.info(f"🎯🎯🎯 PREBUILD EXECUTING: Total {len(problems_data)} problem_ids")
+                        logger.info(f"🎯 - With historical data: {with_historical} problem_ids")
+                        logger.info(f"🎯 - Without historical data (first training): {without_historical} problem_ids")
+                        
+                        # Print the actual problem_ids being prebuilt
+                        prebuilt_pids = [pid for pid, _, _ in problems_data]
+                        logger.info(f"🎯 Prebuilding problem_ids: {prebuilt_pids[:20]}{'...' if len(prebuilt_pids) > 20 else ''}")
+                        
+                        # Print per-problem sequence counts
+                        pid_seq_counts = [(pid, len(seqs)) for pid, _, seqs in problems_data]
+                        total_seqs = sum(cnt for _, cnt in pid_seq_counts)
+                        avg_seqs = total_seqs / len(pid_seq_counts) if pid_seq_counts else 0
+                        min_seqs = min((cnt for _, cnt in pid_seq_counts), default=0)
+                        max_seqs = max((cnt for _, cnt in pid_seq_counts), default=0)
+                        
+                        logger.info(f"📊 Prebuild sequence stats: TOTAL={total_seqs}, AVG={avg_seqs:.1f}, MIN={min_seqs}, MAX={max_seqs}")
+                        
+                        # Sample detailed counts
+                        sample_counts = pid_seq_counts[:3]
+                        logger.info(f"📊 Sample prebuild counts: {sample_counts}")
+                        
+                        _log_performance_info("PREBUILD_EXECUTING", f"problems={len(problems_data)}")
+                        suffix_cache.prebuild_problems_parallel(problems_data)
+                        _log_performance_info("PREBUILD_COMPLETED", f"problems={len(problems_data)}")
+                        logger.info(f"🎯✅ PREBUILD COMPLETED: Successfully prebuilt {len(problems_data)} problem_ids")
+                    except Exception as e:
+                        logger.error(f"prebuild execution failed: {e}")
+                        _log_performance_info("PREBUILD_FAILED", f"error={str(e)[:50]}")
+                else:
+                    logger.warning("🎯❌ PREBUILD SKIPPED: no valid problems_data to process")
+                    _log_performance_info("PREBUILD_SKIPPED", "no_valid_data")
+            except Exception as e:
+                logger.error(f"suffix_prebuild_loop error: {e}")
+            finally:
+                # Remove processed problem IDs from active set
+                if 'problem_ids' in locals():
+                    with self._prebuild_lock:
+                        for pid in problem_ids:
+                            self._active_prebuild_pids.discard(str(pid))
+                
+                self._suffix_prebuild_queue.task_done()
+                logger.info(f"suffix_prebuild_loop task done, rank {rank}, local_rank {local_rank}")
+
+    def _wait_for_prebuild_completion(self, problem_ids, timeout=30.0):
+        """Wait for any ongoing prebuild tasks for the given problem_ids to complete.
+        
+        Args:
+            problem_ids: List of problem IDs to wait for
+            timeout: Maximum time to wait in seconds (default: 30s)
+        """
+        if not self.enable_suffix_prebuild or len(problem_ids) == 0:
+            return
+            
+        problem_id_strs = set(str(pid) for pid in problem_ids)
+        start_time = time.time()
+        
+        # Check initial state
+        with self._prebuild_lock:
+            initial_still_processing = problem_id_strs.intersection(self._active_prebuild_pids)
+            if initial_still_processing:
+                logger.info(f"🔄 Found {len(initial_still_processing)} problem_ids still being prebuilt, waiting...")
+        
+        while True:
+            with self._prebuild_lock:
+                # Check if any of our problem IDs are still being processed
+                still_processing = problem_id_strs.intersection(self._active_prebuild_pids)
+                if not still_processing:
+                    break  # All our problem IDs are done
+            
+            # Check timeout
+            if time.time() - start_time > timeout:
+                logger.warning(f"⏱️ Timeout waiting for prebuild completion of {len(still_processing)} problem_ids: {list(still_processing)[:10]}")
+                break
+                
+            # Short sleep to avoid busy waiting
+            time.sleep(0.1)
+        
+        elapsed = time.time() - start_time
+        if elapsed > 0.1:  # Only log if we actually waited
+            logger.info(f" Waited {elapsed:.2f}s for prebuild completion of {len(problem_ids)} problems")
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
@@ -467,6 +951,10 @@ class vLLMRollout(BaseRollout):
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        # ⏱️ Time profiling: Function start
+        time_total_start = time.time()
+        time_stage_start = time_total_start
+        
         idx = prompts.batch["input_ids"]  # (bs, prompt_length)
         # left-padded attention_mask
         attention_mask = prompts.batch["attention_mask"]
@@ -497,7 +985,7 @@ class vLLMRollout(BaseRollout):
             # Generate problem_ids if not present in the data
             batch_size = len(non_tensor_batch["raw_prompt_ids"])
             problem_ids = [f"generated_{i:05d}" for i in range(batch_size)]
-            print(f"WARNING: problem_id not found in batch, generated {batch_size} problem_ids")
+            logger.warning(f"problem_id not found in batch, generated {batch_size} problem_ids")
 
         if "multi_modal_data" in non_tensor_batch:
             vllm_inputs = []
@@ -569,82 +1057,76 @@ class vLLMRollout(BaseRollout):
             # 🎯 SuffixCache线程数配置：硬编码为10线程
             if suffix_cache_max_threads is None:
                 suffix_cache_max_threads = 10
-                print(f"🎯 SuffixCache使用硬编码线程数: {suffix_cache_max_threads}")
+                logger.info(f"🎯 SuffixCache use hardcoded threads: {suffix_cache_max_threads}")
             else:
-                print(f"🎯 SuffixCache使用配置指定线程数: {suffix_cache_max_threads}")
+                logger.info(f"🎯 SuffixCache use config specified threads: {suffix_cache_max_threads}")
             
             # 🚀 启用C++对象级锁定+GIL释放的线程安全模式
-            self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixCache(
-                max_depth=suffix_cache_max_depth, 
-                thread_safe=True, 
-                max_threads=suffix_cache_max_threads
-            )            
+            # Reuse existing cache if available; otherwise create
+            try:
+                _existing = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+            except Exception:
+                _existing = None
+            if _existing is None:
+                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixCache(
+                    max_depth=suffix_cache_max_depth, 
+                    thread_safe=True, 
+                    max_threads=suffix_cache_max_threads
+                )
             
-            enable_suffix_prebuild = self.suffix_cache_data_path is not None
-
-            if enable_suffix_prebuild:
+            if self.enable_suffix_prebuild:
                 assert problem_ids is not None, "problem_ids must be provided when enable_suffix_prebuild is True"
-                unique_problem_ids = list(set(problem_ids))   
-                import time
-                total_start_time = time.perf_counter()       
-                problem_id_to_sequences = self._load_suffix_cache_data_for_problem_ids(unique_problem_ids)
-                total_time = time.perf_counter() - total_start_time
-                print(f"DEBUG: 数据加载总耗时: {total_time:.4f}秒，处理了{len(unique_problem_ids)}个problem_ids")
-
-                assert problem_id_to_sequences is not None, "problem_id_to_sequences must be provided when enable_suffix_prebuild is True"
-                #print(f"🚀 SuffixCache C++对象级锁定并行构建: {len(problem_id_to_sequences)} 个问题")
                 
-                # 获取suffix_cache引用（现在已经是线程安全模式）
-                suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+                # 🔄 SYNC: Wait for any pending prebuild tasks for current problem_ids to complete
+                _log_performance_info("SYNC_WAIT_START", f"pids={len(problem_ids)}")
+                self._wait_for_prebuild_completion(problem_ids)
+                _log_performance_info("SYNC_WAIT_END", f"pids={len(problem_ids)}")
+                unique_problem_ids = list(set(problem_ids))
+                logger.info(f"🔄✅ Prebuild wait completed for {len(problem_ids)} problem_ids, ({len(unique_problem_ids)} unique)")
+            
+                # Check if distribution_aware is enabled
+                distribution_aware = self.speculative_config.get("distribution_aware", False)
                 
-                # 🔥 准备并行批处理数据格式
-                problems_data = []
-                for problem_id in unique_problem_ids:
-                    if problem_id in problem_id_to_sequences:
-                        prompt_tokens = self.get_prompt_token_ids(vllm_inputs, problem_id)
-                        if prompt_tokens is not None:
-                            sequences = problem_id_to_sequences[problem_id]
-                            problems_data.append((problem_id, prompt_tokens, sequences))
-                
-                #print(f"📊 准备并行处理: {len(problems_data)} 个问题, "f"总序列数: {sum(len(seqs) for _, _, seqs in problems_data)}")
-                
-                # ⚡ 使用C++对象级锁定+GIL释放的真正并行处理
-                import time
-                total_start_time = time.perf_counter()               
-                parallel_result = suffix_cache.prebuild_problems_parallel(problems_data)
-                total_time = time.perf_counter() - total_start_time
-
-                # 📈 性能报告（健壮性：缺失键时使用回退值）
-                successful = parallel_result.get("successful_problems")
-                if successful is None:
-                    successful = parallel_result.get("total_problems", 0)
-                active_threads = parallel_result.get("active_threads", "N/A")
-                actual_speedup = parallel_result.get("actual_speedup", "N/A")
-
-                # print(f"🎯 C++对象级锁定并行构建完成:")
-                # print(f"  ✅ 成功问题: {successful}/{len(problems_data)}")
-                # print(f"  ⚡ 总时间: {total_time:.4f}秒")
-                # print(f"  🚀 实际加速: {actual_speedup}x")
-                # print(f"  🧵 活跃线程: {active_threads}")
-                # print(f"  🔒 技术: 每个SuffixTree独立C++锁+GIL释放")
-                
-                # 验证结果
-                cache_stats = suffix_cache.get_cache_stats()
-                print(f"  📊 最终统计: {cache_stats['problem_tree_count']} 个问题树, "
-                      f"{cache_stats['total_sequences']} 个序列")
+                # Try reuse cached hard/medium sets from previous prebuild
+                if distribution_aware and len(self._hard_pid_set) + len(self._medium_pid_set) > 0:        
+                    hard_ids = [pid for pid in unique_problem_ids if str(pid) in self._hard_pid_set]
+                    medium_ids = [pid for pid in unique_problem_ids if str(pid) in self._medium_pid_set]
+                    easy_ids = [pid for pid in unique_problem_ids if str(pid) in self._easy_pid_set]
+                    logger.info(f"generate_sequences (distribution_aware=True): using cached hard/medium/easy classification with length {len(hard_ids)} and {len(medium_ids)} and {len(easy_ids)}")
+                else:
+                    hard_ids = unique_problem_ids
+                    medium_ids = []
+                    easy_ids = []
+                    if distribution_aware:
+                        logger.info(f"generate_sequences (distribution_aware=True): no cached hard/medium sets, treating all {len(unique_problem_ids)} problems as medium difficulty")
+                    else:
+                        logger.info(f"generate_sequences (distribution_aware=False): treating all {len(unique_problem_ids)} problems as medium difficulty")
 
         # users can customize different sampling_params at different run
+        local_rank = os.getenv("LOCAL_RANK", "0")
+        rank = os.getenv("RANK", "0") 
+        logger.debug(f"rank {rank}, local_rank {local_rank}, DEBUG: start generate sequences")
         with self.update_sampling_params(**kwargs):
             # Initialize context manager for problem_id to req_id mapping if problem_ids provided
+
+            start_time = time.time()
             try:
                 # Import ArcticInference plugin's ProblemIdContextManager
                 from arctic_inference.vllm.model_runner import ProblemIdContextManager
+                ProblemIdContextManager.clear_context()
+                # Get current step from prompts.meta_info and set it in context manager
+                current_step = prompts.meta_info.get("global_steps", None)
+                assert current_step is not None, "global_steps not found in prompts.meta_info"
+                ProblemIdContextManager.set_current_step(current_step)
+                logger.debug(f"Set current_step={current_step} in ProblemIdContextManager")
                 
                 # Create empty req_id to problem_id mapping context
-                ProblemIdContextManager.clear_req_id_mapping()
                 ProblemIdContextManager.set_req_id_to_problem_id_mapping({})
                 
                 # Call generate with problem_ids parameter - LLM patches will handle the mapping
+                # Also pass length_rank through the ProblemIdContextManager for this batch
+                if self.enable_suffix_prebuild:
+                    ProblemIdContextManager.set_hard_medium_ids(hard_ids, medium_ids,easy_ids)
                 outputs = self.inference_engine.generate(
                     prompts=vllm_inputs,  # because we have already convert it to prompt token id
                     sampling_params=self.sampling_params,
@@ -652,49 +1134,17 @@ class vLLMRollout(BaseRollout):
                     use_tqdm=False,
                     problem_ids=problem_ids,  # Pass problem_ids to generate method
                 )
-
+                end_time = time.time()
+                logger.info(f"generate_sequences took {end_time - start_time:.2f} seconds")
             except (ImportError, TypeError):
                 # Fallback if ArcticInference plugin is not available or LLM patches are disabled
-                print("Warning: ArcticInference LLM plugin not available or disabled, problem_ids will be ignored")
+                logger.warning("ArcticInference LLM plugin not available or disabled, problem_ids will be ignored")
                 outputs = self.inference_engine.generate(
                     prompts=vllm_inputs,
                     sampling_params=self.sampling_params,
                     lora_request=lora_requests,
                     use_tqdm=False,
                 )
-                
-            # Clear suffix cache after generation to free up C++ memory
-            try:    
-                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache.clear_all_cache()
-            except Exception as e:
-                print(f"DEBUG: Failed to clear suffix cache: {e}")
-
-            # Output generation length statistics
-            total_generated_tokens = 0
-            generation_lengths = []
-            for i, output in enumerate(outputs):
-                for sample_id in range(len(output.outputs)):
-                    generated_length = len(output.outputs[sample_id].token_ids)
-                    generation_lengths.append(generated_length)
-                    total_generated_tokens += generated_length
-            
-            # Get rank information
-            if torch.distributed.is_initialized():
-                rank = torch.distributed.get_rank()
-                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-            else:
-                rank = int(os.environ.get("RANK", "0"))
-                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-            
-            if generation_lengths:
-                avg_length = total_generated_tokens / len(generation_lengths)
-                min_length = min(generation_lengths)
-                max_length = max(generation_lengths)
-                print(f"[Rank {rank}/Local {local_rank}] Generation Length Stats: Total={total_generated_tokens}, "
-                      f"Count={len(generation_lengths)}, Avg={avg_length:.2f}, "
-                      f"Min={min_length}, Max={max_length}")
-                print(f"[Rank {rank}/Local {local_rank}] Individual lengths: {generation_lengths[:10]}..." if len(generation_lengths) > 10 else f"[Rank {rank}/Local {local_rank}] Individual lengths: {generation_lengths}")
-
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
 
@@ -752,6 +1202,67 @@ class vLLMRollout(BaseRollout):
         if self.config.calculate_log_probs:
             # we will recompute old log prob with actor
             batch["rollout_log_probs"] = rollout_log_probs
+
+        # Update problem_id_to_files mapping if suffix prebuild is enabled
+        if self.enable_suffix_prebuild:
+            # Get current step from prompts.meta_info
+            current_step = prompts.meta_info.get("global_steps", None)
+            if current_step is None:
+                logger.warning("global_steps not found in prompts.meta_info, skipping mapping update")
+                return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
+            
+            # Load mapping on first call when we have access to current_step
+            if not self._mapping_loaded:
+                start_time = time.time()
+                self._load_problem_id_mapping_from_file(max_iteration=current_step)
+                self._mapping_loaded = True
+                end_time = time.time()
+                logger.info(f"Loading problem_id mapping took {end_time - start_time:.2f} seconds for {current_step} steps")
+            
+            # Generate filename in format {global_step}.jsonl
+            filename = f"{current_step}.jsonl"
+            
+            # Update the local mapping window
+            self._update_problem_id_to_files_mapping(filename, current_step, problem_ids)
+        
+        # # 批次级清理 - 清理所有suffix cache，避免内存泄漏
+        # if self.enable_suffix_prebuild:
+        #     try:
+        #         suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+        #         if suffix_cache is not None:
+        #             # 记录清理前的缓存状态
+        #             problem_trees_before = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
+        #             prompt_trees_before = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
+                    
+        #             if cleanup_result and isinstance(cleanup_result, dict) and cleanup_result.get("success"):
+        #                 child_pid = cleanup_result.get("pid", "unknown")
+        #                 logger.info(f"⚡ [Cleanup Detail] Forked background cleanup process (PID={child_pid}) in {time_clear:.3f}s")
+        #                 logger.info(f"⚡ [Cleanup Detail] Main process (PID={os.getpid()}) continues immediately")
+        #                 logger.info(f"⚡ [Cleanup Detail] Cleanup happens in parallel in child process")
+        #             else:
+        #                 logger.warning(f"⚠️ [Cleanup Detail] Unexpected return value: {cleanup_result}")
+        #                 logger.info(f"⏱️ [Cleanup Detail] Cleanup time: {time_clear:.3f}s")
+                    
+        #             # 记录清理后的缓存状态（应该都是0）
+        #             time_verify_start = time.time()
+        #             problem_trees_after = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
+        #             prompt_trees_after = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
+        #             logger.info(f"⏱️ [Cleanup Detail] Verifying cleanup took {time.time() - time_verify_start:.3f}s")
+                    
+        #             logger.info(f"🧹 Cleared all suffix cache: "
+        #                        f"problem_trees: {problem_trees_before}→{problem_trees_after}, "
+        #                        f"prompt_trees: {prompt_trees_before}→{prompt_trees_after}")
+                    
+        #     except Exception as e:
+        #         logger.warning(f"Failed to clear suffix cache after generation: {e}")
+        
+        # # ⏱️ Time profiling: Suffix cache cleanup
+        # time_cache_cleanup = time.time() - time_stage_start
+        # logger.info(f"⏱️ [Profiling] Suffix cache cleanup took {time_cache_cleanup:.3f}s")
+        
+        # ⏱️ Time profiling: Total function time
+        time_total = time.time() - time_total_start
+        logger.info(f"⏱️ [Profiling] ===== TOTAL generate_sequences time: {time_total:.3f}s =====")
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
@@ -871,3 +1382,4 @@ class vLLMAsyncRollout:
             return self.wake_up(*args, **kwargs)
         else:
             return self.inference_engine.execute_method(method, *args, **kwargs)
+    
