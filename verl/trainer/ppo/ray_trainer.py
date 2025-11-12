@@ -1492,7 +1492,7 @@ class RayPPOTrainer:
                                     save_token_ids=save_token_ids,
                                 )
                         print(f"generate_sequences time: {timing_raw['gen']:.4f}s")
-                        return
+                        
 
 
 

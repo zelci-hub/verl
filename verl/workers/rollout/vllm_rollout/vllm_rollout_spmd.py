@@ -75,9 +75,9 @@ from verl.utils.profiler import GPUMemoryLogger
 from verl.utils.torch_functional import get_response_mask, pad_2d_list_to_length
 from verl.workers.rollout.base import BaseRollout
 
-# Import SuffixCache for speculative decoding
+# Import SuffixDecodingCache for speculative decoding
 try:
-    from arctic_inference.common.suffix_cache import SuffixCache
+    from arctic_inference.suffix_decoding.cache import SuffixDecodingCache
 except Exception as e:
     raise ImportError(f"Failed to import Arctic-Inference: {e}")
 
@@ -635,44 +635,56 @@ class vLLMRollout(BaseRollout):
 
 
     def get_length_rank(self, problem_id_to_sequences):
-        """Classify problems by max output token length.
+        """Classify problems by mean and max output token length.
 
-        This computes the maximum sequence length (over all sequences) for
-        each ``problem_id`` and classifies them into two categories:
-        - hard: max length > 12000
-        - medium: 6000 < max length < 12000
+        This computes the mean and maximum sequence length (over all sequences) 
+        for each ``problem_id`` and classifies them into three categories based 
+        on sorted order:
+        - hard: top 20% (sorted by mean desc, then max desc)
+        - medium: next 30%
+        - easy: next 30%
 
         Args:
             problem_id_to_sequences: dict mapping problem_id -> list of
                 sequences (each sequence is a list of token IDs).
 
         Returns:
-            tuple[list, list]: (hard_ids, medium_ids) where each list contains
-            problem_ids sorted by their max length in descending order.
+            tuple[list, list, list]: (hard_ids, medium_ids, easy_ids) where 
+            each list contains problem_ids sorted by their (mean, max) length 
+            in descending order.
         """
-        max_lengths = {}
+        lengths = {}
         for pid, sequences in problem_id_to_sequences.items():
+            mean_len = 0
             max_len = 0
             if sequences:
-                for seq in sequences:
-                    try:
-                        seq_len = len(seq)
-                    except Exception:
-                        # Ignore malformed entries
-                        continue
-                    if seq_len > max_len:
-                        max_len = seq_len
-            max_lengths[pid] = float(max_len)
-
-        hard_ids = [pid for pid, m in max_lengths.items() if m > 14000 or m == 0]
-        medium_ids = [pid for pid, m in max_lengths.items() if 10000 < m <= 14000]
-        easy_ids = [pid for pid, m in max_lengths.items() if 6000 < m <= 10000]
-
-        # Sort within each category by max length (desc) for determinism
-        hard_ids.sort(key=lambda pid: max_lengths[pid], reverse=True)
-        medium_ids.sort(key=lambda pid: max_lengths[pid], reverse=True)
-        easy_ids.sort(key=lambda pid: max_lengths[pid], reverse=True)
-        return hard_ids, medium_ids,easy_ids
+                seq_len = [len(seq) for seq in sequences]
+                mean_len = np.mean(seq_len)
+                max_len = max(seq_len)
+            lengths[pid] = (float(mean_len), float(max_len))
+        
+        # Sort by mean (descending), then by max (descending)
+        sorted_pids = sorted(lengths.items(), 
+                            key=lambda x: (x[1][0], x[1][1]), 
+                            reverse=True)
+        
+        # Calculate split indices
+        total_count = len(sorted_pids)
+        hard_end = int(total_count * 0.20)
+        medium_end = hard_end + int(total_count * 0.30)
+        easy_end = medium_end + int(total_count * 0.30)
+        
+        # Split into categories
+        hard_ids = [pid for pid, _ in sorted_pids[:hard_end]]
+        medium_ids = [pid for pid, _ in sorted_pids[hard_end:medium_end]]
+        easy_ids = [pid for pid, _ in sorted_pids[medium_end:easy_end]]
+        rank = os.getenv("RANK", "0")
+        if rank == 0:
+            print(f"hard_mean{sorted_pids[:hard_end][0][1][0]}, hard_max{sorted_pids[:hard_end][0][1][1]}")
+            print(f"medium_mean{sorted_pids[hard_end:medium_end][0][1][0]}, medium_max{sorted_pids[hard_end:medium_end][0][1][1]}")
+            print(f"easy_mean{sorted_pids[medium_end:easy_end][0][1][0]}, easy_max{sorted_pids[medium_end:easy_end][0][1][1]}")
+            
+        return hard_ids, medium_ids, easy_ids
 
     def get_prompt_token_ids(self, vllm_inputs, problem_id):
         """
@@ -756,7 +768,6 @@ class vLLMRollout(BaseRollout):
                 # DEBUG: Log received problem_ids
                 unique_pids_received = sorted(list(set(problem_ids)))
                 logger.info(f"🔍 PREBUILD DEBUG: Received {len(problem_ids)} problem_ids ({len(unique_pids_received)} unique)")
-                logger.info(f"🔍 PREBUILD DEBUG: First 20 unique pids: {unique_pids_received[:20]}")
 
                 # ensure suffix cache exists (thread-safe)
                 try:
@@ -767,7 +778,7 @@ class vLLMRollout(BaseRollout):
                     if isinstance(self.speculative_config, dict):
                         max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
                         max_threads = self.speculative_config.get("suffix_cache_max_threads", 10)
-                    suffix_cache = SuffixCache(max_depth=max_depth, thread_safe=True, max_threads=max_threads)
+                    suffix_cache = SuffixDecodingCache(max_tree_depth=max_depth, thread_safe=True, max_threads=max_threads)
                     self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = suffix_cache
 
                 # assemble problems_data
@@ -783,7 +794,6 @@ class vLLMRollout(BaseRollout):
                 pids_with_data = set(str(p) for p in problem_id_to_sequences.keys())
                 pids_without_data = set(str(p) for p in unique_ids) - pids_with_data
                 logger.info(f"🔍 PREBUILD DEBUG: {len(pids_with_data)} pids have historical data, {len(pids_without_data)} don't")
-                #.info(f"🔍 PREBUILD DEBUG: pids WITHOUT data: {sorted(list(pids_with_data))}")
 
                 # Select only hard and medium problems for prebuild
                 try:
@@ -800,11 +810,11 @@ class vLLMRollout(BaseRollout):
                         # distribution_aware=False or no historical data: treat all as medium
                         hard_ids, medium_ids,easy_ids = unique_ids, [], []
                         if distribution_aware:
-                            logger.info(f"🎯 Prebuild (distribution_aware=True): no historical data, treating all {len(unique_ids)} problems as medium difficulty")
+                            logger.info(f"🎯 Prebuild (distribution_aware=True): no historical data, treating all {len(unique_ids)} problems as hard difficulty")
                         else:
-                            logger.info(f"🎯 Prebuild (distribution_aware=False): treating all {len(unique_ids)} problems as medium difficulty")
+                            logger.info(f"🎯 Prebuild (distribution_aware=False): treating all {len(unique_ids)} problems as hard difficulty")
 
-                    allowed_pid_strs = set([str(p) for p in list(hard_ids) + list(medium_ids)])
+                    allowed_pid_strs = set([str(p) for p in list(hard_ids) + list(medium_ids) + list(easy_ids)])
                     # Record categories for later reuse in generate_sequences
                     # Clear previous categories and update with current batch only
                     self._hard_pid_set.clear()
@@ -828,35 +838,49 @@ class vLLMRollout(BaseRollout):
                     if allowed_pid_strs is not None and str(pid) not in allowed_pid_strs:
                         continue
                     
-                    sequences = problem_id_to_sequences.get(pid, problem_id_to_sequences.get(str(pid), []))
+                    raw_sequences = problem_id_to_sequences.get(pid, problem_id_to_sequences.get(str(pid), []))
                     prompt_tokens = pid_to_prompt.get(pid)
                     
-                    if prompt_tokens is None:
-                        continue
-                    
-                    if sequences:
-                        # We have historical sequences - use them for prebuild
-                        problems_data.append((pid, prompt_tokens, sequences))
+                    if raw_sequences and prompt_tokens is not None:
+                        # Convert raw token sequences to the format expected by cache.py
+                        formatted_sequences = []
+                        for seq_idx, response_tokens in enumerate(raw_sequences):
+                            formatted_sequences.append({
+                                'seq_id': seq_idx,
+                                'prompt_tokens': prompt_tokens,
+                                'response_tokens': response_tokens
+                            })
+                        
+                        problems_data.append({
+                            'problem_id': pid,
+                            'sequences': formatted_sequences
+                        })
                     else:
-                        # No historical sequences (first training step) - create minimal prebuild data
+                        # No historical sequences or no prompt tokens - create minimal prebuild data
                         # Use empty sequences list, SuffixCache will handle this gracefully
-                        problems_data.append((pid, prompt_tokens, []))
-                        logger.debug(f"prebuild: no historical sequences for problem {pid}, using empty sequences")
+                        problems_data.append({
+                            'problem_id': pid,
+                            'sequences': []
+                        })
+                        if not raw_sequences:
+                            logger.debug(f"prebuild: no historical sequences for problem {pid}, using empty sequences")
+                        if prompt_tokens is None:
+                            logger.debug(f"prebuild: no prompt tokens for problem {pid}, using empty sequences")
 
                 if problems_data:
                     try:
-                        with_historical = sum(1 for _, _, seqs in problems_data if seqs)
+                        with_historical = sum(1 for problem_data in problems_data if problem_data['sequences'])
                         without_historical = len(problems_data) - with_historical
                         logger.info(f"🎯🎯🎯 PREBUILD EXECUTING: Total {len(problems_data)} problem_ids")
                         logger.info(f"🎯 - With historical data: {with_historical} problem_ids")
                         logger.info(f"🎯 - Without historical data (first training): {without_historical} problem_ids")
                         
                         # Print the actual problem_ids being prebuilt
-                        prebuilt_pids = [pid for pid, _, _ in problems_data]
+                        prebuilt_pids = [problem_data['problem_id'] for problem_data in problems_data]
                         logger.info(f"🎯 Prebuilding problem_ids: {prebuilt_pids[:20]}{'...' if len(prebuilt_pids) > 20 else ''}")
                         
                         # Print per-problem sequence counts
-                        pid_seq_counts = [(pid, len(seqs)) for pid, _, seqs in problems_data]
+                        pid_seq_counts = [(problem_data['problem_id'], len(problem_data['sequences'])) for problem_data in problems_data]
                         total_seqs = sum(cnt for _, cnt in pid_seq_counts)
                         avg_seqs = total_seqs / len(pid_seq_counts) if pid_seq_counts else 0
                         min_seqs = min((cnt for _, cnt in pid_seq_counts), default=0)
@@ -1049,11 +1073,11 @@ class vLLMRollout(BaseRollout):
                 raise ValueError(
                     "Suffix decoding is only supported with the 'arctic', "
                     "'mlp_speculator' or 'suffix' spec decoding methods.")
-            if SuffixCache is None:
-                raise ImportError("SuffixCache not available. Please install arctic_inference package.")
+            if SuffixDecodingCache is None:
+                raise ImportError("SuffixDecodingCache not available. Please install arctic_inference package.")
             suffix_cache_max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
             suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", None)
-            
+
             # 🎯 SuffixCache线程数配置：硬编码为10线程
             if suffix_cache_max_threads is None:
                 suffix_cache_max_threads = 10
@@ -1068,8 +1092,8 @@ class vLLMRollout(BaseRollout):
             except Exception:
                 _existing = None
             if _existing is None:
-                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixCache(
-                    max_depth=suffix_cache_max_depth, 
+                self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixDecodingCache(
+                    max_tree_depth=suffix_cache_max_depth, 
                     thread_safe=True, 
                     max_threads=suffix_cache_max_threads
                 )
@@ -1101,6 +1125,17 @@ class vLLMRollout(BaseRollout):
                         logger.info(f"generate_sequences (distribution_aware=True): no cached hard/medium sets, treating all {len(unique_problem_ids)} problems as medium difficulty")
                     else:
                         logger.info(f"generate_sequences (distribution_aware=False): treating all {len(unique_problem_ids)} problems as medium difficulty")
+            else:
+                unique_problem_ids = list(set(problem_ids))
+                hard_ids = unique_problem_ids
+                medium_ids = []
+                easy_ids = []
+
+        else:
+            unique_problem_ids = list(set(problem_ids))
+            hard_ids = unique_problem_ids
+            medium_ids = []
+            easy_ids = []
 
         # users can customize different sampling_params at different run
         local_rank = os.getenv("LOCAL_RANK", "0")
@@ -1125,8 +1160,7 @@ class vLLMRollout(BaseRollout):
                 
                 # Call generate with problem_ids parameter - LLM patches will handle the mapping
                 # Also pass length_rank through the ProblemIdContextManager for this batch
-                if self.enable_suffix_prebuild:
-                    ProblemIdContextManager.set_hard_medium_ids(hard_ids, medium_ids,easy_ids)
+                ProblemIdContextManager.set_hard_medium_ids(hard_ids, medium_ids,easy_ids)
                 outputs = self.inference_engine.generate(
                     prompts=vllm_inputs,  # because we have already convert it to prompt token id
                     sampling_params=self.sampling_params,
@@ -1225,40 +1259,51 @@ class vLLMRollout(BaseRollout):
             # Update the local mapping window
             self._update_problem_id_to_files_mapping(filename, current_step, problem_ids)
         
-        # # 批次级清理 - 清理所有suffix cache，避免内存泄漏
-        # if self.enable_suffix_prebuild:
-        #     try:
-        #         suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
-        #         if suffix_cache is not None:
-        #             # 记录清理前的缓存状态
-        #             problem_trees_before = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
-        #             prompt_trees_before = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
+        # 批次级清理 - 清理所有suffix cache，避免内存泄漏
+        time_cache_cleanup_start = time.time()
+        if self.enable_suffix_prebuild:
+            try:
+                suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+                if suffix_cache is not None:
+                    # 记录清理前的缓存状态
+                    problem_trees_before = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
+                    prompt_trees_before = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
                     
-        #             if cleanup_result and isinstance(cleanup_result, dict) and cleanup_result.get("success"):
-        #                 child_pid = cleanup_result.get("pid", "unknown")
-        #                 logger.info(f"⚡ [Cleanup Detail] Forked background cleanup process (PID={child_pid}) in {time_clear:.3f}s")
-        #                 logger.info(f"⚡ [Cleanup Detail] Main process (PID={os.getpid()}) continues immediately")
-        #                 logger.info(f"⚡ [Cleanup Detail] Cleanup happens in parallel in child process")
-        #             else:
-        #                 logger.warning(f"⚠️ [Cleanup Detail] Unexpected return value: {cleanup_result}")
-        #                 logger.info(f"⏱️ [Cleanup Detail] Cleanup time: {time_clear:.3f}s")
+                    logger.info(f"🧹 [Cache Cleanup] Starting cleanup: "
+                               f"problem_trees={problem_trees_before}, "
+                               f"prompt_trees={prompt_trees_before}")
                     
-        #             # 记录清理后的缓存状态（应该都是0）
-        #             time_verify_start = time.time()
-        #             problem_trees_after = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
-        #             prompt_trees_after = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
-        #             logger.info(f"⏱️ [Cleanup Detail] Verifying cleanup took {time.time() - time_verify_start:.3f}s")
+                    # 调用优化的清理方法（并行清理）
+                    time_clear_start = time.time()
+                    cleanup_result = suffix_cache.clear_all_cache()
+                    time_clear = time.time() - time_clear_start
                     
-        #             logger.info(f"🧹 Cleared all suffix cache: "
-        #                        f"problem_trees: {problem_trees_before}→{problem_trees_after}, "
-        #                        f"prompt_trees: {prompt_trees_before}→{prompt_trees_after}")
+                    if cleanup_result and isinstance(cleanup_result, dict) and cleanup_result.get("success"):
+                        cleanup_method = cleanup_result.get("method", "unknown")
+                        logger.info(f"⚡ [Cache Cleanup] Fast cleanup completed in {time_clear*1000:.2f}ms")
+                        logger.info(f"⚡ [Cache Cleanup] Method: parallel cleanup using ThreadPoolExecutor")
+                        logger.info(f"⚡ [Cache Cleanup] Synchronous parallel tree destruction completed")
+                        logger.info(f"⚡ [Cache Cleanup] All trees cleared and memory freed")
+                    else:
+                        logger.warning(f"⚠️ [Cache Cleanup] Unexpected result: {cleanup_result}")
+                        logger.info(f"⏱️ [Cache Cleanup] Cleanup time: {time_clear*1000:.2f}ms")
                     
-        #     except Exception as e:
-        #         logger.warning(f"Failed to clear suffix cache after generation: {e}")
+                    # 验证清理后的状态（新的空缓存应该立即可用）
+                    problem_trees_after = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
+                    prompt_trees_after = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
+                    
+                    logger.info(f"✅ [Cache Cleanup] Cache state after cleanup: "
+                               f"problem_trees: {problem_trees_before}→{problem_trees_after}, "
+                               f"prompt_trees: {prompt_trees_before}→{prompt_trees_after}")
+                    
+            except Exception as e:
+                logger.warning(f"❌ [Cache Cleanup] Failed to clear suffix cache: {e}")
+                import traceback
+                logger.warning(f"❌ [Cache Cleanup] Traceback: {traceback.format_exc()}")
         
-        # # ⏱️ Time profiling: Suffix cache cleanup
-        # time_cache_cleanup = time.time() - time_stage_start
-        # logger.info(f"⏱️ [Profiling] Suffix cache cleanup took {time_cache_cleanup:.3f}s")
+        # ⏱️ Time profiling: Suffix cache cleanup
+        time_cache_cleanup = time.time() - time_cache_cleanup_start
+        logger.info(f"⏱️ [Profiling] Suffix cache cleanup took {time_cache_cleanup:.2f}s")
         
         # ⏱️ Time profiling: Total function time
         time_total = time.time() - time_total_start
