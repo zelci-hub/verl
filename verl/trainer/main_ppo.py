@@ -26,7 +26,7 @@ import socket
 import hydra
 import ray
 from omegaconf import OmegaConf
-
+import torch
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -63,6 +63,7 @@ def run_ppo(config) -> None:
         ray.init(
             runtime_env=get_ppo_ray_runtime_env(),
             num_cpus=config.ray_init.num_cpus,
+            num_gpus=torch.cuda.device_count(), 
         )
 
     # Create a remote instance of the TaskRunner class, and

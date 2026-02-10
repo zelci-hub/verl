@@ -2,8 +2,8 @@
 set -xeuo pipefail
 
 project_name='DAPO'
-exp_name='DAPO-Qwen2.5-32B'
-
+exp_name='DAPO-DeepSeek-R1-Distill-Qwen-7B'
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 adv_estimator=grpo
 
 use_kl_in_reward=False
@@ -31,17 +31,17 @@ n_resp_per_prompt=16
 train_prompt_mini_bsz=32
 
 # Ray
-RAY_ADDRESS=${RAY_ADDRESS:-"http://localhost:8265"}
+RAY_ADDRESS=${RAY_ADDRESS:-"10.53.1.70:6379"}
 WORKING_DIR=${WORKING_DIR:-"${PWD}"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${WORKING_DIR}/verl/trainer/runtime_env.yaml"}
-NNODES=${NNODES:-16}
+NNODES=${NNODES:-1}
 # Paths
 RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
-MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-32B"}
-CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
-TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
-
+MODEL_PATH=${MODEL_PATH:-"deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"}
+CKPTS_DIR=${CKPTS_DIR:-"/app/src/rllm/data/dapo-7bdistilled-checkpoint"}
+TRAIN_FILE=${TRAIN_FILE:-"/app/src/rllm/data/datasets/dapo/dapo-math-17k.parquet"}
+TEST_FILE=${TEST_FILE:-"/app/src/rllm/data/datasets/dapo/aime-2024.parquet"}
+ROLLOUT_DATA_DIR=${ROLLOUT_DATA_DIR:-"/app/src/rllm/data/rollout_data/7B-distilled-dapo/"}
 # Algorithm
 temperature=1.0
 top_p=1.0
@@ -128,3 +128,4 @@ ray job submit --no-wait --runtime-env="${RUNTIME_ENV}" \
     trainer.total_epochs=1 \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.resume_mode=auto
+    trainer.rollout_data_dir="${ROLLOUT_DATA_DIR}"

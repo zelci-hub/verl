@@ -185,6 +185,151 @@ def _pre_process_inputs(pad_token_id, prompt_token_ids: torch.Tensor) -> list[in
 
 
 class vLLMRollout(BaseRollout):
+    
+    def _get_worker_numa_assignment(self):
+        """
+        根据 Ray worker 的 GPU 分配自动确定 NUMA 节点
+        基于 nvidia-smi topo 的映射关系
+        """
+        try:
+            import os
+            
+            # 获取当前进程的 CUDA_VISIBLE_DEVICES
+            cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '0')
+            gpu_id = int(cuda_visible.split(',')[0]) if cuda_visible else 0
+            
+            # 基于 nvidia-smi topo -m 的 GPU 到 NUMA 节点映射
+            gpu_to_numa = {
+                0: 0,  # GPU 0 -> NUMA node 0 (CPU 0-11)
+                1: 2,  # GPU 1 -> NUMA node 2 (CPU 24-35)  
+                2: 3,  # GPU 2 -> NUMA node 3 (CPU 36-47)
+                3: 1,  # GPU 3 -> NUMA node 1 (CPU 12-23)
+                4: 4,  # GPU 4 -> NUMA node 4 (CPU 48-59)
+                5: 6,  # GPU 5 -> NUMA node 6 (CPU 72-83)
+                6: 7,  # GPU 6 -> NUMA node 7 (CPU 84-95)
+                7: 5,  # GPU 7 -> NUMA node 5 (CPU 60-71)
+            }
+            
+            numa_node = gpu_to_numa.get(gpu_id, 0)
+            cpu_start = numa_node * 12
+            cpu_end = cpu_start + 12
+            
+            return numa_node, cpu_start, cpu_end
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to determine NUMA assignment: {e}")
+            return 0, 0, 12  # 默认使用 NUMA node 0
+
+    def _setup_numa_aware_affinity_manager(self):
+        """
+        设置 NUMA 感知的 CPU 亲和性管理器
+        每个 worker 自动分配到对应 GPU 的最优 NUMA 节点
+        """
+        # 首先初始化关键属性，确保即使异常也不会出错
+        self._vllm_affinity_applied = False
+        
+        try:
+            import os
+            import threading
+            import time
+            import psutil
+            
+            # 🎯 自动确定当前 worker 应该使用的 NUMA 节点
+            numa_node, cpu_start, cpu_end = self._get_worker_numa_assignment()
+            
+            # 基于 NUMA 节点配置 CPU 分配
+            self.numa_node_cpus = set(range(cpu_start, cpu_start + 12))  # 使用 12 个 CPU
+            self.vllm_cpus = set(range(cpu_start, cpu_start + 2))                               # vLLM: 第一个 CPU
+            self.prebuild_cpus = set(range(cpu_start + 2, cpu_start + 12))  # Prebuild: 8 个 CPU
+            # CPU cpu_start+9 到 cpu_end-1 留给系统线程 (3 个 CPU 缓冲)
+            
+            logger.info(f"🎯 Worker NUMA assignment: GPU -> NUMA node {numa_node}, CPUs {cpu_start}-{cpu_end-1}")
+            logger.info(f"🔧 Using CPUs: vLLM={sorted(self.vllm_cpus)}, Prebuild={sorted(self.prebuild_cpus)}")
+            
+            # 1. 绑定整个进程到对应的 NUMA 节点 (确保内存局部性)
+            pid = os.getpid()
+            os.sched_setaffinity(pid, self.numa_node_cpus)
+            logger.info(f"🔧 Ray worker process (PID: {pid}) bound to NUMA node {numa_node} CPUs: {sorted(self.numa_node_cpus)}")
+            
+            # 2. 绑定主线程到 vLLM CPUs
+            main_tid = threading.get_native_id()
+            os.sched_setaffinity(main_tid, self.vllm_cpus)
+            logger.info(f"🎯 Main thread (TID: {main_tid}) bound to vLLM CPUs: {sorted(self.vllm_cpus)}")
+            
+            logger.info("✅ NUMA-aware CPU affinity manager setup completed")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to setup NUMA-aware affinity manager: {e}")
+            # 设置默认值避免后续错误 (使用 NUMA node 0)
+            self.numa_node_cpus = set(range(0, 12))
+            self.vllm_cpus = {0,1,2,3}
+            self.prebuild_cpus = set(range(4, 12))
+            self._vllm_affinity_applied = False
+    
+    def _apply_vllm_worker_threads_affinity(self):
+        """
+        关键：捕获 vLLM engine 启动后的所有 worker threads 并绑定到 vLLM CPU 区间
+        必须在 vLLM engine 初始化完成后调用
+        """
+        if self._vllm_affinity_applied:
+            return
+            
+        try:
+            import os
+            import time
+            import psutil
+            import threading
+            
+            # 给 vLLM engine 一点时间启动内部线程
+            time.sleep(0.5)
+            
+            current_tid = threading.get_native_id()
+            proc = psutil.Process(os.getpid())
+            bound_threads = []
+            
+            # 遍历进程中的所有线程
+            for thread_info in proc.threads():
+                tid = thread_info.id
+                
+                # 跳过当前线程（主线程已经绑定过了）
+                if tid == current_tid:
+                    continue
+                
+                try:
+                    # 绑定所有其他线程到 vLLM CPU 区间
+                    os.sched_setaffinity(tid, self.vllm_cpus)
+                    bound_threads.append(tid)
+                except (OSError, ProcessLookupError):
+                    # 线程可能已经结束，忽略
+                    continue
+            
+            logger.info(f"🧵 Bound {len(bound_threads)} vLLM worker threads to CPUs {sorted(self.vllm_cpus)}")
+            self._vllm_affinity_applied = True
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to bind vLLM worker threads: {e}")
+    
+    def _suffix_prebuild_loop_with_affinity(self):
+        """
+        带完整 CPU 亲和性管理的 suffix prebuild 循环
+        """
+        try:
+            import os
+            import threading
+            
+            # 获取当前线程 ID (prebuild 线程)
+            tid = threading.get_native_id()
+            
+            # 绑定 prebuild 线程到专用 CPU 区间
+            os.sched_setaffinity(tid, self.prebuild_cpus)
+            logger.info(f"🎯 Suffix prebuild thread (TID: {tid}) bound to CPUs: {sorted(self.prebuild_cpus)}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to set prebuild thread affinity: {e}")
+        
+        # 执行原有的 prebuild 逻辑
+        self._suffix_prebuild_loop()
+
     def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
@@ -199,6 +344,9 @@ class vLLMRollout(BaseRollout):
         self.config = config
         self.trainer_rollout_data_dir = kwargs.pop("trainer_rollout_data_dir", None)  # Get trainer rollout_data_dir
 
+        # 🚀 Setup NUMA-aware CPU affinity management FIRST
+        # self._setup_numa_aware_affinity_manager()
+        
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), (
             "tensor parallel size should be less than or equal to the world size"
@@ -295,6 +443,9 @@ class vLLMRollout(BaseRollout):
             **engine_kwargs,
         )
 
+        # 🧵 Apply CPU affinity to all vLLM worker threads (after engine initialization)
+        # self._apply_vllm_worker_threads_affinity()
+
         # Offload vllm model to reduce peak memory usage
         if config.free_cache_engine:
             self.inference_engine.sleep(level=1)
@@ -333,7 +484,7 @@ class vLLMRollout(BaseRollout):
             if config.get("suffix_cache_window_size") is not None:
                 self.suffix_cache_window_size = int(config.get("suffix_cache_window_size"))
             else:
-                self.suffix_cache_window_size = 4 
+                self.suffix_cache_window_size = 8 
                 logger.info(f"suffix_cache_window_size not set, using default value: {self.suffix_cache_window_size}")
             
             # Initialize problem_id_to_files mapping window from file_to_problem_ids.jsonl
@@ -346,13 +497,29 @@ class vLLMRollout(BaseRollout):
             self._active_prebuild_pids = set()  # Currently being processed problem IDs
             self._prebuild_lock = threading.Lock()  # Lock for thread-safe access to active_pids
         # Cache of length-rank categories computed during prebuild
-            self._hard_pid_set = set()
-            self._medium_pid_set = set()
-            self._easy_pid_set = set()
+        # Use step-based tracking to distinguish current and next batches
+            self._step_classifications = {}  # step_id -> {"hard": set, "medium": set, "easy": set}
             self._suffix_prebuild_thread = threading.Thread(
                 target=self._suffix_prebuild_loop, name="suffix-prebuild-worker", daemon=True
             )
             self._suffix_prebuild_thread.start()
+            
+            # Initialize cache cleanup infrastructure
+            self.enable_async_cache_cleanup = config.get("enable_async_cache_cleanup", False)
+            if self.enable_async_cache_cleanup:
+                self._cache_cleanup_queue: queue.Queue = queue.Queue()
+                self._active_cleanup_tasks = set()  # Track ongoing cleanup tasks
+                self._cleanup_lock = threading.Lock()  # Lock for thread-safe access
+                self._cache_cleanup_thread = threading.Thread(
+                    target=self._cache_cleanup_loop, name="cache-cleanup-worker", daemon=True
+                )
+                self._cache_cleanup_thread.start()
+                logger.info("🧹 Async cache cleanup thread started")
+            else:
+                self._cache_cleanup_queue = None
+                self._active_cleanup_tasks = set()
+                self._cleanup_lock = threading.Lock()
+                self._cache_cleanup_thread = None
         else:
             # Initialize default values when suffix prebuild is disabled
             self.suffix_cache_data_path = None
@@ -362,10 +529,25 @@ class vLLMRollout(BaseRollout):
             self._suffix_prebuild_queue = None
             self._active_prebuild_pids = set()
             self._prebuild_lock = threading.Lock()
-            self._hard_pid_set = set()
-            self._medium_pid_set = set()
-            self._easy_pid_set = set()
+            self._step_classifications = {}  # step_id -> {"hard": set, "medium": set, "easy": set}
             self._suffix_prebuild_thread = None
+            
+            # Initialize cache cleanup infrastructure (even when prebuild is disabled)
+            self.enable_async_cache_cleanup = config.get("enable_async_cache_cleanup", False)
+            if self.enable_async_cache_cleanup:
+                self._cache_cleanup_queue: queue.Queue = queue.Queue()
+                self._active_cleanup_tasks = set()  # Track ongoing cleanup tasks
+                self._cleanup_lock = threading.Lock()  # Lock for thread-safe access
+                self._cache_cleanup_thread = threading.Thread(
+                    target=self._cache_cleanup_loop, name="cache-cleanup-worker", daemon=True
+                )
+                self._cache_cleanup_thread.start()
+                logger.info("🧹 Async cache cleanup thread started (prebuild disabled)")
+            else:
+                self._cache_cleanup_queue = None
+                self._active_cleanup_tasks = set()
+                self._cleanup_lock = threading.Lock()
+                self._cache_cleanup_thread = None
 
     def _load_problem_id_mapping_from_file(self, max_iteration=None):
         """
@@ -519,18 +701,18 @@ class vLLMRollout(BaseRollout):
                 except Exception:
                     return -1
             file_numbers = [parse_num(f) for f in all_selected_files if parse_num(f) != -1]
-            if file_numbers:
-                min_file_num = min(file_numbers)
-                max_file_num = max(file_numbers)
-                if rank == 0:
-                    logger.info(f"File range: [{min_file_num}, {max_file_num}], window_size={self.suffix_cache_window_size}")
+            # if file_numbers:
+            #     min_file_num = min(file_numbers)
+            #     max_file_num = max(file_numbers)
+            #     if rank == 0:
+            #         logger.info(f"File range: [{min_file_num}, {max_file_num}], window_size={self.suffix_cache_window_size}")
         
-        # Print per-problem_id file selection (sample)
-        if rank == 0:
-            sample_pids = list(pid_to_selected_files.keys())[:1]
-            for pid in sample_pids:
-                files = pid_to_selected_files[pid]
-                logger.info(f" sample problem_id={pid}: using {len(files)} files {files}")
+        # # Print per-problem_id file selection (sample)
+        # if rank == 0:
+        #     sample_pids = list(pid_to_selected_files.keys())[:1]
+        #     for pid in sample_pids:
+        #         files = pid_to_selected_files[pid]
+        #         logger.info(f" sample problem_id={pid}: using {len(files)} files {files}")
 
         processed_files = 0
         try:
@@ -542,7 +724,7 @@ class vLLMRollout(BaseRollout):
                 jobs.append((file_path, list(needed_pid_strs)))
                 all_needed_pid_strs.update(needed_pid_strs)
 
-            max_workers = 10
+            max_workers = 8
             per_pid_counts_total: dict[str, int] = {pid: 0 for pid in all_needed_pid_strs}
             has_orjson = _HAS_ORJSON
 
@@ -672,17 +854,16 @@ class vLLMRollout(BaseRollout):
         total_count = len(sorted_pids)
         hard_end = int(total_count * 0.20)
         medium_end = hard_end + int(total_count * 0.30)
-        easy_end = medium_end + int(total_count * 0.30)
         
         # Split into categories
         hard_ids = [pid for pid, _ in sorted_pids[:hard_end]]
         medium_ids = [pid for pid, _ in sorted_pids[hard_end:medium_end]]
-        easy_ids = [pid for pid, _ in sorted_pids[medium_end:easy_end]]
+        easy_ids = [pid for pid, _ in sorted_pids[medium_end:]]
         rank = os.getenv("RANK", "0")
         if rank == 0:
             print(f"hard_mean{sorted_pids[:hard_end][0][1][0]}, hard_max{sorted_pids[:hard_end][0][1][1]}")
             print(f"medium_mean{sorted_pids[hard_end:medium_end][0][1][0]}, medium_max{sorted_pids[hard_end:medium_end][0][1][1]}")
-            print(f"easy_mean{sorted_pids[medium_end:easy_end][0][1][0]}, easy_max{sorted_pids[medium_end:easy_end][0][1][1]}")
+            print(f"easy_mean{sorted_pids[medium_end:][0][1][0]}, easy_max{sorted_pids[medium_end:][0][1][1]}")
             
         return hard_ids, medium_ids, easy_ids
 
@@ -738,11 +919,39 @@ class vLLMRollout(BaseRollout):
                 return
             task = {"problem_ids": list(problem_ids), "raw_prompt_ids": raw_prompt_ids, "iteration": iteration}
             self._suffix_prebuild_queue.put_nowait(task)
-            # logger.info(f"📥 Enqueued prebuild task: {len(problem_ids)} problem_ids, iteration={iteration}")
-            # logger.info(f"📥 Problem_ids preview: {list(problem_ids)[:20]}{'...' if len(problem_ids) > 20 else ''}")
             _log_performance_info("PREBUILD_ENQUEUED", f"pids={len(problem_ids)}, iter={iteration}")
         except Exception as e:
             logger.error(f"enqueue_prebuild failed: {e}")
+
+    def enqueue_cache_cleanup(self, cleanup_id: str = None, problem_ids=None):
+        """Non-blocking: enqueue a cache cleanup task.
+        
+        Args:
+            cleanup_id: Optional unique identifier for this cleanup task
+            problem_ids: Optional list of problem_id to clean. Only these problem trees
+                are cleared. If None, clears all problem trees (full cache reset).
+        """
+        try:
+            # Skip entirely if async cache cleanup is not enabled (queue is None)
+            if self._cache_cleanup_queue is None:
+                return
+            if cleanup_id is None:
+                cleanup_id = f"cleanup_{int(time.time() * 1000)}"
+            # Normalize problem_ids to list (e.g. from tensor/ndarray)
+            if problem_ids is not None:
+                if hasattr(problem_ids, "tolist"):
+                    problem_ids = problem_ids.tolist()
+                else:
+                    problem_ids = list(problem_ids)
+            task = {
+                "cleanup_id": cleanup_id,
+                "problem_ids": problem_ids,
+                "timestamp": time.time()
+            }
+            self._cache_cleanup_queue.put_nowait(task)
+            _log_performance_info("CACHE_CLEANUP_ENQUEUED", f"id={cleanup_id}")
+        except Exception as e:
+            logger.error(f"enqueue_cache_cleanup failed: {e}")
 
     def _suffix_prebuild_loop(self):
         local_rank = os.getenv("LOCAL_RANK", "0")
@@ -750,6 +959,9 @@ class vLLMRollout(BaseRollout):
         while True:
             task = self._suffix_prebuild_queue.get()
             try:
+                # 总体计时开始
+                total_start_time = time.perf_counter()
+                
                 assert self.enable_suffix_prebuild, "suffix prebuild should be enabled"
                 problem_ids = task.get("problem_ids") or None
                 raw_prompt_ids = task.get("raw_prompt_ids") or None 
@@ -757,30 +969,43 @@ class vLLMRollout(BaseRollout):
                 assert problem_ids is not None, "problem_ids must be provided when enable_suffix_prebuild is True"
                 assert raw_prompt_ids is not None, "raw_prompt_ids must be provided when enable_suffix_prebuild is True"
                 assert max_iteration is not None, "max_iteration must be provided when enable_suffix_prebuild is True"
-                # logger.info(f"🚀 PREBUILD STARTED: Processing {len(problem_ids)} problem_ids from queue (iteration={max_iteration})")
-                # logger.info(f"🚀 Problem_ids: {problem_ids[:20]}{'...' if len(problem_ids) > 20 else ''}")
-                _log_performance_info("PREBUILD_STARTED", f"pids={len(problem_ids)}, iter={max_iteration}")
-
+  
+                # 步骤2: 问题ID管理
+                step2_start = time.perf_counter()
                 # Mark these problem IDs as being processed
                 with self._prebuild_lock:
-                    self._active_prebuild_pids.update(pid for pid in problem_ids)
+                    self._active_prebuild_pids.update(str(pid) for pid in problem_ids)
                 
                 # DEBUG: Log received problem_ids
                 unique_pids_received = sorted(list(set(problem_ids)))
-                logger.info(f"🔍 PREBUILD DEBUG: Received {len(problem_ids)} problem_ids ({len(unique_pids_received)} unique)")
+                step2_time = (time.perf_counter() - step2_start) * 1000
 
+                # 步骤3: Suffix Cache初始化
+                step3_start = time.perf_counter()
                 # ensure suffix cache exists (thread-safe)
                 try:
                     suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
                 except Exception:
-                    suffix_cache = None
-                if suffix_cache is None:
                     if isinstance(self.speculative_config, dict):
-                        max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
-                        max_threads = self.speculative_config.get("suffix_cache_max_threads", 10)
-                    suffix_cache = SuffixDecodingCache(max_tree_depth=max_depth, thread_safe=True, max_threads=max_threads)
-                    self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = suffix_cache
+                        max_depth = self.speculative_config.get("suffix_cache_max_depth", 32)
+                        max_threads = self.speculative_config.get("suffix_cache_max_threads", 8)
+                        self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache = SuffixDecodingCache(
+                            max_tree_depth=max_depth, 
+                            thread_safe=True, 
+                            max_threads=max_threads)
+                        suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+                    if local_rank == 0:
+                        logger.info(f"suffix_cache prebuild with max_threads: {max_threads}")
+                step3_time = (time.perf_counter() - step3_start) * 1000
 
+                # 步骤4: 历史数据加载
+                if not self._mapping_loaded:
+                    self._load_problem_id_mapping_from_file(max_iteration=max_iteration-1)
+                    self._mapping_loaded = True
+                else:
+                    logger.info(f"Problem_id mapping already loaded for {max_iteration} steps")
+
+                step4_start = time.perf_counter()
                 # assemble problems_data
                 unique_ids = list(dict.fromkeys([p for p in problem_ids]))
                 pid_native = unique_ids
@@ -790,11 +1015,10 @@ class vLLMRollout(BaseRollout):
                     logger.error(f"prebuild: load data failed: {e}")
                     problem_id_to_sequences = {}
                 
-                # DEBUG: Check which problem_ids have historical data
-                pids_with_data = set(str(p) for p in problem_id_to_sequences.keys())
-                pids_without_data = set(str(p) for p in unique_ids) - pids_with_data
-                logger.info(f"🔍 PREBUILD DEBUG: {len(pids_with_data)} pids have historical data, {len(pids_without_data)} don't")
+                step4_time = (time.perf_counter() - step4_start) * 1000
 
+                # 步骤5: 难度分类
+                step5_start = time.perf_counter()
                 # Select only hard and medium problems for prebuild
                 try:
                     # Check if distribution_aware is enabled
@@ -805,7 +1029,6 @@ class vLLMRollout(BaseRollout):
                     if distribution_aware and problem_id_to_sequences:
                         # distribution_aware=True: use length-based classification
                         hard_ids, medium_ids,easy_ids = self.get_length_rank(problem_id_to_sequences)
-                        logger.info(f"🎯 Prebuild classification (distribution_aware=True): {len(hard_ids)} hard + {len(medium_ids)} medium problems (from {len(problem_id_to_sequences)} with historical data)")
                     else:
                         # distribution_aware=False or no historical data: treat all as medium
                         hard_ids, medium_ids,easy_ids = unique_ids, [], []
@@ -815,18 +1038,26 @@ class vLLMRollout(BaseRollout):
                             logger.info(f"🎯 Prebuild (distribution_aware=False): treating all {len(unique_ids)} problems as hard difficulty")
 
                     allowed_pid_strs = set([str(p) for p in list(hard_ids) + list(medium_ids) + list(easy_ids)])
-                    # Record categories for later reuse in generate_sequences
-                    # Clear previous categories and update with current batch only
-                    self._hard_pid_set.clear()
-                    self._medium_pid_set.clear()
-                    self._easy_pid_set.clear()
-                    self._hard_pid_set.update(str(p) for p in hard_ids)
-                    self._medium_pid_set.update(str(p) for p in medium_ids)
-                    self._easy_pid_set.update(str(p) for p in easy_ids)
+                    # Record categories for this step (being prebuilt) for later reuse in generate_sequences
+                    # Use step ID to distinguish different batches
+                    with self._prebuild_lock:
+                        self._step_classifications[max_iteration] = {
+                            "hard": set(str(p) for p in hard_ids),
+                            "medium": set(str(p) for p in medium_ids), 
+                            "easy": set(str(p) for p in easy_ids)
+                        }
+                        # Clean up old classifications to prevent memory leak (keep last 5 steps)
+                        if len(self._step_classifications) > 5:
+                            oldest_steps = sorted(self._step_classifications.keys())[:-5]
+                            for old_step in oldest_steps:
+                                del self._step_classifications[old_step]
                     logger.info(f"🎯 Total allowed problem_ids for prebuild: {len(allowed_pid_strs)}")
                 except Exception:
                     allowed_pid_strs = None
+                step5_time = (time.perf_counter() - step5_start) * 1000
 
+                # 步骤6: 数据格式转换
+                step6_start = time.perf_counter()
                 pid_to_prompt = {}
                 if raw_prompt_ids is not None:
                     for pid, pr in zip(problem_ids, raw_prompt_ids):
@@ -866,44 +1097,56 @@ class vLLMRollout(BaseRollout):
                             logger.debug(f"prebuild: no historical sequences for problem {pid}, using empty sequences")
                         if prompt_tokens is None:
                             logger.debug(f"prebuild: no prompt tokens for problem {pid}, using empty sequences")
+                step6_time = (time.perf_counter() - step6_start) * 1000
 
                 if problems_data:
+                    # 步骤7: 统计分析与日志
+                    step7_start = time.perf_counter()
                     try:
                         with_historical = sum(1 for problem_data in problems_data if problem_data['sequences'])
                         without_historical = len(problems_data) - with_historical
-                        logger.info(f"🎯🎯🎯 PREBUILD EXECUTING: Total {len(problems_data)} problem_ids")
-                        logger.info(f"🎯 - With historical data: {with_historical} problem_ids")
-                        logger.info(f"🎯 - Without historical data (first training): {without_historical} problem_ids")
+                        if local_rank == 0:
+                            logger.info(f"🎯🎯🎯 PREBUILD EXECUTING: Total {len(problems_data)} problem_ids")
+                            logger.info(f"🎯 - With historical data: {with_historical} problem_ids")
+                            logger.info(f"🎯 - Without historical data (first training): {without_historical} problem_ids")                       
+                        step7_time = (time.perf_counter() - step7_start) * 1000
                         
-                        # Print the actual problem_ids being prebuilt
-                        prebuilt_pids = [problem_data['problem_id'] for problem_data in problems_data]
-                        logger.info(f"🎯 Prebuilding problem_ids: {prebuilt_pids[:20]}{'...' if len(prebuilt_pids) > 20 else ''}")
-                        
-                        # Print per-problem sequence counts
-                        pid_seq_counts = [(problem_data['problem_id'], len(problem_data['sequences'])) for problem_data in problems_data]
-                        total_seqs = sum(cnt for _, cnt in pid_seq_counts)
-                        avg_seqs = total_seqs / len(pid_seq_counts) if pid_seq_counts else 0
-                        min_seqs = min((cnt for _, cnt in pid_seq_counts), default=0)
-                        max_seqs = max((cnt for _, cnt in pid_seq_counts), default=0)
-                        
-                        logger.info(f"📊 Prebuild sequence stats: TOTAL={total_seqs}, AVG={avg_seqs:.1f}, MIN={min_seqs}, MAX={max_seqs}")
-                        
-                        # Sample detailed counts
-                        sample_counts = pid_seq_counts[:3]
-                        logger.info(f"📊 Sample prebuild counts: {sample_counts}")
-                        
-                        _log_performance_info("PREBUILD_EXECUTING", f"problems={len(problems_data)}")
+                        # 步骤8: 执行Prebuild
+                        step8_start = time.perf_counter()
                         suffix_cache.prebuild_problems_parallel(problems_data)
-                        _log_performance_info("PREBUILD_COMPLETED", f"problems={len(problems_data)}")
-                        logger.info(f"🎯✅ PREBUILD COMPLETED: Successfully prebuilt {len(problems_data)} problem_ids")
+                        step8_time = (time.perf_counter() - step8_start) * 1000
+                        
                     except Exception as e:
                         logger.error(f"prebuild execution failed: {e}")
                         _log_performance_info("PREBUILD_FAILED", f"error={str(e)[:50]}")
+                        step7_time = (time.perf_counter() - step7_start) * 1000 if 'step7_start' in locals() else 0.0
+                        step8_time = 0.0
                 else:
                     logger.warning("🎯❌ PREBUILD SKIPPED: no valid problems_data to process")
                     _log_performance_info("PREBUILD_SKIPPED", "no_valid_data")
+                    step7_time = 0.0
+                    step8_time = 0.0
+                # 计算总时间并输出详细计时信息
+                total_time = (time.perf_counter() - total_start_time) * 1000
+                
+                # 输出详细的步骤计时
+                if local_rank == 0:
+                    logger.info(f"⏱️  PREBUILD TIMING BREAKDOWN (Total: {total_time:.2f}ms):")
+                    logger.info(f"   Step 2 - ID Management:       {step2_time:.2f}ms ({step2_time/total_time*100:.1f}%)")
+                    logger.info(f"   Step 3 - Cache Init:          {step3_time:.2f}ms ({step3_time/total_time*100:.1f}%)")
+                    logger.info(f"   Step 4 - Data Loading:        {step4_time:.2f}ms ({step4_time/total_time*100:.1f}%)")
+                    logger.info(f"   Step 5 - Classification:      {step5_time:.2f}ms ({step5_time/total_time*100:.1f}%)")
+                    logger.info(f"   Step 6 - Format Conversion:   {step6_time:.2f}ms ({step6_time/total_time*100:.1f}%)")
+                    if 'step7_time' in locals():
+                        logger.info(f"   Step 7 - Statistics & Log:    {step7_time:.2f}ms ({step7_time/total_time*100:.1f}%)")
+                    if 'step8_time' in locals():
+                        logger.info(f"   Step 8 - Prebuild Execution:  {step8_time:.2f}ms ({step8_time/total_time*100:.1f}%)")   
             except Exception as e:
                 logger.error(f"suffix_prebuild_loop error: {e}")
+                # 即使出错也要记录已有的计时信息
+                if 'total_start_time' in locals():
+                    total_time = (time.perf_counter() - total_start_time) * 1000
+                    logger.info(f"⏱️  PREBUILD ERROR TIMING (Total: {total_time:.2f}ms before error)")
             finally:
                 # Remove processed problem IDs from active set
                 if 'problem_ids' in locals():
@@ -912,9 +1155,70 @@ class vLLMRollout(BaseRollout):
                             self._active_prebuild_pids.discard(str(pid))
                 
                 self._suffix_prebuild_queue.task_done()
-                logger.info(f"suffix_prebuild_loop task done, rank {rank}, local_rank {local_rank}")
 
-    def _wait_for_prebuild_completion(self, problem_ids, timeout=30.0):
+    def _cache_cleanup_loop(self):
+        """Background thread loop for processing cache cleanup tasks."""
+        local_rank = os.getenv("LOCAL_RANK", "0")
+        rank = os.getenv("RANK", "0")
+        
+        while True:
+            try:
+                task = self._cache_cleanup_queue.get()
+                cleanup_id = task.get("cleanup_id", "unknown")
+                
+                # 总体计时开始
+                total_start_time = time.perf_counter()        
+                # Mark this cleanup as active
+                with self._cleanup_lock:
+                    self._active_cleanup_tasks.add(cleanup_id)
+                
+                try:
+                    # 获取本 batch 要清理的 problem_ids
+                    problem_ids = task.get("problem_ids")
+                    # 获取suffix cache
+                    suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
+                    if suffix_cache is not None:
+                        # 记录清理前的缓存状态
+                        problem_trees_before = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
+                        prompt_trees_before = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
+                        
+                        time_clear_start = time.perf_counter()
+                        cleanup_result = suffix_cache.clear_cache(problem_ids=problem_ids)
+                        time_clear = (time.perf_counter() - time_clear_start) * 1000  # ms
+                        
+                        if cleanup_result and isinstance(cleanup_result, dict) and cleanup_result.get("success"):
+                            if local_rank == 0:
+                                logger.info(f"⚡ [Cache Cleanup {cleanup_id}] Fast cleanup completed in {time_clear:.2f}ms")
+                        else:
+                            logger.warning(f"⚠️ [Cache Cleanup {cleanup_id}] Unexpected result: {cleanup_result}")
+                        
+                        # 验证清理后的状态
+                        problem_trees_after = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
+                        prompt_trees_after = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
+                        if problem_trees_after != 0 or prompt_trees_after != 0:
+                            logger.warning(f"⚠️ [Cache Cleanup {cleanup_id}] Cache state after cleanup: "
+                                       f"problem_trees: {problem_trees_before}→{problem_trees_after}, "
+                                       f"prompt_trees: {prompt_trees_before}→{prompt_trees_after}")
+                    else:
+                        logger.warning(f"🧹 [Cache Cleanup {cleanup_id}] No suffix cache found")
+                        
+                except Exception as e:
+                    logger.error(f"❌ [Cache Cleanup {cleanup_id}] Failed to clear suffix cache: {e}")
+                    import traceback
+                    logger.error(f"❌ [Cache Cleanup {cleanup_id}] Traceback: {traceback.format_exc()}")
+                    _log_performance_info("CACHE_CLEANUP_FAILED", f"id={cleanup_id}, error={str(e)[:50]}")
+                
+                # 计算总时间
+                total_time = (time.perf_counter() - total_start_time) * 1000
+                if local_rank == 0:
+                    logger.info(f"🧹✅ CACHE_CLEANUP COMPLETED: Task {cleanup_id} finished in {total_time:.2f}ms")
+                
+            except Exception as e:
+                logger.error(f"cache_cleanup_loop error: {e}")
+            finally:
+                self._cache_cleanup_queue.task_done()
+
+    def _wait_for_prebuild_completion(self, problem_ids):
         """Wait for any ongoing prebuild tasks for the given problem_ids to complete.
         
         Args:
@@ -939,11 +1243,6 @@ class vLLMRollout(BaseRollout):
                 still_processing = problem_id_strs.intersection(self._active_prebuild_pids)
                 if not still_processing:
                     break  # All our problem IDs are done
-            
-            # Check timeout
-            if time.time() - start_time > timeout:
-                logger.warning(f"⏱️ Timeout waiting for prebuild completion of {len(still_processing)} problem_ids: {list(still_processing)[:10]}")
-                break
                 
             # Short sleep to avoid busy waiting
             time.sleep(0.1)
@@ -951,6 +1250,39 @@ class vLLMRollout(BaseRollout):
         elapsed = time.time() - start_time
         if elapsed > 0.1:  # Only log if we actually waited
             logger.info(f" Waited {elapsed:.2f}s for prebuild completion of {len(problem_ids)} problems")
+
+    def _wait_for_cache_cleanup_completion(self, timeout=10.0):
+        """Wait for any ongoing cache cleanup tasks to complete.
+        
+        Args:
+            timeout: Maximum time to wait in seconds (default: 10s)
+        """
+        if not self.enable_async_cache_cleanup:
+            return
+            
+        start_time = time.time()
+        
+        # Check initial state
+        with self._cleanup_lock:
+            if self._active_cleanup_tasks:
+                logger.info(f"🔄 Found {len(self._active_cleanup_tasks)} active cleanup tasks, waiting...")
+        
+        while True:
+            with self._cleanup_lock:
+                if not self._active_cleanup_tasks:
+                    break  # All cleanup tasks are done
+            
+            # Check timeout
+            if time.time() - start_time > timeout:
+                logger.warning(f"⏱️ Timeout waiting for cache cleanup completion")
+                break
+                
+            # Short sleep to avoid busy waiting
+            time.sleep(0.1)
+        
+        elapsed = time.time() - start_time
+        if elapsed > 0.1:  # Only log if we actually waited
+            logger.info(f"🔄 Waited {elapsed:.2f}s for cache cleanup completion")
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
@@ -1076,15 +1408,7 @@ class vLLMRollout(BaseRollout):
             if SuffixDecodingCache is None:
                 raise ImportError("SuffixDecodingCache not available. Please install arctic_inference package.")
             suffix_cache_max_depth = self.speculative_config.get("suffix_cache_max_depth", 64)
-            suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", None)
-
-            # 🎯 SuffixCache线程数配置：硬编码为10线程
-            if suffix_cache_max_threads is None:
-                suffix_cache_max_threads = 10
-                logger.info(f"🎯 SuffixCache use hardcoded threads: {suffix_cache_max_threads}")
-            else:
-                logger.info(f"🎯 SuffixCache use config specified threads: {suffix_cache_max_threads}")
-            
+            suffix_cache_max_threads = self.speculative_config.get("suffix_cache_max_threads", 8)
             # 🚀 启用C++对象级锁定+GIL释放的线程安全模式
             # Reuse existing cache if available; otherwise create
             try:
@@ -1101,41 +1425,55 @@ class vLLMRollout(BaseRollout):
             if self.enable_suffix_prebuild:
                 assert problem_ids is not None, "problem_ids must be provided when enable_suffix_prebuild is True"
                 
-                # 🔄 SYNC: Wait for any pending prebuild tasks for current problem_ids to complete
-                _log_performance_info("SYNC_WAIT_START", f"pids={len(problem_ids)}")
+                # 🔄 SYNC: Wait for any pending prebuild tasks for current step's problem_ids to complete
+                # Note: We prebuild next step's problem_ids before generate_sequences, but here we wait for 
+                # current step's prebuild to complete (which was triggered in the previous iteration)
+                start_time = time.time()
                 self._wait_for_prebuild_completion(problem_ids)
-                _log_performance_info("SYNC_WAIT_END", f"pids={len(problem_ids)}")
+                end_time = time.time()
+                elapsed_time = end_time - start_time
                 unique_problem_ids = list(set(problem_ids))
-                logger.info(f"🔄✅ Prebuild wait completed for {len(problem_ids)} problem_ids, ({len(unique_problem_ids)} unique)")
-            
+                logger.info(f"🔄 Prebuild wait completed for {len(problem_ids)} problem_ids, ({len(unique_problem_ids)} unique) in {elapsed_time:.2f} seconds")            
                 # Check if distribution_aware is enabled
                 distribution_aware = self.speculative_config.get("distribution_aware", False)
                 
-                # Try reuse cached hard/medium sets from previous prebuild
-                if distribution_aware and len(self._hard_pid_set) + len(self._medium_pid_set) > 0:        
-                    hard_ids = [pid for pid in unique_problem_ids if str(pid) in self._hard_pid_set]
-                    medium_ids = [pid for pid in unique_problem_ids if str(pid) in self._medium_pid_set]
-                    easy_ids = [pid for pid in unique_problem_ids if str(pid) in self._easy_pid_set]
-                    logger.info(f"generate_sequences (distribution_aware=True): using cached hard/medium/easy classification with length {len(hard_ids)} and {len(medium_ids)} and {len(easy_ids)}")
+                # Get current step from prompts.meta_info for step-based classification lookup
+                current_step = prompts.meta_info.get("global_steps", None)
+                
+                # Try to use step-based cached classifications from prebuild
+                assert current_step is not None
+                if distribution_aware:
+                    with self._prebuild_lock:
+                        step_classification = self._step_classifications.get(current_step, None)
+                    
+                    if step_classification is not None:
+                        # Use prebuilt classifications for this specific step
+                        hard_ids = [pid for pid in unique_problem_ids if str(pid) in step_classification["hard"]]
+                        medium_ids = [pid for pid in unique_problem_ids if str(pid) in step_classification["medium"]]
+                        easy_ids = [pid for pid in unique_problem_ids if str(pid) in step_classification["easy"]]
+                        logger.info(f"🎯 generate_sequences (step={current_step}): using prebuilt classifications: {len(hard_ids)} hard + {len(medium_ids)} medium + {len(easy_ids)} easy")
+                    else:
+                        # No prebuilt classification for this step, use default (all hard)
+                        hard_ids = unique_problem_ids
+                        medium_ids = []
+                        easy_ids = []
+                        logger.info(f"⚠️ generate_sequences (step={current_step}): no prebuilt classification found, treating all {len(hard_ids)} as hard")
                 else:
+                    # distribution_aware=False or no step info, use default
                     hard_ids = unique_problem_ids
                     medium_ids = []
                     easy_ids = []
-                    if distribution_aware:
-                        logger.info(f"generate_sequences (distribution_aware=True): no cached hard/medium sets, treating all {len(unique_problem_ids)} problems as medium difficulty")
-                    else:
-                        logger.info(f"generate_sequences (distribution_aware=False): treating all {len(unique_problem_ids)} problems as medium difficulty")
             else:
                 unique_problem_ids = list(set(problem_ids))
-                hard_ids = unique_problem_ids
+                hard_ids = []
                 medium_ids = []
-                easy_ids = []
+                easy_ids = unique_problem_ids
 
         else:
             unique_problem_ids = list(set(problem_ids))
-            hard_ids = unique_problem_ids
+            hard_ids = []
             medium_ids = []
-            easy_ids = []
+            easy_ids = unique_problem_ids
 
         # users can customize different sampling_params at different run
         local_rank = os.getenv("LOCAL_RANK", "0")
@@ -1150,17 +1488,22 @@ class vLLMRollout(BaseRollout):
                 from arctic_inference.vllm.model_runner import ProblemIdContextManager
                 ProblemIdContextManager.clear_context()
                 # Get current step from prompts.meta_info and set it in context manager
-                current_step = prompts.meta_info.get("global_steps", None)
-                assert current_step is not None, "global_steps not found in prompts.meta_info"
-                ProblemIdContextManager.set_current_step(current_step)
-                logger.debug(f"Set current_step={current_step} in ProblemIdContextManager")
+                #current_step = prompts.meta_info.get("global_steps", None)
+                #assert current_step is not None, "global_steps not found in prompts.meta_info"
+                #ProblemIdContextManager.set_current_step(current_step)
+                #logger.debug(f"Set current_step={current_step} in ProblemIdContextManager")
                 
                 # Create empty req_id to problem_id mapping context
                 ProblemIdContextManager.set_req_id_to_problem_id_mapping({})
                 
                 # Call generate with problem_ids parameter - LLM patches will handle the mapping
                 # Also pass length_rank through the ProblemIdContextManager for this batch
+                # print("DEBUG in vLLMRollout: hard_ids", hard_ids)
+                # print("DEBUG in vLLMRollout: medium_ids", medium_ids)
+                # print("DEBUG in vLLMRollout: easy_ids", easy_ids)
                 ProblemIdContextManager.set_hard_medium_ids(hard_ids, medium_ids,easy_ids)
+                assert len(problem_ids) == len(vllm_inputs), "problem_ids and vllm_inputs must have the same length"
+                assert len(vllm_inputs) > 0
                 outputs = self.inference_engine.generate(
                     prompts=vllm_inputs,  # because we have already convert it to prompt token id
                     sampling_params=self.sampling_params,
@@ -1239,75 +1582,13 @@ class vLLMRollout(BaseRollout):
 
         # Update problem_id_to_files mapping if suffix prebuild is enabled
         if self.enable_suffix_prebuild:
-            # Get current step from prompts.meta_info
-            current_step = prompts.meta_info.get("global_steps", None)
-            if current_step is None:
-                logger.warning("global_steps not found in prompts.meta_info, skipping mapping update")
-                return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-            
-            # Load mapping on first call when we have access to current_step
-            if not self._mapping_loaded:
-                start_time = time.time()
-                self._load_problem_id_mapping_from_file(max_iteration=current_step)
-                self._mapping_loaded = True
-                end_time = time.time()
-                logger.info(f"Loading problem_id mapping took {end_time - start_time:.2f} seconds for {current_step} steps")
-            
-            # Generate filename in format {global_step}.jsonl
-            filename = f"{current_step}.jsonl"
-            
-            # Update the local mapping window
-            self._update_problem_id_to_files_mapping(filename, current_step, problem_ids)
-        
-        # 批次级清理 - 清理所有suffix cache，避免内存泄漏
-        time_cache_cleanup_start = time.time()
-        if self.enable_suffix_prebuild:
-            try:
-                suffix_cache = self.inference_engine.llm_engine.model_executor.driver_worker.model_runner._suffix_cache
-                if suffix_cache is not None:
-                    # 记录清理前的缓存状态
-                    problem_trees_before = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
-                    prompt_trees_before = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
-                    
-                    logger.info(f"🧹 [Cache Cleanup] Starting cleanup: "
-                               f"problem_trees={problem_trees_before}, "
-                               f"prompt_trees={prompt_trees_before}")
-                    
-                    # 调用优化的清理方法（并行清理）
-                    time_clear_start = time.time()
-                    cleanup_result = suffix_cache.clear_all_cache()
-                    time_clear = time.time() - time_clear_start
-                    
-                    if cleanup_result and isinstance(cleanup_result, dict) and cleanup_result.get("success"):
-                        cleanup_method = cleanup_result.get("method", "unknown")
-                        logger.info(f"⚡ [Cache Cleanup] Fast cleanup completed in {time_clear*1000:.2f}ms")
-                        logger.info(f"⚡ [Cache Cleanup] Method: parallel cleanup using ThreadPoolExecutor")
-                        logger.info(f"⚡ [Cache Cleanup] Synchronous parallel tree destruction completed")
-                        logger.info(f"⚡ [Cache Cleanup] All trees cleared and memory freed")
-                    else:
-                        logger.warning(f"⚠️ [Cache Cleanup] Unexpected result: {cleanup_result}")
-                        logger.info(f"⏱️ [Cache Cleanup] Cleanup time: {time_clear*1000:.2f}ms")
-                    
-                    # 验证清理后的状态（新的空缓存应该立即可用）
-                    problem_trees_after = len(suffix_cache._problem_tree) if hasattr(suffix_cache, '_problem_tree') else 0
-                    prompt_trees_after = len(suffix_cache._prompt_trees) if hasattr(suffix_cache, '_prompt_trees') else 0
-                    
-                    logger.info(f"✅ [Cache Cleanup] Cache state after cleanup: "
-                               f"problem_trees: {problem_trees_before}→{problem_trees_after}, "
-                               f"prompt_trees: {prompt_trees_before}→{prompt_trees_after}")
-                    
-            except Exception as e:
-                logger.warning(f"❌ [Cache Cleanup] Failed to clear suffix cache: {e}")
-                import traceback
-                logger.warning(f"❌ [Cache Cleanup] Traceback: {traceback.format_exc()}")
-        
-        # ⏱️ Time profiling: Suffix cache cleanup
-        time_cache_cleanup = time.time() - time_cache_cleanup_start
-        logger.info(f"⏱️ [Profiling] Suffix cache cleanup took {time_cache_cleanup:.2f}s")
-        
-        # ⏱️ Time profiling: Total function time
+            self.enqueue_cache_cleanup(
+                cleanup_id=f"cleanup_{int(time.time() * 1000)}",
+                problem_ids=problem_ids,
+            )
         time_total = time.time() - time_total_start
-        logger.info(f"⏱️ [Profiling] ===== TOTAL generate_sequences time: {time_total:.3f}s =====")
+        rank = os.getenv("RANK", "0")
+        logger.info(f"[Profiling] ===== rank {rank} TOTAL generate_sequences time: {time_total:.3f}s =====")
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 

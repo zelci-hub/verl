@@ -112,7 +112,7 @@ class RayResourcePool(ResourcePool):
         elif device_name == "cuda":
             device_name = "GPU"
 
-        bundle = {"CPU": self.max_colocate_count}
+        bundle = {"CPU": 8}  # 增加 CPU 分配：8 个 CPU 用于 vLLM + suffix prebuild 并行处理
         if self.use_gpu:
             bundle[device_name] = 1
             if self.accelerator_type is not None:

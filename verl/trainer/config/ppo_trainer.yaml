@@ -252,6 +252,9 @@ trainer:
   # Experiment name for run identification in tracking tools
   experiment_name: gsm8k
 
+  # Wandb entity (username or team). null = use logged-in account
+  wandb_entity: null
+
   # Logging backends to use: "console", "wandb", etc.
   logger: [ 'console', 'wandb' ]
 

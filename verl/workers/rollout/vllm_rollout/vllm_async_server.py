@@ -330,9 +330,16 @@ class AsyncvLLMServer(AsyncServerBase):
     async def wake_up(self):
         if self.config.rollout.free_cache_engine:
             await self.engine.wake_up()
+        await self.engine.resume_generation()
 
     async def sleep(self):
-        # TODO: https://github.com/vllm-project/vllm/issues/17103
-        await self.engine.reset_prefix_cache()
+        # Drain in-flight requests before clearing caches to avoid "Failed to reset
+        # prefix cache because some blocks are not freed yet" (vllm#17103).
+        await self.engine.pause_generation(
+            wait_for_inflight_requests=True,
+            clear_cache=True,
+        )
         if self.config.rollout.free_cache_engine:
             await self.engine.sleep()
+        else:
+            await self.engine.resume_generation()

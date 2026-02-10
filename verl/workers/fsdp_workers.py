@@ -777,6 +777,19 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             print("DEBUG:rollout doesn't support enqueue_prebuild")
         # If rollout doesn't support enqueue_prebuild, silently ignore
 
+    @register(blocking=False)
+    def enqueue_cache_cleanup(self, cleanup_id: str = None, problem_ids=None):
+        """Forward cache cleanup call to the underlying rollout if it supports it.
+        
+        Args:
+            cleanup_id: Optional unique identifier for this cleanup task
+            problem_ids: Optional list of problem_id to clean (only these trees are cleared)
+        """
+        if hasattr(self.rollout, 'enqueue_cache_cleanup'):
+            return self.rollout.enqueue_cache_cleanup(cleanup_id, problem_ids=problem_ids)
+        else:
+            logger.debug("rollout doesn't support enqueue_cache_cleanup")
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     def compute_log_prob(self, data: DataProto):

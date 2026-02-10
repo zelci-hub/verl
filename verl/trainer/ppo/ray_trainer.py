@@ -396,7 +396,8 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
     def _prebuild_next_batch(self) -> None:
-        """Collect next-step problem IDs and prompt tokens and enqueue prebuild on rollout.
+        """
+        Collect next-step problem IDs and prompt tokens and enqueue prebuild on rollout.
 
         If `self._next_batch` exists, extract `problem_id` and optional `raw_prompt_ids`.
         If `raw_prompt_ids` are absent, derive them by stripping left pads from `input_ids`.
@@ -431,7 +432,7 @@ class RayPPOTrainer:
             # Directly hint rollout via non-blocking RPC, include current iteration
             try:
                 current_iteration = int(self.global_steps)
-                self.actor_rollout_wg.enqueue_prebuild(next_pids, next_raw, current_iteration)
+                self.actor_rollout_wg.enqueue_prebuild(next_pids, next_raw, current_iteration+1)
             except Exception as e:
                 print(f"WARN: enqueue_prebuild RPC failed: {e}")
         except Exception as e:
@@ -1095,7 +1096,6 @@ class RayPPOTrainer:
             actor_rollout_config = self.config.actor_rollout_ref
             trainer_rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
             if trainer_rollout_data_dir is not None:
-                from omegaconf import OmegaConf
                 actor_rollout_config = OmegaConf.create(OmegaConf.to_container(actor_rollout_config, resolve=True))
                 actor_rollout_config.trainer_rollout_data_dir = trainer_rollout_data_dir
             
@@ -1460,6 +1460,7 @@ class RayPPOTrainer:
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
+                    
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
                         if not self.async_rollout_mode:
@@ -1469,32 +1470,29 @@ class RayPPOTrainer:
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
                     # Print the elapsed time for generate_sequences
-                    if getattr(self.config.trainer, "rollout_only", False):
-                                            # Log rollout generations if enabled
-                        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                        if rollout_data_dir:
-                            with marked_timer("dump_rollout_generations", timing_raw, color="green"):
-                                save_token_ids = self.config.trainer.get("save_token_ids", False)
-                                print("DEBUG:save_token_ids", save_token_ids)
-                                if save_token_ids:
-                                    # Save token IDs instead of decoded text
-                                    inputs = gen_batch_output.batch["prompts"].cpu().tolist()
-                                    outputs = gen_batch_output.batch["responses"].cpu().tolist()
-                                else:
-                                    # Save decoded text (original behavior)
-                                    inputs = self.tokenizer.batch_decode(gen_batch_output.batch["prompts"], skip_special_tokens=True)
-                                    outputs = self.tokenizer.batch_decode(gen_batch_output.batch["responses"], skip_special_tokens=True)
-                                self._dump_generations_rollout(
-                                    inputs=inputs,
-                                    outputs=outputs,
-                                    problem_ids=gen_batch.non_tensor_batch["problem_id"],
-                                    dump_path=rollout_data_dir,
-                                    save_token_ids=save_token_ids,
-                                )
-                        print(f"generate_sequences time: {timing_raw['gen']:.4f}s")
-                        
-
-
+                    # if getattr(self.config.trainer, "rollout_only", False):
+                    #                         # Log rollout generations if enabled
+                    #     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    #     if rollout_data_dir:
+                    #         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+                    #             save_token_ids = self.config.trainer.get("save_token_ids", False)
+                    #             print("DEBUG:save_token_ids", save_token_ids)
+                    #             if save_token_ids:
+                    #                 # Save token IDs instead of decoded text
+                    #                 inputs = gen_batch_output.batch["prompts"].cpu().tolist()
+                    #                 outputs = gen_batch_output.batch["responses"].cpu().tolist()
+                    #             else:
+                    #                 # Save decoded text (original behavior)
+                    #                 inputs = self.tokenizer.batch_decode(gen_batch_output.batch["prompts"], skip_special_tokens=True)
+                    #                 outputs = self.tokenizer.batch_decode(gen_batch_output.batch["responses"], skip_special_tokens=True)
+                    #             self._dump_generations_rollout(
+                    #                 inputs=inputs,
+                    #                 outputs=outputs,
+                    #                 problem_ids=gen_batch.non_tensor_batch["problem_id"],
+                    #                 dump_path=rollout_data_dir,
+                    #                 save_token_ids=save_token_ids,
+                    #             )
+                    #     print(f"generate_sequences time: {timing_raw['gen']:.4f}s")
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1691,22 +1689,30 @@ class RayPPOTrainer:
                             )
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        try:
+                            cleanup_id = f"step_{self.global_steps}"
+                            problem_ids = None
+                            if "problem_id" in batch.non_tensor_batch:
+                                pid = batch.non_tensor_batch["problem_id"]
+                                pid_list = pid.tolist() if hasattr(pid, "tolist") else list(pid)
+                                problem_ids = list(set(pid_list))
+                            self.actor_rollout_wg.enqueue_cache_cleanup(cleanup_id, problem_ids=problem_ids)
+                            print(f"[PERF] {timestamp} | CACHE_CLEANUP_ENQUEUED | step={self.global_steps}")
+                        except Exception as e:
+                            print(f"WARN: enqueue_cache_cleanup RPC failed: {e}")
+                        # Prebuild next batch before generate_sequences to reduce latency
+                        self._prebuild_next_batch()
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            # Hint rollout to prebuild right before launching update_actor (reduced CPU contention)
                             import datetime
                             timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
                             print(f"[PERF] {timestamp} | ACTOR_UPDATE_START | step={self.global_steps}")
-                            self._prebuild_next_batch()
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                             timestamp = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
                             print(f"[PERF] {timestamp} | ACTOR_UPDATE_END | step={self.global_steps}")
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
-                    else:
-                        # Actor update is skipped due to warmup; still trigger prebuild now
-                        self._prebuild_next_batch()
 
                     # # validate
                     if (
